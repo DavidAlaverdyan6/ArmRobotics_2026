@@ -1,13 +1,13 @@
 import time
 from telemetrix import telemetrix
 from pins import PB10, PB2
-
+from pins import PA8
 
 board = telemetrix.Telemetrix(com_port="/dev/serial0")
 
 board.set_pin_mode_digital_output(PB10)
 board.set_pin_mode_digital_output(PB2)
-
+board.set_pin_mode_servo(PA8)
 
 def motor_forward():
     board.digital_write(PB10, 1)
@@ -23,6 +23,13 @@ def motor_stop():
     board.digital_write(PB10, 0)
     board.digital_write(PB2, 0)
 
+def servo():
+    board.servo_write(PA8, 90)
+    time.sleep(1)
+    board.servo_write(PA8, 0)
+    time.sleep(1)
+    board.servo_write(PA8, 180)
+    time.sleep(3)
 
 try:
     print("Motor forward")
@@ -39,6 +46,9 @@ try:
 
     print("Stop")
     motor_stop()
+    time.sleep(1)
+    servo()
+
 
 finally:
     motor_stop()

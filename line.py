@@ -33,3 +33,6 @@ except KeyboardInterrupt:
 
 finally:
     board.shutdown()
+
+
+print("1234")
