@@ -723,6 +723,16 @@ void serial_loopback() {
   Serial1.write(loop_back_buffer, 3);
 }
 
+int analog_pin_to_slot(uint8_t pin) {
+    for (int i = 0; i < MAX_ANALOG_PINS_SUPPORTED; i++) {
+        if (analog_read_pins[i] == pin) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
 void set_pin_mode()
 /*
     Set a pin to digital input, digital input_pullup, digital output,
@@ -750,13 +760,22 @@ void set_pin_mode()
       the_digital_pins[pin].pin_mode = mode;
       pinMode(pin, OUTPUT);
       break;
-    case AT_ANALOG:
-      the_analog_pins[pin].pin_mode = mode;
-      the_analog_pins[pin].differential = (command_buffer[2] << 8) + command_buffer[3];
-      the_analog_pins[pin].reporting_enabled = command_buffer[4];
-      break;
-    default:
-      break;
+    case AT_ANALOG: {
+        int analog_slot = analog_pin_to_slot(pin);
+
+        if (analog_slot < 0) {
+            break;
+        }
+
+        the_analog_pins[analog_slot].pin_number = pin;
+        the_analog_pins[analog_slot].pin_mode = mode;
+        the_analog_pins[analog_slot].differential =
+            (command_buffer[2] << 8) + command_buffer[3];
+        the_analog_pins[analog_slot].reporting_enabled =
+            command_buffer[4];
+
+        break;
+    }
   }
 }
 
@@ -1776,7 +1795,7 @@ void scan_digital_inputs() {
         value = (byte)digitalRead(the_digital_pins[i].pin_number);
         if (value != the_digital_pins[i].last_value) {
           the_digital_pins[i].last_value = value;
-          report_message[2] = (byte)i;
+          report_message[2] = analog_read_pins[i];
           report_message[3] = value;
           Serial1.write(report_message, 4);
         }
