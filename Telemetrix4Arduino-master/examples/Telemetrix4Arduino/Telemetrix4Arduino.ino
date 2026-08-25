@@ -761,21 +761,23 @@ void set_pin_mode()
       pinMode(pin, OUTPUT);
       break;
     case AT_ANALOG: {
-        int analog_slot = analog_pin_to_slot(pin);
+      int analog_slot = analog_pin_to_slot(pin);
 
-        if (analog_slot < 0) {
-            break;
-        }
+      if (analog_slot < 0) {
+          break;
+      }
 
-        the_analog_pins[analog_slot].pin_number = pin;
-        the_analog_pins[analog_slot].pin_mode = mode;
-        the_analog_pins[analog_slot].differential =
-            (command_buffer[2] << 8) + command_buffer[3];
-        the_analog_pins[analog_slot].reporting_enabled =
-            command_buffer[4];
+      the_analog_pins[analog_slot].pin_number = pin;
+      the_analog_pins[analog_slot].pin_mode = mode;
+      the_analog_pins[analog_slot].differential =
+          (command_buffer[2] << 8) + command_buffer[3];
+      the_analog_pins[analog_slot].reporting_enabled =
+          command_buffer[4];
 
-        break;
-    }
+      the_analog_pins[analog_slot].last_value = analogRead(pin);
+
+      break;
+  }
   }
 }
 
@@ -1837,7 +1839,7 @@ void scan_analog_inputs() {
             //trigger value achieved, send out the report
             the_analog_pins[i].last_value = value;
             // input_message[1] = the_analog_pins[i].pin_number;
-            report_message[2] = (byte)i;
+            report_message[2] = (byte)analog_read_pins[i];
             report_message[3] = highByte(value);  // get high order byte
             report_message[4] = lowByte(value);
             Serial1.write(report_message, 5);
