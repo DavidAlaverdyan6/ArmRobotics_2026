@@ -566,11 +566,29 @@ TwoWire *current_i2c_port;
 // To translate a pin number from an integer value to its analog pin number
 // equivalent, this array is used to look up the value to use for the pin.
 #ifdef ARDUINO_SAMD_MKRWIFI1010
-int analog_read_pins[20] = { A0, A1, A2, A3, A4, A5, A6 };
+int analog_read_pins[20] = {
+    A0, A1, A2, A3, A4, A5, A6
+};
+
 #elif ARDUINO_FSP
-int analog_read_pins[20] = { A0, A1, A2, A3, A4, A5 };
+int analog_read_pins[20] = {
+    A0, A1, A2, A3, A4, A5
+};
+
+#elif defined(ARDUINO_ARCH_STM32)
+int analog_read_pins[20] = {
+    PA0, PA1, PA2, PA3,
+    PA4, PA5, PA6, PA7,
+    PB0, PB1
+};
+
 #else
-int analog_read_pins[20] = { A0, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15 };
+int analog_read_pins[20] = {
+    A0, A1, A2, A3,
+    A4, A5, A6, A7,
+    A8, A9, A10, A11,
+    A12, A13, A14, A15
+};
 #endif
 
 // a descriptor for digital pins
@@ -2013,6 +2031,7 @@ void setup() {
   init_pin_structures();
 
   Serial1.begin(115200);
+  analogReadResolution(12);
 
   /*while (true) {
       Serial1.println("HELLO FROM STM32");
