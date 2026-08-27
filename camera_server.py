@@ -16,7 +16,7 @@ PAGE = """\
 </head>
 <body>
     <h1>Pi Camera</h1>
-    <img src="/stream.mjpg" width="640" height="480">
+    <img src="/stream.mjpg" width="800" height="600">
 </body>
 </html>
 """
@@ -102,7 +102,7 @@ picam2 = Picamera2()
 
 picam2.configure(
     picam2.create_video_configuration(
-        main={"size": (640, 480)}
+        main={"size": (800, 600)}
     )
 )
 
