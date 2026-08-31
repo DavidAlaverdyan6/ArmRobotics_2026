@@ -1,1234 +1,762 @@
-"""
-ArmRobotics Camera Server
-=========================
+# camera.py
+#
+# Central camera driver + HTTP preview server.
+#
+# Provides:
+#   camera.start()
+#   camera.stop()
+#   camera.get_frame()              -> BGR OpenCV frame
+#   camera.set_processed_frame()
+#   camera.get_processed_frame()
+#
+# HTTP:
+#   http://<PI-IP>:8000/
+#   http://<PI-IP>:8000/stream.mjpg
+#   http://<PI-IP>:8000/processed.mjpg
+#   http://<PI-IP>:8000/status
+#
+# No Telemetrix.
+# No motors.
+# No line-following logic.
 
-One shared camera node for the robot.
-
-FEATURES
---------
-
-1. Raw camera feed:
-
-       http://<PI-IP>:8000/
-
-   Shows the unmodified camera image.
-
-
-2. OpenCV processed feed:
-
-       http://<PI-IP>:8000/processed
-
-   Shows whatever frame OpenCV publishes through:
-
-       set_processed_frame(frame)
-
-
-3. OpenCV access:
-
-       from camera_server import get_frame
-
-       frame = get_frame()
-
-   Returns a BGR NumPy array suitable for OpenCV.
-
-
-4. Publish OpenCV result:
-
-       from camera_server import set_processed_frame
-
-       set_processed_frame(frame)
-
-
-5. One Picamera2 instance is used.
-
-The camera is NOT opened again every time get_frame()
-is called.
-"""
-
-import io
 import time
 import threading
-import socketserver
+import io
+import json
 
 import cv2
 import numpy as np
-
-from http import server
+from PIL import Image
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from picamera2 import Picamera2
-from picamera2.encoders import MJPEGEncoder
-from picamera2.outputs import FileOutput
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-CAMERA_WIDTH = 800
-CAMERA_HEIGHT = 600
+WIDTH = 416
+HEIGHT = 416
+
+JPEG_QUALITY = 75
 
 SERVER_HOST = "0.0.0.0"
 SERVER_PORT = 8000
 
-JPEG_QUALITY = 80
-
-FRAME_TIMEOUT = 2.0
+CAPTURE_DELAY = 0.001
 
 
 # ============================================================
-# CAMERA
+# CAMERA CLASS
 # ============================================================
 
-print()
-print("========================================")
-print("       ARMROBOTICS CAMERA SERVER")
-print("========================================")
-print()
+class Camera:
 
-print("Initializing Picamera2...")
+    def __init__(
+        self,
+        width=WIDTH,
+        height=HEIGHT,
+        host=SERVER_HOST,
+        port=SERVER_PORT
+    ):
 
+        self.width = width
+        self.height = height
 
-picam2 = Picamera2()
+        self.host = host
+        self.port = port
 
+        self.picam2 = None
 
-camera_config = picam2.create_video_configuration(
-    main={
-        "size": (
-            CAMERA_WIDTH,
-            CAMERA_HEIGHT
-        )
-    }
-)
+        self.running = False
 
+        self.capture_thread = None
+        self.server_thread = None
 
-picam2.configure(
-    camera_config
-)
-
-
-# ============================================================
-# RAW CAMERA STREAM
-# ============================================================
-
-class CameraOutput(io.BufferedIOBase):
-
-    def __init__(self):
-
-        super().__init__()
+        self.frame_lock = threading.Lock()
+        self.jpeg_lock = threading.Lock()
 
         self.frame = None
+        self.processed_frame = None
+
+        self.latest_jpeg = None
+        self.latest_processed_jpeg = None
 
         self.frame_number = 0
 
-        self.condition = threading.Condition()
+        self.start_time = None
+
+        self.server = None
 
 
-    def write(self, buf):
+    # ========================================================
+    # START
+    # ========================================================
 
-        with self.condition:
+    def start(self):
 
-            self.frame = bytes(buf)
-
-            self.frame_number += 1
-
-            self.condition.notify_all()
-
-        return len(buf)
-
-
-raw_output = CameraOutput()
-
-
-# ============================================================
-# PROCESSED OPENCV FRAME
-# ============================================================
-
-processed_frame = None
-
-processed_jpeg = None
-
-processed_frame_number = 0
-
-processed_condition = threading.Condition()
-
-
-# ============================================================
-# CAMERA STATE
-# ============================================================
-
-camera_started = False
-
-camera_lock = threading.Lock()
-
-
-# ============================================================
-# START CAMERA
-# ============================================================
-
-def start_camera():
-
-    global camera_started
-
-    with camera_lock:
-
-        if camera_started:
-
+        if self.running:
             return
 
+        print()
+        print("========================================")
+        print("Starting camera")
+        print("========================================")
+
+        self.picam2 = Picamera2()
+
+        config = self.picam2.create_preview_configuration(
+            main={
+                "size": (
+                    self.width,
+                    self.height
+                ),
+                "format": "RGB888"
+            }
+        )
+
+        self.picam2.configure(config)
+
+        self.picam2.start()
+
+        time.sleep(1)
+
+        self.running = True
+        self.start_time = time.monotonic()
 
         print(
-            f"Camera resolution: "
-            f"{CAMERA_WIDTH}x{CAMERA_HEIGHT}"
+            f"Camera started: "
+            f"{self.width}x{self.height}"
         )
 
-        print("Starting camera...")
+        # ----------------------------------------------------
+        # Capture thread
+        # ----------------------------------------------------
 
-
-        picam2.start_recording(
-            MJPEGEncoder()
-            ,
-            FileOutput(
-                raw_output
-            )
+        self.capture_thread = threading.Thread(
+            target=self._capture_loop,
+            daemon=True
         )
 
+        self.capture_thread.start()
 
-        time.sleep(
-            1
+        # ----------------------------------------------------
+        # HTTP server
+        # ----------------------------------------------------
+
+        self.server_thread = threading.Thread(
+            target=self._server_loop,
+            daemon=True
         )
 
+        self.server_thread.start()
 
-        camera_started = True
-
-
-        print("Camera ready.")
+        print()
+        print("Camera server:")
+        print(
+            f"http://<PI-IP>:{self.port}"
+        )
         print()
 
 
-# ============================================================
-# GET RAW JPEG
-# ============================================================
+    # ========================================================
+    # STOP
+    # ========================================================
 
-def get_raw_jpeg():
+    def stop(self):
 
-    """
-    Return the latest raw camera JPEG.
+        if not self.running:
+            return
 
-    Returns:
-        bytes
-    """
+        print("Stopping camera...")
 
-    if not camera_started:
+        self.running = False
 
-        start_camera()
+        if self.server is not None:
+
+            try:
+                self.server.shutdown()
+            except Exception:
+                pass
+
+            try:
+                self.server.server_close()
+            except Exception:
+                pass
+
+        if self.picam2 is not None:
+
+            try:
+                self.picam2.stop()
+            except Exception:
+                pass
+
+            self.picam2 = None
+
+        print("Camera stopped.")
 
 
-    with raw_output.condition:
+    # ========================================================
+    # CAPTURE LOOP
+    # ========================================================
 
-        if raw_output.frame is None:
+    def _capture_loop(self):
 
-            if not raw_output.condition.wait(
-                timeout=FRAME_TIMEOUT
-            ):
+        print("Camera capture thread started.")
 
-                raise TimeoutError(
-                    "Timed out waiting for camera frame."
+        while self.running:
+
+            try:
+
+                frame = self.picam2.capture_array()
+
+                # Picamera2 is configured as RGB888.
+                # OpenCV expects BGR.
+
+                frame = cv2.cvtColor(
+                    frame,
+                    cv2.COLOR_RGB2BGR
                 )
 
+                with self.frame_lock:
 
-        frame = raw_output.frame
+                    self.frame = frame.copy()
 
+                    self.frame_number += 1
 
-    if frame is None:
+                # ------------------------------------------------
+                # Generate JPEG for browser preview
+                # ------------------------------------------------
 
-        raise RuntimeError(
-            "Camera frame unavailable."
-        )
+                self._update_jpeg(
+                    frame
+                )
 
+            except Exception as e:
 
-    return frame
+                print(
+                    "Camera capture error:",
+                    e
+                )
 
+                time.sleep(0.1)
 
-# ============================================================
-# GET RAW OPENCV FRAME
-# ============================================================
+            time.sleep(
+                CAPTURE_DELAY
+            )
 
-def get_frame():
-
-    """
-    Return the latest camera frame.
-
-    The returned image is:
-
-        NumPy ndarray
-        BGR
-        OpenCV compatible
-
-    Example:
-
-        frame = get_frame()
-
-        cv2.line(
-            frame,
-            (0, 300),
-            (800, 300),
-            (0, 255, 0),
-            2
-        )
-    """
-
-    jpeg = get_raw_jpeg()
+        print("Camera capture thread stopped.")
 
 
-    array = np.frombuffer(
-        jpeg,
-        dtype=np.uint8
-    )
+    # ========================================================
+    # JPEG GENERATION
+    # ========================================================
 
-
-    frame = cv2.imdecode(
-        array,
-        cv2.IMREAD_COLOR
-    )
-
-
-    if frame is None:
-
-        raise RuntimeError(
-            "OpenCV could not decode camera frame."
-        )
-
-
-    return frame
-
-
-# ============================================================
-# GET FRAME COPY
-# ============================================================
-
-def get_frame_copy():
-
-    """
-    Return an independent copy of the camera frame.
-    """
-
-    return get_frame().copy()
-
-
-# ============================================================
-# SET PROCESSED FRAME
-# ============================================================
-
-def set_processed_frame(frame):
-
-    """
-    Publish an OpenCV frame to the website.
-
-    The frame must be a NumPy image.
-
-    Normally this is a BGR OpenCV image.
-
-    Example:
-
-        frame = get_frame()
-
-        cv2.line(
-            frame,
-            (0, 300),
-            (800, 300),
-            (0, 255, 0),
-            2
-        )
-
-        set_processed_frame(frame)
-    """
-
-    global processed_frame
-    global processed_jpeg
-    global processed_frame_number
-
-
-    if frame is None:
-
-        return
-
-
-    if not isinstance(
-        frame,
-        np.ndarray
+    def _update_jpeg(
+        self,
+        frame
     ):
 
-        raise TypeError(
-            "Processed frame must be a NumPy array."
-        )
+        try:
+
+            success, encoded = cv2.imencode(
+                ".jpg",
+                frame,
+                [
+                    cv2.IMWRITE_JPEG_QUALITY,
+                    JPEG_QUALITY
+                ]
+            )
+
+            if success:
+
+                jpeg = encoded.tobytes()
+
+                with self.jpeg_lock:
+
+                    self.latest_jpeg = jpeg
+
+        except Exception as e:
+
+            print(
+                "JPEG error:",
+                e
+            )
 
 
-    if frame.ndim != 3:
+    # ========================================================
+    # GET CURRENT FRAME
+    # ========================================================
 
-        raise ValueError(
-            "Processed frame must be a 3-channel image."
-        )
+    def get_frame(self):
 
+        with self.frame_lock:
 
-    # --------------------------------------------------------
-    # Make a copy.
-    #
-    # This is important because the caller may continue
-    # modifying its OpenCV frame after this function returns.
-    # --------------------------------------------------------
+            if self.frame is None:
+                return None
 
-    frame_copy = frame.copy()
+            return self.frame.copy()
 
 
-    # --------------------------------------------------------
-    # Make sure it is BGR.
-    #
-    # Normally it already is because get_frame() returns BGR.
-    # --------------------------------------------------------
+    # ========================================================
+    # GET FRAME NUMBER
+    # ========================================================
 
-    if frame_copy.shape[2] == 4:
+    def get_frame_number(self):
 
-        frame_copy = cv2.cvtColor(
-            frame_copy,
-            cv2.COLOR_BGRA2BGR
-        )
+        with self.frame_lock:
+
+            return self.frame_number
 
 
-    # --------------------------------------------------------
-    # Encode for browser.
-    # --------------------------------------------------------
+    # ========================================================
+    # SET PROCESSED FRAME
+    # ========================================================
 
-    success, encoded = cv2.imencode(
-        ".jpg",
-        frame_copy,
-        [
-            cv2.IMWRITE_JPEG_QUALITY,
-            JPEG_QUALITY
-        ]
-    )
+    def set_processed_frame(
+        self,
+        frame
+    ):
 
+        if frame is None:
+            return
 
-    if not success:
+        with self.frame_lock:
 
-        return
+            self.processed_frame = frame.copy()
 
+        try:
 
-    jpeg = encoded.tobytes()
+            success, encoded = cv2.imencode(
+                ".jpg",
+                frame,
+                [
+                    cv2.IMWRITE_JPEG_QUALITY,
+                    JPEG_QUALITY
+                ]
+            )
 
+            if success:
 
-    # --------------------------------------------------------
-    # Store both image and JPEG.
-    # --------------------------------------------------------
+                jpeg = encoded.tobytes()
 
-    with processed_condition:
+                with self.jpeg_lock:
 
-        processed_frame = frame_copy
+                    self.latest_processed_jpeg = jpeg
 
-        processed_jpeg = jpeg
+        except Exception as e:
 
-        processed_frame_number += 1
-
-        processed_condition.notify_all()
-
-
-# ============================================================
-# GET PROCESSED FRAME
-# ============================================================
-
-def get_processed_frame():
-
-    """
-    Return the latest OpenCV processed frame.
-
-    Returns:
-        NumPy BGR image
-
-    Returns None if OpenCV has not published a frame yet.
-    """
-
-    with processed_condition:
-
-        if processed_frame is None:
-
-            return None
-
-        return processed_frame.copy()
+            print(
+                "Processed JPEG error:",
+                e
+            )
 
 
-# ============================================================
-# GET PROCESSED JPEG
-# ============================================================
+    # ========================================================
+    # GET PROCESSED FRAME
+    # ========================================================
 
-def get_processed_jpeg():
+    def get_processed_frame(self):
 
-    """
-    Return the latest processed JPEG.
+        with self.frame_lock:
 
-    Returns None until OpenCV publishes its first frame.
-    """
+            if self.processed_frame is None:
+                return None
 
-    with processed_condition:
-
-        if processed_jpeg is None:
-
-            return None
-
-        return processed_jpeg
+            return self.processed_frame.copy()
 
 
-# ============================================================
-# HTML PAGE
-# ============================================================
+    # ========================================================
+    # STATUS
+    # ========================================================
 
-PAGE = f"""
+    def get_status(self):
+
+        uptime = 0
+
+        if self.start_time is not None:
+
+            uptime = (
+                time.monotonic()
+                - self.start_time
+            )
+
+        return {
+            "running": self.running,
+            "width": self.width,
+            "height": self.height,
+            "frame": self.frame_number,
+            "uptime": round(
+                uptime,
+                2
+            )
+        }
+
+
+    # ========================================================
+    # HTTP SERVER
+    # ========================================================
+
+    def _server_loop(self):
+
+        camera_instance = self
+
+        class Handler(
+            BaseHTTPRequestHandler
+        ):
+
+            # ==================================================
+            # GET
+            # ==================================================
+
+            def do_GET(self):
+
+                # ----------------------------------------------
+                # MAIN PAGE
+                # ----------------------------------------------
+
+                if self.path == "/":
+
+                    self.send_response(
+                        200
+                    )
+
+                    self.send_header(
+                        "Content-Type",
+                        "text/html"
+                    )
+
+                    self.end_headers()
+
+                    page = f"""
 <!DOCTYPE html>
 
 <html>
 
 <head>
 
-<meta charset="UTF-8">
-
-<meta name="viewport"
-      content="width=device-width, initial-scale=1">
-
-<title>ArmRobotics Camera</title>
+<title>Robot Camera</title>
 
 <style>
 
 body {{
-
     background: #111;
-
     color: white;
-
-    font-family: Arial, sans-serif;
-
-    margin: 0;
-
-    padding: 20px;
-
+    font-family: Arial;
     text-align: center;
-
-}}
-
-h1 {{
-
-    margin-top: 5px;
-
-    margin-bottom: 25px;
-
+    margin: 0;
+    padding: 20px;
 }}
 
 .container {{
-
     display: flex;
-
-    justify-content: center;
-
-    align-items: flex-start;
-
-    gap: 25px;
-
     flex-wrap: wrap;
-
+    justify-content: center;
+    gap: 20px;
 }}
 
-.camera-box {{
-
-    background: #222;
-
-    padding: 12px;
-
-    border-radius: 10px;
-
-    width: {CAMERA_WIDTH}px;
-
-    max-width: 90vw;
-
-    box-sizing: border-box;
-
+.camera {{
+    display: flex;
+    flex-direction: column;
+    align-items: center;
 }}
 
-.camera-box h2 {{
-
-    margin-top: 5px;
-
-    margin-bottom: 10px;
-
-    font-size: 20px;
-
-}}
-
-.camera-box img {{
-
-    width: 100%;
-
+img {{
+    width: {camera_instance.width * 2}px;
+    max-width: 95vw;
     height: auto;
-
-    display: block;
-
-    border-radius: 5px;
-
 }}
 
-.status {{
+h1 {{
+    margin-bottom: 10px;
+}}
 
-    margin-top: 20px;
-
-    color: #aaa;
-
-    font-size: 14px;
-
+h2 {{
+    margin-bottom: 5px;
 }}
 
 </style>
 
 </head>
 
-
 <body>
 
-<h1>ArmRobotics Camera</h1>
-
+<h1>Robot Camera</h1>
 
 <div class="container">
 
+<div class="camera">
 
-    <div class="camera-box">
+<h2>Live</h2>
 
-        <h2>Raw Camera</h2>
-
-        <img
-            src="/stream.mjpg"
-            alt="Raw camera feed"
-        >
-
-    </div>
-
-
-    <div class="camera-box">
-
-        <h2>OpenCV Processed</h2>
-
-        <img
-            src="/processed.mjpg"
-            alt="OpenCV processed feed"
-        >
-
-    </div>
-
+<img src="/stream.mjpg">
 
 </div>
 
+<div class="camera">
 
-<div class="status">
+<h2>Processed</h2>
 
-    Camera: {CAMERA_WIDTH}x{CAMERA_HEIGHT}
-
-    &nbsp; | &nbsp;
-
-    Port: {SERVER_PORT}
+<img src="/processed.mjpg">
 
 </div>
 
+</div>
 
 </body>
 
 </html>
 """
 
-
-# ============================================================
-# HTTP HANDLER
-# ============================================================
-
-class StreamingHandler(
-    server.BaseHTTPRequestHandler
-):
-
-
-    # ========================================================
-    # GET
-    # ========================================================
-
-    def do_GET(self):
-
-
-        # ----------------------------------------------------
-        # MAIN PAGE
-        # ----------------------------------------------------
-
-        if self.path == "/":
-
-            self.send_response(
-                200
-            )
-
-            self.send_header(
-                "Content-Type",
-                "text/html; charset=utf-8"
-            )
-
-            self.send_header(
-                "Cache-Control",
-                "no-cache"
-            )
-
-            self.end_headers()
-
-
-            try:
-
-                self.wfile.write(
-                    PAGE.encode(
-                        "utf-8"
+                    self.wfile.write(
+                        page.encode()
                     )
+
+                    return
+
+
+                # ----------------------------------------------
+                # LIVE STREAM
+                # ----------------------------------------------
+
+                if self.path == "/stream.mjpg":
+
+                    self._stream(
+                        processed=False
+                    )
+
+                    return
+
+
+                # ----------------------------------------------
+                # PROCESSED STREAM
+                # ----------------------------------------------
+
+                if self.path == "/processed.mjpg":
+
+                    self._stream(
+                        processed=True
+                    )
+
+                    return
+
+
+                # ----------------------------------------------
+                # STATUS
+                # ----------------------------------------------
+
+                if self.path == "/status":
+
+                    status = (
+                        camera_instance
+                        .get_status()
+                    )
+
+                    data = json.dumps(
+                        status
+                    ).encode()
+
+                    self.send_response(
+                        200
+                    )
+
+                    self.send_header(
+                        "Content-Type",
+                        "application/json"
+                    )
+
+                    self.send_header(
+                        "Content-Length",
+                        str(len(data))
+                    )
+
+                    self.end_headers()
+
+                    self.wfile.write(
+                        data
+                    )
+
+                    return
+
+
+                # ----------------------------------------------
+                # 404
+                # ----------------------------------------------
+
+                self.send_error(
+                    404
                 )
 
-            except (
-                BrokenPipeError,
-                ConnectionResetError
+
+            # ==================================================
+            # STREAM
+            # ==================================================
+
+            def _stream(
+                self,
+                processed=False
             ):
 
-                pass
+                self.send_response(
+                    200
+                )
+
+                self.send_header(
+                    "Cache-Control",
+                    "no-cache"
+                )
+
+                self.send_header(
+                    "Pragma",
+                    "no-cache"
+                )
+
+                self.send_header(
+                    "Content-Type",
+                    "multipart/x-mixed-replace; boundary=frame"
+                )
+
+                self.end_headers()
+
+                try:
+
+                    while camera_instance.running:
+
+                        with camera_instance.jpeg_lock:
+
+                            if processed:
+
+                                jpeg = (
+                                    camera_instance
+                                    .latest_processed_jpeg
+                                )
+
+                            else:
+
+                                jpeg = (
+                                    camera_instance
+                                    .latest_jpeg
+                                )
+
+                        if jpeg is None:
+
+                            time.sleep(
+                                0.01
+                            )
+
+                            continue
+
+                        self.wfile.write(
+                            b"--frame\r\n"
+                        )
+
+                        self.wfile.write(
+                            b"Content-Type: image/jpeg\r\n"
+                        )
+
+                        self.wfile.write(
+                            f"Content-Length: "
+                            f"{len(jpeg)}\r\n\r\n"
+                            .encode()
+                        )
+
+                        self.wfile.write(
+                            jpeg
+                        )
+
+                        self.wfile.write(
+                            b"\r\n"
+                        )
+
+                        self.wfile.flush()
+
+                        time.sleep(
+                            0.03
+                        )
+
+                except (
+                    BrokenPipeError,
+                    ConnectionResetError
+                ):
+
+                    pass
 
 
-            return
+            # ==================================================
+            # LOG
+            # ==================================================
 
+            def log_message(
+                self,
+                format,
+                *args
+            ):
 
-        # ----------------------------------------------------
-        # RAW CAMERA STREAM
-        # ----------------------------------------------------
-
-        if self.path == "/stream.mjpg":
-
-            self.stream_raw()
-
-            return
-
-
-        # ----------------------------------------------------
-        # PROCESSED STREAM
-        # ----------------------------------------------------
-
-        if self.path == "/processed.mjpg":
-
-            self.stream_processed()
-
-            return
-
-
-        # ----------------------------------------------------
-        # INVALID URL
-        # ----------------------------------------------------
-
-        self.send_error(
-            404
-        )
-
-
-    # ========================================================
-    # RAW STREAM
-    # ========================================================
-
-    def stream_raw(self):
-
-        self.send_response(
-            200
-        )
-
-        self.send_header(
-            "Cache-Control",
-            "no-cache, private"
-        )
-
-        self.send_header(
-            "Pragma",
-            "no-cache"
-        )
-
-        self.send_header(
-            "Content-Type",
-            "multipart/x-mixed-replace; boundary=FRAME"
-        )
-
-        self.end_headers()
-
-
-        last_frame = -1
+                return
 
 
         try:
 
-            while camera_started:
+            self.server = HTTPServer(
+                (
+                    self.host,
+                    self.port
+                ),
+                Handler
+            )
 
-                with raw_output.condition:
+            print(
+                f"HTTP camera server listening "
+                f"on port {self.port}"
+            )
 
-                    while (
-                        raw_output.frame_number
-                        == last_frame
-                    ):
+            self.server.serve_forever()
 
-                        raw_output.condition.wait(
-                            timeout=1
-                        )
+        except Exception as e:
 
+            if self.running:
 
-                    frame = raw_output.frame
-
-                    number = (
-                        raw_output.frame_number
-                    )
-
-
-                if frame is None:
-
-                    continue
-
-
-                last_frame = number
-
-
-                self.wfile.write(
-                    b"--FRAME\r\n"
+                print(
+                    "Camera server error:",
+                    e
                 )
 
-                self.wfile.write(
-                    b"Content-Type: image/jpeg\r\n"
-                )
 
-                self.wfile.write(
-                    (
-                        f"Content-Length: "
-                        f"{len(frame)}\r\n\r\n"
-                    ).encode()
-                )
+# ============================================================
+# GLOBAL CAMERA INSTANCE
+# ============================================================
 
-                self.wfile.write(
-                    frame
-                )
-
-                self.wfile.write(
-                    b"\r\n"
-                )
-
-                self.wfile.flush()
-
-
-        except (
-            BrokenPipeError,
-            ConnectionResetError
-        ):
-
-            pass
-
-
-    # ========================================================
-    # PROCESSED STREAM
-    # ========================================================
-
-    def stream_processed(self):
-
-        self.send_response(
-            200
-        )
-
-        self.send_header(
-            "Cache-Control",
-            "no-cache, private"
-        )
-
-        self.send_header(
-            "Pragma",
-            "no-cache"
-        )
-
-        self.send_header(
-            "Content-Type",
-            "multipart/x-mixed-replace; boundary=FRAME"
-        )
-
-        self.end_headers()
-
-
-        last_frame = -1
-
-
-        try:
-
-            while camera_started:
-
-                with processed_condition:
-
-                    while (
-                        processed_frame_number
-                        == last_frame
-                    ):
-
-                        processed_condition.wait(
-                            timeout=1
-                        )
-
-
-                    frame = processed_jpeg
-
-                    number = (
-                        processed_frame_number
-                    )
-
-
-                # ------------------------------------------------
-                # OpenCV hasn't published anything yet.
-                # ------------------------------------------------
-
-                if frame is None:
-
-                    # Send a simple black frame instead of
-                    # leaving the browser waiting forever.
-
-                    placeholder = np.zeros(
-                        (
-                            CAMERA_HEIGHT,
-                            CAMERA_WIDTH,
-                            3
-                        ),
-                        dtype=np.uint8
-                    )
-
-
-                    cv2.putText(
-                        placeholder,
-                        "Waiting for OpenCV...",
-                        (
-                            180,
-                            CAMERA_HEIGHT // 2
-                        ),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1.0,
-                        (255, 255, 255),
-                        2,
-                        cv2.LINE_AA
-                    )
-
-
-                    success, encoded = cv2.imencode(
-                        ".jpg",
-                        placeholder,
-                        [
-                            cv2.IMWRITE_JPEG_QUALITY,
-                            JPEG_QUALITY
-                        ]
-                    )
-
-
-                    if not success:
-
-                        continue
-
-
-                    frame = encoded.tobytes()
-
-                    number = 0
-
-
-                if number != 0:
-
-                    last_frame = number
-
-
-                self.wfile.write(
-                    b"--FRAME\r\n"
-                )
-
-                self.wfile.write(
-                    b"Content-Type: image/jpeg\r\n"
-                )
-
-                self.wfile.write(
-                    (
-                        f"Content-Length: "
-                        f"{len(frame)}\r\n\r\n"
-                    ).encode()
-                )
-
-                self.wfile.write(
-                    frame
-                )
-
-                self.wfile.write(
-                    b"\r\n"
-                )
-
-                self.wfile.flush()
-
-
-        except (
-            BrokenPipeError,
-            ConnectionResetError
-        ):
-
-            pass
-
-
-    # ========================================================
-    # DISABLE HTTP LOGGING
-    # ========================================================
-
-    def log_message(
-        self,
-        format,
-        *args
-    ):
-
-        return
+camera = Camera()
 
 
 # ============================================================
-# THREADED HTTP SERVER
-# ============================================================
-
-class StreamingServer(
-    socketserver.ThreadingMixIn,
-    server.HTTPServer
-):
-
-    allow_reuse_address = True
-
-    daemon_threads = True
-
-
-# ============================================================
-# SERVER STATE
-# ============================================================
-
-http_server = None
-
-server_thread = None
-
-server_lock = threading.Lock()
-
-
-# ============================================================
-# START WEB SERVER
-# ============================================================
-
-def start_server():
-
-    """
-    Start the camera and HTTP server.
-
-    Safe to call multiple times.
-    """
-
-    global http_server
-    global server_thread
-
-
-    with server_lock:
-
-        if (
-            server_thread is not None
-            and server_thread.is_alive()
-        ):
-
-            return
-
-
-        start_camera()
-
-
-        http_server = StreamingServer(
-            (
-                SERVER_HOST,
-                SERVER_PORT
-            ),
-            StreamingHandler
-        )
-
-
-        server_thread = threading.Thread(
-            target=http_server.serve_forever,
-            daemon=True
-        )
-
-
-        server_thread.start()
-
-
-        print(
-            "========================================"
-        )
-
-        print(
-            "CAMERA SERVER STARTED"
-        )
-
-        print(
-            f"Resolution: "
-            f"{CAMERA_WIDTH}x{CAMERA_HEIGHT}"
-        )
-
-        print()
-
-        print(
-            "Website:"
-        )
-
-        print(
-            f"http://<PI-IP>:{SERVER_PORT}"
-        )
-
-        print()
-
-        print(
-            "Raw stream:"
-        )
-
-        print(
-            f"http://<PI-IP>:{SERVER_PORT}/stream.mjpg"
-        )
-
-        print()
-
-        print(
-            "OpenCV stream:"
-        )
-
-        print(
-            f"http://<PI-IP>:{SERVER_PORT}/processed.mjpg"
-        )
-
-        print(
-            "========================================"
-        )
-
-        print()
-
-
-# ============================================================
-# STOP SERVER
-# ============================================================
-
-def stop_server():
-
-    """
-    Stop the HTTP server.
-    """
-
-    global http_server
-    global server_thread
-
-
-    with server_lock:
-
-        if http_server is not None:
-
-            try:
-
-                http_server.shutdown()
-
-            except Exception:
-
-                pass
-
-
-            try:
-
-                http_server.server_close()
-
-            except Exception:
-
-                pass
-
-
-            http_server = None
-
-
-        server_thread = None
-
-
-# ============================================================
-# STOP CAMERA
-# ============================================================
-
-def stop_camera():
-
-    """
-    Safely stop HTTP server and Picamera2.
-    """
-
-    global camera_started
-
-
-    stop_server()
-
-
-    with camera_lock:
-
-        if camera_started:
-
-            try:
-
-                picam2.stop_recording()
-
-            except Exception:
-
-                pass
-
-
-            camera_started = False
-
-
-    print(
-        "Camera stopped."
-    )
-
-
-# ============================================================
-# CAMERA STATUS
-# ============================================================
-
-def camera_running():
-
-    return camera_started
-
-
-# ============================================================
-# MAIN
+# RUN DIRECTLY
 # ============================================================
 
 if __name__ == "__main__":
 
     try:
 
-        start_server()
+        camera.start()
 
+        print(
+            "Camera service running."
+        )
 
         print(
             "Press CTRL+C to stop."
         )
 
-
         while True:
 
-            time.sleep(
-                1
-            )
-
+            time.sleep(1)
 
     except KeyboardInterrupt:
 
-        print()
-        print(
-            "Stopping camera server..."
-        )
-
+        pass
 
     finally:
 
-        stop_camera()
+        camera.stop()
 
-        print(
-            "Camera server stopped safely."
-        )
