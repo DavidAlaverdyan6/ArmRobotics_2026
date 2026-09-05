@@ -145,17 +145,9 @@ class Camera:
 
                 # Picamera2 gives us RGB888 here.
 
-                frame_rgb = self.picam2.capture_array()
-
-                # Convert ONCE to BGR for OpenCV.
-
-                frame_bgr = cv2.cvtColor(
-                    frame_rgb,
-                    cv2.COLOR_RGB2BGR
-                )
+                frame_bgr = self.picam2.capture_array()
 
                 with self.frame_lock:
-
                     self.latest_frame = frame_bgr.copy()
 
 
