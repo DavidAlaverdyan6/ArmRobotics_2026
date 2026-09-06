@@ -1,10 +1,9 @@
-import io
+import socket
 import threading
 import time
 
 import cv2
 import numpy as np
-from PIL import Image
 from picamera2 import Picamera2
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -20,7 +19,12 @@ SERVER_HOST = "0.0.0.0"
 SERVER_PORT = 8000
 
 JPEG_QUALITY = 75
-STREAM_DELAY = 0.03
+
+# Small delay prevents the server from hammering the network.
+STREAM_DELAY = 0.01
+
+# Don't allow a stuck network connection to block forever.
+SOCKET_TIMEOUT = 2.0
 
 
 # ============================================================
@@ -36,7 +40,6 @@ class Camera:
         host=SERVER_HOST,
         port=SERVER_PORT
     ):
-
         self.width = width
         self.height = height
 
@@ -45,6 +48,8 @@ class Camera:
 
         self.running = False
 
+        # Latest-frame buffers.
+        # These are replaced, never queued.
         self.latest_frame = None
         self.latest_processed = None
 
@@ -104,8 +109,7 @@ class Camera:
 
         print("Camera ready.")
 
-        # Start capture thread.
-
+        # Capture thread
         self.capture_thread = threading.Thread(
             target=self._capture_loop,
             daemon=True
@@ -113,8 +117,7 @@ class Camera:
 
         self.capture_thread.start()
 
-        # Start HTTP server.
-
+        # HTTP server thread
         self.server_thread = threading.Thread(
             target=self._server_loop,
             daemon=True
@@ -143,13 +146,13 @@ class Camera:
 
             try:
 
-                # Picamera2 gives us RGB888 here.
+                # capture_array() already returns a new NumPy
+                # array, so no additional copy is necessary.
 
-                frame_bgr = self.picam2.capture_array()
+                frame = self.picam2.capture_array()
 
                 with self.frame_lock:
-                    self.latest_frame = frame_bgr.copy()
-
+                    self.latest_frame = frame
 
             except Exception as e:
 
@@ -167,52 +170,21 @@ class Camera:
 
     def get_frame(self):
 
-        """
-        Return latest camera frame.
-
-        FORMAT:
-            OpenCV BGR uint8 NumPy array.
-
-        Returns:
-            numpy.ndarray or None
-        """
-
         with self.frame_lock:
-
-            if self.latest_frame is None:
-                return None
-
-            return self.latest_frame.copy()
+            return self.latest_frame
 
 
     # ========================================================
     # SET PROCESSED FRAME
     # ========================================================
 
-    def set_processed_frame(
-        self,
-        frame
-    ):
-
-        """
-        Publish an OpenCV image to the processed stream.
-
-        Input may be:
-
-            BGR color image
-            grayscale image
-            binary image
-
-        It is copied so the caller can safely
-        continue processing.
-        """
+    def set_processed_frame(self, frame):
 
         if frame is None:
             return
 
         with self.processed_lock:
-
-            self.latest_processed = frame.copy()
+            self.latest_processed = frame
 
 
     # ========================================================
@@ -222,56 +194,28 @@ class Camera:
     def get_processed_frame(self):
 
         with self.processed_lock:
-
-            if self.latest_processed is None:
-                return None
-
-            return self.latest_processed.copy()
+            return self.latest_processed
 
 
     # ========================================================
     # JPEG ENCODING
     # ========================================================
 
-    def _encode_jpeg(
-        self,
-        frame
-    ):
+    def _encode_jpeg(self, frame):
 
         if frame is None:
             return None
 
         try:
 
-            # ------------------------------------------------
-            # Grayscale / binary image
-            # ------------------------------------------------
-
-            if len(frame.shape) == 2:
-
-                success, encoded = cv2.imencode(
-                    ".jpg",
-                    frame,
-                    [
-                        cv2.IMWRITE_JPEG_QUALITY,
-                        JPEG_QUALITY
-                    ]
-                )
-
-            # ------------------------------------------------
-            # BGR image
-            # ------------------------------------------------
-
-            else:
-
-                success, encoded = cv2.imencode(
-                    ".jpg",
-                    frame,
-                    [
-                        cv2.IMWRITE_JPEG_QUALITY,
-                        JPEG_QUALITY
-                    ]
-                )
+            success, encoded = cv2.imencode(
+                ".jpg",
+                frame,
+                [
+                    cv2.IMWRITE_JPEG_QUALITY,
+                    JPEG_QUALITY
+                ]
+            )
 
             if not success:
                 return None
@@ -296,10 +240,10 @@ class Camera:
 
         camera = self
 
+        class Handler(BaseHTTPRequestHandler):
 
-        class Handler(
-            BaseHTTPRequestHandler
-        ):
+            # Prevent unnecessary buffering.
+            wbufsize = 0
 
             # ------------------------------------------------
             # ROOT PAGE
@@ -308,10 +252,6 @@ class Camera:
             def do_GET(self):
 
                 path = self.path.split("?")[0]
-
-                # --------------------------------------------
-                # MAIN PAGE
-                # --------------------------------------------
 
                 if path == "/":
 
@@ -405,6 +345,11 @@ img {
 
                     self.send_header(
                         "Cache-Control",
+                        "no-cache, no-store, must-revalidate"
+                    )
+
+                    self.send_header(
+                        "Pragma",
                         "no-cache"
                     )
 
@@ -417,41 +362,25 @@ img {
                     return
 
 
-                # --------------------------------------------
-                # RAW STREAM ALIASES
-                # --------------------------------------------
-
+                # Raw stream
                 if path in (
                     "/stream",
                     "/stream.mjpg"
                 ):
 
-                    self._stream(
-                        processed=False
-                    )
-
+                    self._stream(processed=False)
                     return
 
 
-                # --------------------------------------------
-                # PROCESSED STREAM ALIASES
-                # --------------------------------------------
-
+                # Processed stream
                 if path in (
                     "/processed",
                     "/processed.mjpg"
                 ):
 
-                    self._stream(
-                        processed=True
-                    )
-
+                    self._stream(processed=True)
                     return
 
-
-                # --------------------------------------------
-                # 404
-                # --------------------------------------------
 
                 self.send_error(
                     404,
@@ -463,16 +392,13 @@ img {
             # MJPEG STREAM
             # ------------------------------------------------
 
-            def _stream(
-                self,
-                processed=False
-            ):
+            def _stream(self, processed=False):
 
                 self.send_response(200)
 
                 self.send_header(
                     "Cache-Control",
-                    "no-cache"
+                    "no-cache, no-store, must-revalidate"
                 )
 
                 self.send_header(
@@ -492,9 +418,40 @@ img {
 
                 self.end_headers()
 
+                # Configure the actual TCP socket.
+                try:
+
+                    self.connection.setsockopt(
+                        socket.IPPROTO_TCP,
+                        socket.TCP_NODELAY,
+                        1
+                    )
+
+                    self.connection.settimeout(
+                        SOCKET_TIMEOUT
+                    )
+
+                except Exception:
+                    pass
+
+
+                # Empty processed frame.
+                empty_frame = np.zeros(
+                    (
+                        camera.height,
+                        camera.width,
+                        3
+                    ),
+                    dtype=np.uint8
+                )
+
                 try:
 
                     while camera.running:
+
+                        # ------------------------------------
+                        # GET LATEST FRAME
+                        # ------------------------------------
 
                         if processed:
 
@@ -502,87 +459,77 @@ img {
                                 camera.get_processed_frame()
                             )
 
-                            # If processing hasn't published
-                            # anything yet, display a black image.
-
                             if frame is None:
-
-                                frame = np.zeros(
-                                    (
-                                        camera.height,
-                                        camera.width
-                                    ),
-                                    dtype=np.uint8
-                                )
+                                frame = empty_frame
 
                         else:
 
-                            frame = (
-                                camera.get_frame()
-                            )
+                            frame = camera.get_frame()
+
 
                         if frame is None:
 
-                            time.sleep(0.01)
-
+                            time.sleep(0.005)
                             continue
 
 
                         # ------------------------------------
-                        # JPEG
+                        # JPEG ENCODE
                         # ------------------------------------
 
-                        jpeg = camera._encode_jpeg(
-                            frame
-                        )
+                        jpeg = camera._encode_jpeg(frame)
 
                         if jpeg is None:
 
-                            time.sleep(0.01)
-
+                            time.sleep(0.005)
                             continue
 
 
                         # ------------------------------------
-                        # SEND FRAME
+                        # BUILD COMPLETE MJPEG PACKET
                         # ------------------------------------
 
-                        self.wfile.write(
+                        header = (
                             b"--frame\r\n"
-                        )
-
-                        self.wfile.write(
                             b"Content-Type: image/jpeg\r\n"
-                        )
-
-                        self.wfile.write(
+                            +
                             (
                                 f"Content-Length: "
                                 f"{len(jpeg)}\r\n\r\n"
-                            ).encode()
+                            ).encode("ascii")
                         )
 
-                        self.wfile.write(
-                            jpeg
+                        packet = (
+                            header
+                            + jpeg
+                            + b"\r\n"
                         )
 
-                        self.wfile.write(
-                            b"\r\n"
-                        )
 
+                        # ------------------------------------
+                        # SEND COMPLETE FRAME
+                        # ------------------------------------
+
+                        self.wfile.write(packet)
                         self.wfile.flush()
 
-                        time.sleep(
-                            STREAM_DELAY
-                        )
+
+                        # ------------------------------------
+                        # SMALL NETWORK-FRIENDLY DELAY
+                        # ------------------------------------
+
+                        time.sleep(STREAM_DELAY)
 
 
                 except (
                     BrokenPipeError,
                     ConnectionResetError,
-                    ConnectionAbortedError
+                    ConnectionAbortedError,
+                    TimeoutError,
+                    socket.timeout
                 ):
 
+                    # Client disconnected or stopped receiving.
                     pass
 
                 except Exception as e:
@@ -593,13 +540,17 @@ img {
                     )
 
 
+            # ------------------------------------------------
+            # DISABLE HTTP LOGGING
+            # ------------------------------------------------
+
             def log_message(
                 self,
                 format,
                 *args
             ):
 
-                return
+                pass
 
 
         try:
@@ -612,10 +563,12 @@ img {
                 Handler
             )
 
+            # Allows quick restart after stopping the server.
+            self.http_server.allow_reuse_address = True
+
             self.http_server.daemon_threads = True
 
             self.http_server.serve_forever()
-
 
         except Exception as e:
 
@@ -640,29 +593,25 @@ img {
 
         self.running = False
 
+        # Stop HTTP server.
         if self.http_server is not None:
 
             try:
-
                 self.http_server.shutdown()
-
             except Exception:
                 pass
 
             try:
-
                 self.http_server.server_close()
-
             except Exception:
                 pass
 
 
+        # Stop camera.
         if self.picam2 is not None:
 
             try:
-
                 self.picam2.stop()
-
             except Exception:
                 pass
 
@@ -685,7 +634,6 @@ if __name__ == "__main__":
         camera.start()
 
         while True:
-
             time.sleep(1)
 
     except KeyboardInterrupt:
@@ -695,4 +643,3 @@ if __name__ == "__main__":
     finally:
 
         camera.stop()
-

@@ -1,5 +1,6 @@
 import time
 import numpy as np
+from cv2 import rectangle
 from camera import Camera
 
 ContCam = Camera()
@@ -15,20 +16,18 @@ try:
             time.sleep(0.01)
             continue
         else:
-            blue = frame[:,:,0]
-            green = frame[:,:,1]
-            red = frame[:,:,2]
+            result = frame.copy()
 
-            GreenCondition =  (red < 125) & (green > 150) & (blue < 125)
+            GreenCondition =  (frame[:,:,2] < 125) & (frame[:,:,1] > 150) & (frame[:,:,0] < 125)
             GreenPixels = np.argwhere(GreenCondition)
-            mask = np.zeros(frame.shape[:2], dtype=np.uint8)
             LeftUpMost = [np.min(GreenPixels[:,1]), np.min(GreenPixels[:,0])]
             RightDownMost = [np.max(GreenPixels[:,1]), np.max(GreenPixels[:,0])]
-            print("LeftUpMost:", LeftUpMost, "RightDownMost:", RightDownMost)
-            mask[GreenCondition] = 255
+            SquarePosition = [RightDownMost[0]-LeftUpMost[0], RightDownMost[1]-LeftUpMost[1]]
+            rectangle(result, LeftUpMost, RightDownMost, (27, 200, 27), 3)
+
+            result[GreenCondition] = (0, 255, 0)
 
         
-        result = mask
         ContCam.set_processed_frame(result)
 except KeyboardInterrupt:
     pass
