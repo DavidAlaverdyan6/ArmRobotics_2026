@@ -1,7 +1,7 @@
 import time
 
 from telemetrix import telemetrix
-from pins import PB1
+from pins import PA0
 
 
 def analog_callback(data):
@@ -10,17 +10,12 @@ def analog_callback(data):
 
 print("Connecting to STM32...")
 
-board = telemetrix.Telemetrix(
-    com_port="/dev/serial0"
-)
+board = telemetrix.Telemetrix()
 
 print("STM32 connected!")
-print(f"Reading PB1 = {PB1}")
+print(f"Reading PA0 = {PA0}")
 
-board.set_pin_mode_analog_input(
-    PB1,
-    callback=analog_callback
-)
+board.set_pin_mode_analog_input(PA0, callback=analog_callback)
 
 print("Analog input initialized!")
 
