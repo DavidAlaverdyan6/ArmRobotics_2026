@@ -3,7 +3,7 @@ from telemetrix import telemetrix
 from pins import PB10, PB2
 from pins import PA8
 
-board = telemetrix.Telemetrix(com_port="/dev/serial0")
+board = telemetrix.Telemetrix()
 
 board.set_pin_mode_digital_output(PB10)
 board.set_pin_mode_digital_output(PB2)

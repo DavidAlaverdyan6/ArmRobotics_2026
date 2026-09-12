@@ -11,14 +11,17 @@ from camera import Camera
 WIDTH = 800
 HEIGHT = 600
 
-MIN_OBJECT_AREA = 50
+MIN_OBJECT_AREA = 700
 
-# BGR
-LOWER_COLOR = np.array([0, 150, 0], dtype=np.uint8)
-UPPER_COLOR = np.array([125, 255, 125], dtype=np.uint8)
+# Tweak these
+MIN_BRIGHTNESS = 60
+MIN_CHANNEL_DIFF = 25
 
-OUTPUT_COLOR = (0, 255, 0)
-BOX_COLOR = (27, 200, 27)
+# Color IDs
+RED = 1
+YELLOW = 2
+GREEN = 3
+BLUE = 4
 
 
 # ============================================================
@@ -32,12 +35,105 @@ ContCam = Camera(
 
 ContCam.start()
 
-print("==============================")
-print("MULTI-OBJECT COLOR DETECTOR")
-print("==============================")
 
+# ============================================================
+# COLOR CLASSIFICATION
+# ============================================================
+
+def classify_colors(frame):
+
+    # OpenCV BGR
+    b = frame[:, :, 0].astype(np.uint16)
+    g = frame[:, :, 1].astype(np.uint16)
+    r = frame[:, :, 2].astype(np.uint16)
+
+    color_map = np.zeros(
+        (HEIGHT, WIDTH),
+        dtype=np.uint8
+    )
+
+    # --------------------------------------------------------
+    # BRIGHTNESS / COLOR FILTER
+    # --------------------------------------------------------
+
+    max_channel = np.maximum(
+        np.maximum(r, g),
+        b
+    )
+
+    min_channel = np.minimum(
+        np.minimum(r, g),
+        b
+    )
+
+    bright = max_channel >= MIN_BRIGHTNESS
+
+    colorful = (
+        (max_channel - min_channel)
+        >= MIN_CHANNEL_DIFF
+    )
+
+    valid = bright & colorful
+
+
+    # ========================================================
+    # YELLOW
+    # ========================================================
+
+    yellow = valid & (
+        (r > 120) &
+        (g > 100) &
+        (b * 100 < np.minimum(r, g) * 65)
+    )
+
+    color_map[yellow] = YELLOW
+
+
+    # ========================================================
+    # RED
+    # ========================================================
+
+    red = valid & (
+        (r * 100 > g * 135) &
+        (r * 100 > b * 135)
+    )
+
+    color_map[red] = RED
+
+
+    # ========================================================
+    # GREEN
+    # ========================================================
+
+    green = valid & (
+        (g * 100 > r * 115) &
+        (g * 100 > b * 110)
+    )
+
+    color_map[green] = GREEN
+
+
+    # ========================================================
+    # BLUE
+    # ========================================================
+
+    blue = valid & (
+        (b * 100 > r * 125) &
+        (b * 100 > g * 115)
+    )
+
+    color_map[blue] = BLUE
+
+
+    return color_map
+
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
 
 try:
+
     while True:
 
         frame = ContCam.get_frame()
@@ -48,60 +144,81 @@ try:
 
 
         # ====================================================
-        # COLOR MASK
+        # CLASSIFY COLORS
         # ====================================================
 
-        mask = cv2.inRange(
-            frame,
-            LOWER_COLOR,
-            UPPER_COLOR
-        )
+        color_map = classify_colors(frame)
 
 
         # ====================================================
-        # SEPARATE OBJECTS
+        # OBJECT MASK
         # ====================================================
 
-        num_labels, labels = cv2.connectedComponents(
+        mask = (
+            color_map != 0
+        ).astype(np.uint8) * 255
+
+
+        # ====================================================
+        # FIND OBJECTS
+        # ====================================================
+
+        contours, _ = cv2.findContours(
             mask,
-            connectivity=8
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
         )
 
 
         # ====================================================
-        # RESULT
+        # RESULT IMAGE
         # ====================================================
 
         result = frame.copy()
 
-        # Turn matching pixels green
-        result[mask != 0] = OUTPUT_COLOR
-
-
-        # ====================================================
-        # FIND EVERY OBJECT
-        # ====================================================
+        # Fill detected pixels with their classified color
+        result[color_map == RED] = (0, 0, 255)
+        result[color_map == YELLOW] = (0, 255, 255)
+        result[color_map == GREEN] = (0, 255, 0)
+        result[color_map == BLUE] = (255, 0, 0)
 
         objects = []
 
-        for label in range(1, num_labels):
 
-            ys, xs = np.where(labels == label)
+        # ====================================================
+        # PROCESS OBJECTS
+        # ====================================================
 
-            area = len(xs)
+        for contour in contours:
 
-            # Ignore tiny objects
+            area = cv2.contourArea(contour)
+
             if area < MIN_OBJECT_AREA:
                 continue
 
-            x = xs.min()
-            y = ys.min()
+            x, y, width, height = cv2.boundingRect(
+                contour
+            )
 
-            width = xs.max() - x + 1
-            height = ys.max() - y + 1
+
+            # ------------------------------------------------
+            # Get color from contour point
+            # ------------------------------------------------
+
+            px_x, px_y = contour[0][0]
+
+            color_id = int(
+                color_map[px_y, px_x]
+            )
+
+            # If the contour point somehow isn't classified,
+            # skip it.
+            if color_id == 0:
+                continue
 
 
             objects.append({
+                "color": color_id,
                 "x": int(x),
                 "y": int(y),
                 "width": int(width),
@@ -110,15 +227,46 @@ try:
             })
 
 
-            # Draw bounding box
+            # ------------------------------------------------
+            # Bounding box
+            # ------------------------------------------------
+
             cv2.rectangle(
                 result,
                 (x, y),
                 (x + width - 1, y + height - 1),
-                BOX_COLOR,
+                (255, 255, 255),
                 3
             )
 
+            # ------------------------------------------------
+            # Center crosshair
+            # ------------------------------------------------
+
+            center_x = x + width // 2
+            center_y = y + height // 2
+
+            crosshair_size = 6
+
+            cv2.line(
+                 result,
+                (center_x - crosshair_size, center_y),
+                (center_x + crosshair_size, center_y),
+                (255, 255, 255),
+                2
+            )
+
+            cv2.line(
+                result,
+                (center_x, center_y - crosshair_size),
+                (center_x, center_y + crosshair_size),
+                (255, 255, 255),
+                2
+            )
+
+            # ------------------------------------------------
+            # Object number
+            # ------------------------------------------------
 
             cv2.putText(
                 result,
@@ -126,7 +274,7 @@ try:
                 (x, max(20, y - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
-                BOX_COLOR,
+                (255, 255, 255),
                 2
             )
 
@@ -141,6 +289,7 @@ try:
 
             print(
                 f"  Object {i + 1}: "
+                f"color={obj['color']} "
                 f"x={obj['x']} "
                 f"y={obj['y']} "
                 f"size={obj['width']}x{obj['height']} "
@@ -148,11 +297,16 @@ try:
             )
 
 
+        # ====================================================
+        # SEND PROCESSED FRAME
+        # ====================================================
+
         ContCam.set_processed_frame(result)
 
 
 except KeyboardInterrupt:
     pass
+
 
 finally:
     ContCam.stop()
