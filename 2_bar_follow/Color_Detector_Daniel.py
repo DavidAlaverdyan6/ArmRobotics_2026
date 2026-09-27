@@ -55,7 +55,7 @@ class ColorDetector:
 
         green = valid & (
             (g * 100 > r * 115) &
-            (g * 100 > b * 110)
+            (g * 100 > b * 120)
         )
         color_map[green] = self.GREEN
 

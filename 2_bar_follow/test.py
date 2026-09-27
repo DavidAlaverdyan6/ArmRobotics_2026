@@ -4,9 +4,9 @@ from Color_Detector_Daniel import ColorDetector
 
 camera = Camera(width=800, height=600)
 detector = ColorDetector(
-    min_object_area=700,
-    min_brightness=60,
-    min_channel_diff=25
+    min_object_area=10000,
+    min_brightness=40,
+    min_channel_diff=50,
 )
 
 camera.start()

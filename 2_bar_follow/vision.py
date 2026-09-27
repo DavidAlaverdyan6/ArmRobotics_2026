@@ -1,121 +1,45 @@
-# vision.py
-#
-# Vision-only module.
-#
-# No camera hardware.
-# No motors.
-# No Telemetrix.
-#
-# Uses an OpenCV frame supplied by camera.py.
-#
-# Features:
-#   - BW thresholding
-#   - Noise cleanup
-#   - Adaptive left/right line-edge detection
-#   - Crossing detection
-#   - Debouncing / confirmation
-#   - Debug visualization
-#
-# Edge detection:
-#
-# LEFT:
-#     scans LEFT -> RIGHT
-#
-# RIGHT:
-#     scans RIGHT -> LEFT
-#
-# This means the line edges continuously follow
-# the actual position of the line.
-
-import time
-
 import cv2
 import numpy as np
+import time
 
 
 # ============================================================
-# CONFIGURATION
+# SETTINGS
 # ============================================================
 
-THRESHOLD = 100
+THRESHOLD = 128
 
-# Region used for line tracking.
+MIN_LINE_LENGTH = 30
+MIN_LINE_WIDTH = 3
+MAX_LINE_WIDTH = 80
 
-ROI_TOP = 260
-ROI_BOTTOM = 410
+# How far a branch must extend outside the normal line.
+JUNCTION_EXTENSION = 10
 
+# Maximum distance from the main line to inspect.
+JUNCTION_RADIUS = 60
 
-# Minimum amount of black pixels
-# required for a valid line.
+# Minimum amount of branch pixels.
+MIN_BRANCH_PIXELS = 8
 
-MIN_LINE_PIXELS = 20
-
-
-# Morphological cleanup.
-
-MORPH_KERNEL_SIZE = 5
-
-
-# ============================================================
-# EDGE SEARCH
-# ============================================================
-
-# Number of vertical samples used to determine
-# the line position.
-
-EDGE_SAMPLE_HEIGHT = 30
-
-# Ignore tiny black regions.
-
-MIN_RUN_WIDTH = 3
-
-
-# ============================================================
-# CROSSING DETECTION
-# ============================================================
-
-# Extra black pixels outside the normal
-# line edges required to call it a branch.
-
-CROSSING_MIN_PIXELS = 8
-
-# How many consecutive frames must agree
-# before triggering.
-
-CROSSING_CONFIRM_FRAMES = 4
-
-# Minimum time between crossing events.
-
+# Confirmation.
+CROSSING_CONFIRM_FRAMES = 3
 CROSSING_COOLDOWN = 1.0
 
-
-# ============================================================
-# LINE TRACKER
-# ============================================================
 
 class LineTracker:
 
     def __init__(self):
-        self.crossing_counter = 0
-        self.last_crossing_time = (-float("inf"))
-        self.last_crossing = None
+        self.pending_crossing = None
+        self.pending_frames = 0
+        self.last_confirmed_time = 0.0
 
-        self.line_left = None
-        self.line_right = None
-        self.line_center = None
-
-        self.last_error = 0
-
-
-    # ========================================================
+    # ============================================================
     # THRESHOLD
-    # ========================================================
+    # ============================================================
 
     def threshold_image(self, frame):
-
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # Black = white in mask.
 
         _, binary = cv2.threshold(
             gray,
@@ -124,361 +48,696 @@ class LineTracker:
             cv2.THRESH_BINARY_INV
         )
 
-        # Remove isolated noise.
-
-        kernel = np.ones(
-            (
-                MORPH_KERNEL_SIZE,
-                MORPH_KERNEL_SIZE
-            ),
-            np.uint8
-        )
-
-        binary = cv2.morphologyEx(
-            binary,
-            cv2.MORPH_OPEN,
-            kernel
-        )
-
-        binary = cv2.morphologyEx(
-            binary,
-            cv2.MORPH_CLOSE,
-            kernel
-        )
-
         return binary
 
+    # ============================================================
+    # LONGEST CONTINUOUS RUN
+    # ============================================================
 
-    # ========================================================
-    # FIND LINE EDGES
-    # ========================================================
+    @staticmethod
+    def longest_run(values):
+        values = np.asarray(values, dtype=np.bool_)
 
-    def find_line_edges(
-        self,
-        binary
-    ):
+        if not np.any(values):
+            return 0
 
-        height, width = binary.shape
-
-        y1 = max(
-            0,
-            ROI_TOP
+        padded = np.concatenate(
+            (
+                [False],
+                values,
+                [False]
+            )
         )
 
-        y2 = min(
-            height,
-            ROI_BOTTOM
+        changes = np.flatnonzero(
+            padded[1:] != padded[:-1]
         )
 
-        roi = binary[
-            y1:y2,
-            :
-        ]
+        lengths = (
+            changes[1::2]
+            - changes[::2]
+        )
 
-        if roi.size == 0:
+        if lengths.size == 0:
+            return 0
 
-            return None, None
+        return int(lengths.max())
 
+    # ============================================================
+    # FIND VERTICAL
+    # ============================================================
 
-        # ----------------------------------------------------
-        # Collapse vertically.
-        #
-        # For each X coordinate we calculate how much
-        # black is present.
-        # ----------------------------------------------------
+    def find_vertical(self, binary):
 
-        black_count = np.count_nonzero(
-            roi,
+        h, w = binary.shape
+
+        # Number of black pixels in every column.
+        counts = np.count_nonzero(
+            binary,
             axis=0
         )
 
+        x = int(np.argmax(counts))
 
-        # ----------------------------------------------------
-        # Ignore very weak pixels.
-        # ----------------------------------------------------
+        strength = int(counts[x])
 
-        min_vertical_pixels = max(
-            3,
-            EDGE_SAMPLE_HEIGHT // 5
-        )
-
-        line_columns = (
-            black_count
-            >= min_vertical_pixels
-        )
-
-
-        # ----------------------------------------------------
-        # LEFT EDGE
-        #
-        # Search from LEFT -> RIGHT.
-        #
-        # First sufficiently large black region
-        # is considered the line.
-        # ----------------------------------------------------
-
-        left_edge = None
-
-        run_start = None
-
-        for x in range(width):
-
-            if line_columns[x]:
-
-                if run_start is None:
-
-                    run_start = x
-
-            else:
-
-                if run_start is not None:
-
-                    run_width = (
-                        x
-                        - run_start
-                    )
-
-                    if run_width >= MIN_RUN_WIDTH:
-
-                        left_edge = run_start
-
-                        break
-
-                    run_start = None
-
-
-        # Handle run reaching image edge.
-
-        if (
-            left_edge is None
-            and run_start is not None
-        ):
-
-            if (
-                width
-                - run_start
-                >= MIN_RUN_WIDTH
-            ):
-
-                left_edge = run_start
-
-
-        # ----------------------------------------------------
-        # RIGHT EDGE
-        #
-        # Search from RIGHT -> LEFT.
-        # ----------------------------------------------------
-
-        right_edge = None
-
-        run_end = None
-
-        for x in range(
-            width - 1,
-            -1,
-            -1
-        ):
-
-            if line_columns[x]:
-
-                if run_end is None:
-
-                    run_end = x
-
-            else:
-
-                if run_end is not None:
-
-                    run_width = (
-                        run_end
-                        - x
-                    )
-
-                    if run_width >= MIN_RUN_WIDTH:
-
-                        right_edge = run_end
-
-                        break
-
-                    run_end = None
-
-
-        if (
-            right_edge is None
-            and run_end is not None
-        ):
-
-            if (
-                run_end + 1
-                >= MIN_RUN_WIDTH
-            ):
-
-                right_edge = run_end
-
-
-        # ----------------------------------------------------
-        # Validate
-        # ----------------------------------------------------
-
-        if (
-            left_edge is None
-            or right_edge is None
-        ):
-
-            return None, None
-
-
-        if right_edge <= left_edge:
-
-            return None, None
-
-
-        return (
-            left_edge,
-            right_edge
-        )
-
-
-    # ========================================================
-    # FIND LINE CENTER
-    # ========================================================
-
-    def find_line_center(
-        self,
-        binary
-    ):
-
-        height, width = binary.shape
-
-        y1 = max(
-            0,
-            ROI_TOP
-        )
-
-        y2 = min(
-            height,
-            ROI_BOTTOM
-        )
-
-        roi = binary[
-            y1:y2,
-            :
-        ]
-
-        y, x = np.where(
-            roi > 0
-        )
-
-        if len(x) < MIN_LINE_PIXELS:
-
+        if strength < MIN_LINE_LENGTH:
             return None
 
-
-        return float(
-            np.mean(x)
+        # Require a genuinely continuous vertical line.
+        run = self.longest_run(
+            binary[:, x] > 0
         )
 
+        if run < MIN_LINE_LENGTH:
+            return None
 
-    # ========================================================
-    # CROSSING DETECTION
-    # ========================================================
+        # --------------------------------------------------------
+        # Estimate normal width.
+        # Use a few rows near the top where a junction is unlikely.
+        # --------------------------------------------------------
 
-    def detect_crossing(
-        self,
-        binary,
-        left_edge,
-        right_edge
-    ):
+        sample_y = h // 4
 
-        height, width = binary.shape
-
-        y1 = max(
+        y0 = max(
             0,
-            ROI_TOP
+            sample_y - 3
         )
 
-        y2 = min(
-            height,
-            ROI_BOTTOM
+        y1 = min(
+            h,
+            sample_y + 4
         )
 
-        roi = binary[
-            y1:y2,
-            :
-        ]
+        sample = binary[y0:y1] > 0
 
-
-        # ----------------------------------------------------
-        # We inspect BLACK outside the detected line.
-        #
-        # left side:
-        #   [0 ... left_edge]
-        #
-        # right side:
-        #   [right_edge ... width]
-        # ----------------------------------------------------
-
-        left_region = roi[
-            :,
-            :left_edge
-        ]
-
-        right_region = roi[
-            :,
-            right_edge + 1:
-        ]
-
-
-        left_pixels = np.count_nonzero(
-            left_region
+        width_profile = np.count_nonzero(
+            sample,
+            axis=0
         )
 
-        right_pixels = np.count_nonzero(
-            right_region
+        occupied = (
+            width_profile
+            >= max(
+                1,
+                (y1 - y0) // 2
+            )
         )
 
+        if occupied[x]:
 
-        left_detected = (
-            left_pixels
-            >= CROSSING_MIN_PIXELS
-        )
+            left = x
 
-        right_detected = (
-            right_pixels
-            >= CROSSING_MIN_PIXELS
-        )
+            while (
+                left > 0
+                and occupied[left - 1]
+            ):
+                left -= 1
 
+            right = x
 
-        if (
-            left_detected
-            and right_detected
-        ):
-
-            direction = "BOTH"
-
-        elif left_detected:
-
-            direction = "LEFT"
-
-        elif right_detected:
-
-            direction = "RIGHT"
+            while (
+                right < w - 1
+                and occupied[right + 1]
+            ):
+                right += 1
 
         else:
 
-            direction = None
+            left = x
+            right = x
 
+        width = right - left + 1
 
-        return (
-            direction,
-            left_pixels,
-            right_pixels
+        if width < MIN_LINE_WIDTH:
+            width = MIN_LINE_WIDTH
+
+        if width > MAX_LINE_WIDTH:
+            return None
+
+        return {
+            "center": x,
+            "left": left,
+            "right": right,
+            "width": width,
+            "run": run,
+            "strength": strength,
+        }
+
+    # ============================================================
+    # FIND HORIZONTAL
+    # ============================================================
+
+    def find_horizontal(self, binary):
+
+        h, w = binary.shape
+
+        counts = np.count_nonzero(
+            binary,
+            axis=1
         )
 
+        y = int(np.argmax(counts))
 
-    # ========================================================
-    # DEBOUNCE CROSSING
-    # ========================================================
+        strength = int(counts[y])
+
+        if strength < MIN_LINE_LENGTH:
+            return None
+
+        run = self.longest_run(
+            binary[y, :] > 0
+        )
+
+        if run < MIN_LINE_LENGTH:
+            return None
+
+        # Estimate normal thickness.
+        sample_x = w // 4
+
+        x0 = max(
+            0,
+            sample_x - 3
+        )
+
+        x1 = min(
+            w,
+            sample_x + 4
+        )
+
+        sample = binary[:, x0:x1] > 0
+
+        height_profile = np.count_nonzero(
+            sample,
+            axis=1
+        )
+
+        occupied = (
+            height_profile
+            >= max(
+                1,
+                (x1 - x0) // 2
+            )
+        )
+
+        if occupied[y]:
+
+            top = y
+
+            while (
+                top > 0
+                and occupied[top - 1]
+            ):
+                top -= 1
+
+            bottom = y
+
+            while (
+                bottom < h - 1
+                and occupied[bottom + 1]
+            ):
+                bottom += 1
+
+        else:
+
+            top = y
+            bottom = y
+
+        height = bottom - top + 1
+
+        if height < MIN_LINE_WIDTH:
+            height = MIN_LINE_WIDTH
+
+        if height > MAX_LINE_WIDTH:
+            return None
+
+        return {
+            "center": y,
+            "top": top,
+            "bottom": bottom,
+            "height": height,
+            "run": run,
+            "strength": strength,
+        }
+
+    # ============================================================
+    # VERTICAL JUNCTION
+    #
+    #        |
+    #        |
+    # --------+       LEFT
+    #        |
+    #
+    #        |
+    #        |
+    #        +-------- RIGHT
+    #        |
+    #
+    #        |
+    # --------+-------- CROSS
+    #        |
+    #
+    #        |
+    #        |
+    #        |        STRAIGHT
+    #
+    # ============================================================
+
+    def detect_vertical(
+        self,
+        binary,
+        line
+    ):
+
+        h, w = binary.shape
+
+        x = line["center"]
+
+        half_width = max(
+            1,
+            line["width"] // 2
+        )
+
+        normal_left = max(
+            0,
+            x - half_width
+        )
+
+        normal_right = min(
+            w - 1,
+            x + half_width
+        )
+
+        radius = min(
+            JUNCTION_RADIUS,
+            x,
+            w - x - 1
+        )
+
+        if radius <= JUNCTION_EXTENSION:
+            return "STRAIGHT", None
+
+        local_left = x - radius
+        local_right = x + radius + 1
+
+        patch = (
+            binary[
+                :,
+                local_left:local_right
+            ] > 0
+        )
+
+        normal_l = (
+            normal_left
+            - local_left
+        )
+
+        normal_r = (
+            normal_right
+            - local_left
+        )
+
+        # --------------------------------------------------------
+        # Pixels beyond normal line on each side.
+        # --------------------------------------------------------
+
+        left_part = patch[:, :normal_l]
+
+        right_part = patch[:, normal_r + 1:]
+
+        if left_part.shape[1] > 0:
+
+            left_extension = np.count_nonzero(
+                left_part,
+                axis=1
+            )
+
+        else:
+
+            left_extension = np.zeros(
+                h,
+                dtype=np.int32
+            )
+
+        if right_part.shape[1] > 0:
+
+            right_extension = np.count_nonzero(
+                right_part,
+                axis=1
+            )
+
+        else:
+
+            right_extension = np.zeros(
+                h,
+                dtype=np.int32
+            )
+
+        # --------------------------------------------------------
+        # Find rows containing an actual branch.
+        # --------------------------------------------------------
+
+        left_candidates = (
+            left_extension
+            >= MIN_BRANCH_PIXELS
+        )
+
+        right_candidates = (
+            right_extension
+            >= MIN_BRANCH_PIXELS
+        )
+
+        candidates = (
+            left_candidates
+            | right_candidates
+        )
+
+        ys = np.flatnonzero(candidates)
+
+        if ys.size == 0:
+            return "STRAIGHT", None
+
+        # --------------------------------------------------------
+        # Find largest group of nearby candidate rows.
+        # --------------------------------------------------------
+
+        breaks = np.flatnonzero(
+            np.diff(ys) > 2
+        )
+
+        starts = np.r_[
+            0,
+            breaks + 1
+        ]
+
+        ends = np.r_[
+            breaks,
+            len(ys) - 1
+        ]
+
+        best_start = None
+        best_end = None
+        best_score = -1
+
+        for start, end in zip(
+            starts,
+            ends
+        ):
+
+            a = int(ys[start])
+            b = int(ys[end])
+
+            score = max(
+                int(
+                    left_extension[
+                        a:b + 1
+                    ].max()
+                ),
+                int(
+                    right_extension[
+                        a:b + 1
+                    ].max()
+                )
+            )
+
+            if score > best_score:
+
+                best_score = score
+                best_start = a
+                best_end = b
+
+        junction_y = (
+            best_start
+            + best_end
+        ) // 2
+
+        # --------------------------------------------------------
+        # Check several rows around junction.
+        # --------------------------------------------------------
+
+        sample_radius = 5
+
+        y0 = max(
+            0,
+            junction_y - sample_radius
+        )
+
+        y1 = min(
+            h,
+            junction_y + sample_radius + 1
+        )
+
+        left_score = np.count_nonzero(
+            left_extension[y0:y1]
+            >= MIN_BRANCH_PIXELS
+        )
+
+        right_score = np.count_nonzero(
+            right_extension[y0:y1]
+            >= MIN_BRANCH_PIXELS
+        )
+
+        required = 3
+
+        left = (
+            left_score >= required
+        )
+
+        right = (
+            right_score >= required
+        )
+
+        if left and right:
+            return "CROSS", junction_y
+
+        if left:
+            return "LEFT", junction_y
+
+        if right:
+            return "RIGHT", junction_y
+
+        return "STRAIGHT", None
+
+    # ============================================================
+    # HORIZONTAL JUNCTION
+    #
+    # Horizontal is ONLY used when NO vertical line exists.
+    #
+    #       |
+    # -------+-------     UP
+    #
+    # -------+-------
+    #       |             DOWN
+    #
+    #       |
+    # -------+-------
+    #       |             CROSS
+    #
+    # ============================================================
+
+    def detect_horizontal(
+        self,
+        binary,
+        line
+    ):
+
+        h, w = binary.shape
+
+        y = line["center"]
+
+        half_height = max(
+            1,
+            line["height"] // 2
+        )
+
+        normal_top = max(
+            0,
+            y - half_height
+        )
+
+        normal_bottom = min(
+            h - 1,
+            y + half_height
+        )
+
+        radius = min(
+            JUNCTION_RADIUS,
+            y,
+            h - y - 1
+        )
+
+        if radius <= JUNCTION_EXTENSION:
+            return "STRAIGHT", None
+
+        local_top = y - radius
+        local_bottom = y + radius + 1
+
+        patch = (
+            binary[
+                local_top:local_bottom,
+                :
+            ] > 0
+        )
+
+        normal_t = (
+            normal_top
+            - local_top
+        )
+
+        normal_b = (
+            normal_bottom
+            - local_top
+        )
+
+        top_part = patch[:normal_t]
+
+        bottom_part = patch[
+            normal_b + 1:
+        ]
+
+        if top_part.shape[0] > 0:
+
+            top_extension = np.count_nonzero(
+                top_part,
+                axis=0
+            )
+
+        else:
+
+            top_extension = np.zeros(
+                w,
+                dtype=np.int32
+            )
+
+        if bottom_part.shape[0] > 0:
+
+            bottom_extension = np.count_nonzero(
+                bottom_part,
+                axis=0
+            )
+
+        else:
+
+            bottom_extension = np.zeros(
+                w,
+                dtype=np.int32
+            )
+
+        top_candidates = (
+            top_extension
+            >= MIN_BRANCH_PIXELS
+        )
+
+        bottom_candidates = (
+            bottom_extension
+            >= MIN_BRANCH_PIXELS
+        )
+
+        candidates = (
+            top_candidates
+            | bottom_candidates
+        )
+
+        xs = np.flatnonzero(candidates)
+
+        if xs.size == 0:
+            return "STRAIGHT", None
+
+        breaks = np.flatnonzero(
+            np.diff(xs) > 2
+        )
+
+        starts = np.r_[
+            0,
+            breaks + 1
+        ]
+
+        ends = np.r_[
+            breaks,
+            len(xs) - 1
+        ]
+
+        best_start = None
+        best_end = None
+        best_score = -1
+
+        for start, end in zip(
+            starts,
+            ends
+        ):
+
+            a = int(xs[start])
+            b = int(xs[end])
+
+            score = max(
+                int(
+                    top_extension[
+                        a:b + 1
+                    ].max()
+                ),
+                int(
+                    bottom_extension[
+                        a:b + 1
+                    ].max()
+                )
+            )
+
+            if score > best_score:
+
+                best_score = score
+                best_start = a
+                best_end = b
+
+        junction_x = (
+            best_start
+            + best_end
+        ) // 2
+
+        sample_radius = 5
+
+        x0 = max(
+            0,
+            junction_x - sample_radius
+        )
+
+        x1 = min(
+            w,
+            junction_x + sample_radius + 1
+        )
+
+        top_score = np.count_nonzero(
+            top_extension[x0:x1]
+            >= MIN_BRANCH_PIXELS
+        )
+
+        bottom_score = np.count_nonzero(
+            bottom_extension[x0:x1]
+            >= MIN_BRANCH_PIXELS
+        )
+
+        required = 3
+
+        top = (
+            top_score >= required
+        )
+
+        bottom = (
+            bottom_score >= required
+        )
+
+        if top and bottom:
+            return "CROSS", junction_x
+
+        if top:
+            return "UP", junction_x
+
+        if bottom:
+            return "DOWN", junction_x
+
+        return "STRAIGHT", None
+
+    # ============================================================
+    # DEBOUNCE
+    # ============================================================
 
     def debounce_crossing(
         self,
@@ -487,426 +746,303 @@ class LineTracker:
 
         now = time.monotonic()
 
+        if crossing in (
+            None,
+            "NONE",
+            "STRAIGHT"
+        ):
 
-        # ----------------------------------------------------
-        # No crossing this frame.
-        # ----------------------------------------------------
-
-        if crossing is None:
-
-            self.crossing_counter = 0
+            self.pending_crossing = None
+            self.pending_frames = 0
 
             return None
 
-
-        # ----------------------------------------------------
-        # Cooldown.
-        # ----------------------------------------------------
-
         if (
-            now
-            - self.last_crossing_time
+            now - self.last_confirmed_time
             < CROSSING_COOLDOWN
         ):
-
             return None
 
-
-        # ----------------------------------------------------
-        # Consecutive confirmation.
-        # ----------------------------------------------------
-
-        self.crossing_counter += 1
-
-
         if (
-            self.crossing_counter
-            < CROSSING_CONFIRM_FRAMES
+            crossing
+            == self.pending_crossing
         ):
 
-            return None
+            self.pending_frames += 1
 
+        else:
 
-        # ----------------------------------------------------
-        # Confirmed.
-        # ----------------------------------------------------
-
-        self.crossing_counter = 0
-
-        self.last_crossing_time = now
-
-        self.last_crossing = crossing
-
-        return crossing
-
-
-    # ========================================================
-    # PROCESS FRAME
-    # ========================================================
-
-    def process(
-        self,
-        frame
-    ):
-
-        height, width = frame.shape[:2]
-
-        binary = self.threshold_image(
-            frame
-        )
-
-
-        # ----------------------------------------------------
-        # Find line edges.
-        # ----------------------------------------------------
-
-        left_edge, right_edge = (
-            self.find_line_edges(
-                binary
-            )
-        )
-
-
-        # ----------------------------------------------------
-        # Line lost.
-        # ----------------------------------------------------
+            self.pending_crossing = crossing
+            self.pending_frames = 1
 
         if (
-            left_edge is None
-            or right_edge is None
+            self.pending_frames
+            >= CROSSING_CONFIRM_FRAMES
         ):
 
-            self.line_left = None
-            self.line_right = None
-            self.line_center = None
-
-            self.crossing_counter = 0
-
-            display = frame.copy()
-
-            cv2.putText(
-                display,
-                "LINE LOST",
-                (
-                    10,
-                    30
-                ),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 0, 255),
-                2
+            confirmed = (
+                self.pending_crossing
             )
 
-            return {
-                "binary": binary,
-                "display": display,
-                "line_left": None,
-                "line_right": None,
-                "line_center": None,
-                "crossing": None,
-                "confirmed_crossing": None
-            }
+            self.pending_crossing = None
+            self.pending_frames = 0
 
+            self.last_confirmed_time = now
 
-        self.line_left = left_edge
-        self.line_right = right_edge
+            return confirmed
 
+        return None
 
-        # ----------------------------------------------------
-        # Center based on detected edges.
-        # ----------------------------------------------------
+    # ============================================================
+    # MAIN PROCESS
+    # ============================================================
 
-        center = (
-            left_edge
-            + right_edge
-        ) / 2.0
+    def process(self, frame):
 
-        self.line_center = center
+        binary = self.threshold_image(frame)
 
+        # ========================================================
+        # IMPORTANT:
+        #
+        # VERTICAL ALWAYS HAS PRIORITY.
+        #
+        # We only calculate/use horizontal if vertical does NOT
+        # exist.
+        # ========================================================
 
-        # ----------------------------------------------------
-        # Error.
-        # ----------------------------------------------------
-
-        image_center = width / 2.0
-
-        error = (
-            center
-            - image_center
+        vertical = self.find_vertical(
+            binary
         )
 
-        self.last_error = error
+        horizontal = None
 
+        if vertical is not None:
 
-        # ----------------------------------------------------
-        # Crossing.
-        # ----------------------------------------------------
+            orientation = "vertical"
+            line = vertical
 
-        (
-            crossing,
-            left_pixels,
-            right_pixels
-        ) = self.detect_crossing(
-            binary,
-            left_edge,
-            right_edge
-        )
-
-
-        confirmed_crossing = (
-            self.debounce_crossing(
-                crossing
-            )
-        )
-
-
-        # ----------------------------------------------------
-        # DEBUG IMAGE.
-        # ----------------------------------------------------
-
-        display = frame.copy()
-
-
-        # ----------------------------------------------------
-        # ROI
-        # ----------------------------------------------------
-
-        cv2.line(
-            display,
-            (
-                0,
-                ROI_TOP
-            ),
-            (
-                width,
-                ROI_TOP
-            ),
-            (255, 255, 0),
-            1
-        )
-
-        cv2.line(
-            display,
-            (
-                0,
-                ROI_BOTTOM
-            ),
-            (
-                width,
-                ROI_BOTTOM
-            ),
-            (255, 255, 0),
-            1
-        )
-
-
-        # ----------------------------------------------------
-        # Left edge.
-        # ----------------------------------------------------
-
-        cv2.line(
-            display,
-            (
-                left_edge,
-                ROI_TOP
-            ),
-            (
-                left_edge,
-                ROI_BOTTOM
-            ),
-            (0, 255, 0),
-            2
-        )
-
-
-        # ----------------------------------------------------
-        # Right edge.
-        # ----------------------------------------------------
-
-        cv2.line(
-            display,
-            (
-                right_edge,
-                ROI_TOP
-            ),
-            (
-                right_edge,
-                ROI_BOTTOM
-            ),
-            (0, 255, 0),
-            2
-        )
-
-
-        # ----------------------------------------------------
-        # Center.
-        # ----------------------------------------------------
-
-        cv2.line(
-            display,
-            (
-                int(center),
-                ROI_TOP
-            ),
-            (
-                int(center),
-                ROI_BOTTOM
-            ),
-            (255, 0, 0),
-            2
-        )
-
-
-        # ----------------------------------------------------
-        # Image center.
-        # ----------------------------------------------------
-
-        cv2.line(
-            display,
-            (
-                int(image_center),
-                ROI_TOP
-            ),
-            (
-                int(image_center),
-                ROI_BOTTOM
-            ),
-            (255, 0, 255),
-            1
-        )
-
-
-        # ----------------------------------------------------
-        # Crossing status.
-        # ----------------------------------------------------
-
-        if confirmed_crossing is not None:
-
-            text = (
-                "CROSSING: "
-                + confirmed_crossing
-            )
-
-            cv2.putText(
-                display,
-                text,
-                (
-                    10,
-                    30
-                ),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 255),
-                2
-            )
-
-        elif crossing is not None:
-
-            text = (
-                "DETECTING: "
-                + crossing
-                + f" "
-                + str(
-                    self.crossing_counter
+            crossing, junction_position = (
+                self.detect_vertical(
+                    binary,
+                    vertical
                 )
-                + "/"
-                + str(
-                    CROSSING_CONFIRM_FRAMES
-                )
-            )
-
-            cv2.putText(
-                display,
-                text,
-                (
-                    10,
-                    30
-                ),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 255, 255),
-                2
             )
 
         else:
 
-            cv2.putText(
+            horizontal = self.find_horizontal(
+                binary
+            )
+
+            if horizontal is not None:
+
+                orientation = "horizontal"
+                line = horizontal
+
+                crossing, junction_position = (
+                    self.detect_horizontal(
+                        binary,
+                        horizontal
+                    )
+                )
+
+            else:
+
+                orientation = None
+                line = None
+
+                crossing = "NONE"
+                junction_position = None
+
+        # ========================================================
+        # CONFIRM
+        # ========================================================
+
+        confirmed = self.debounce_crossing(
+            crossing
+        )
+
+        # ========================================================
+        # DISPLAY
+        # ========================================================
+
+        display = frame.copy()
+
+        if (
+            orientation == "vertical"
+            and line is not None
+        ):
+
+            x = line["center"]
+
+            cv2.line(
                 display,
-                "NORMAL",
+                (x, 0),
                 (
-                    10,
-                    30
+                    x,
+                    display.shape[0]
                 ),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
                 (0, 255, 0),
                 2
             )
 
+            if junction_position is not None:
 
-        # ----------------------------------------------------
-        # Debug information.
-        # ----------------------------------------------------
+                y = junction_position
+
+                cv2.circle(
+                    display,
+                    (x, y),
+                    12,
+                    (0, 0, 255),
+                    2
+                )
+
+        elif (
+            orientation == "horizontal"
+            and line is not None
+        ):
+
+            y = line["center"]
+
+            cv2.line(
+                display,
+                (0, y),
+                (
+                    display.shape[1],
+                    y
+                ),
+                (0, 255, 0),
+                2
+            )
+
+            if junction_position is not None:
+
+                x = junction_position
+
+                cv2.circle(
+                    display,
+                    (x, y),
+                    12,
+                    (0, 0, 255),
+                    2
+                )
+
+        # Text
+        cv2.putText(
+            display,
+            "ORIENTATION: "
+            + (
+                orientation
+                or "NONE"
+            ),
+            (20, 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2
+        )
 
         cv2.putText(
             display,
-            f"L={left_edge} "
-            f"R={right_edge} "
-            f"C={center:.1f}",
-            (
-                10,
-                height - 35
-            ),
+            "DETECTION: "
+            + crossing,
+            (20, 70),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 255, 255),
-            1
+            0.7,
+            (0, 0, 255),
+            2
         )
 
+        if confirmed is not None:
 
-        cv2.putText(
-            display,
-            f"Outside: "
-            f"L={left_pixels} "
-            f"R={right_pixels}",
-            (
-                10,
-                height - 15
-            ),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 255, 255),
-            1
-        )
+            cv2.putText(
+                display,
+                "CONFIRMED: "
+                + confirmed,
+                (20, 105),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 255),
+                2
+            )
 
+        # ========================================================
+        # RESULT
+        # ========================================================
 
         return {
-            "binary": binary,
             "display": display,
-            "line_left": left_edge,
-            "line_right": right_edge,
-            "line_center": center,
-            "error": error,
+            "binary": binary,
+
+            "orientation": orientation,
+
+            "line_center": (
+                line["center"]
+                if line is not None
+                else None
+            ),
+
+            "line_left": (
+                line["left"]
+                if (
+                    line is not None
+                    and orientation == "vertical"
+                )
+                else None
+            ),
+
+            "line_right": (
+                line["right"]
+                if (
+                    line is not None
+                    and orientation == "vertical"
+                )
+                else None
+            ),
+
+            "error": (
+                (
+                    line["center"]
+                    - frame.shape[1] // 2
+                )
+                if (
+                    line is not None
+                    and orientation == "vertical"
+                )
+
+                else (
+                    line["center"]
+                    - frame.shape[0] // 2
+                )
+                if (
+                    line is not None
+                    and orientation == "horizontal"
+                )
+
+                else None
+            ),
+
             "crossing": crossing,
-            "confirmed_crossing": confirmed_crossing
+
+            "confirmed_crossing": confirmed,
         }
 
 
 # ============================================================
-# DIRECT TEST
+# STANDALONE TEST
 # ============================================================
 
 if __name__ == "__main__":
 
-    from camera import camera
+    from camera import Camera
 
     tracker = LineTracker()
+    camera = Camera()
 
     camera.start()
 
-    print(
-        "Vision test running."
-    )
+    print("Vision test running.")
 
     try:
 
@@ -915,23 +1051,15 @@ if __name__ == "__main__":
             frame = camera.get_frame()
 
             if frame is None:
-
-                time.sleep(
-                    0.01
-                )
-
                 continue
-
 
             result = tracker.process(
                 frame
             )
 
-
             camera.set_processed_frame(
                 result["display"]
             )
-
 
             if (
                 result["confirmed_crossing"]
@@ -945,17 +1073,8 @@ if __name__ == "__main__":
                     ]
                 )
 
-
-            time.sleep(
-                0.01
-            )
-
-
     except KeyboardInterrupt:
-
         pass
 
     finally:
-
         camera.stop()
-
