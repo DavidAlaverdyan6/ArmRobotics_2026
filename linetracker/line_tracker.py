@@ -29,14 +29,14 @@ CALIBRATION_FILE = os.path.expanduser(
 # ============================================================
 
 SENSOR_PINS = [
-    pins.PA0,
-    pins.PA1,
-    pins.PA2,
-    pins.PA3,
-    pins.PA4,
-    pins.PA5,
-    pins.PA6,
     pins.PA7,
+    pins.PA6,
+    pins.PA5,
+    pins.PA4,
+    pins.PA3,
+    pins.PA2,
+    pins.PA1,
+    pins.PA0,
 ]
 
 SENSOR_NAMES = [
@@ -382,7 +382,7 @@ def initialize_board():
     print("Connecting to STM32...")
     print("Telemetrix: auto-detect serial port")
 
-    board = telemetrix.Telemetrix()
+    board = telemetrix.Telemetrix("/dev/serial0")
 
     time.sleep(1)
 

@@ -7,6 +7,7 @@ from threading import Condition
 from picamera2 import Picamera2
 from picamera2.encoders import MJPEGEncoder
 from picamera2.outputs import FileOutput
+from libcamera import Transform
 
 
 PAGE = """\
@@ -102,7 +103,8 @@ picam2 = Picamera2()
 
 picam2.configure(
     picam2.create_video_configuration(
-        main={"size": (800, 600)}
+        main={"size": (800, 600)},
+        transform=Transform(hflip=1, vflip=1)
     )
 )
 
@@ -133,4 +135,3 @@ try:
 
 finally:
     picam2.stop_recording()
-

@@ -43,7 +43,7 @@ def make_callback(index):
     return callback
 
 
-board = telemetrix.Telemetrix()
+board = telemetrix.Telemetrix(SERIAL_PORT)
 
 for i, pin in enumerate(SENSOR_PINS):
     board.set_pin_mode_analog_input(
