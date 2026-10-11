@@ -27,8 +27,8 @@ LINE_SENSORS = (
 # Provisional mapping: reconcile with the actual wiring.
 motorl1 = PB6
 motorl2 = PB7
-motorr1 = PB8
-motorr2 = PB9
+motorr1 = PB9
+motorr2 = PB8
 
 LEFT_MOTOR = (motorl1, motorl2)
 RIGHT_MOTOR = (motorr1, motorr2)

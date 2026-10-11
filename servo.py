@@ -1,28 +1,21 @@
-import time
-from telemetrix import telemetrix
-
-from pins import PA8, PB13, PB14, PB15, PA8, PA11
-
-board = telemetrix.Telemetrix()
-
-board.set_pin_mode_servo(PB13)
-board.set_pin_mode_servo(PB14)
-board.set_pin_mode_servo(PB15)
-board.set_pin_mode_servo(PA8)
-board.set_pin_mode_servo(PA11)
+import robot_pin_config as pins
 
 
-def servo():
-    board.servo_write(PB13, 0)
-    time.sleep(1)
-    board.servo_write(PB13, 90)
-    time.sleep(1)
-    board.servo_write(PB13, 180)
-    time.sleep(1)
+class Servo:
+    def __init__(self, board, pin):
+        self.board = board
+        self.pin = pin
+        self.board.set_pin_mode_servo(pin)
 
-try:
-    servo()
+    def write(self, angle):
+        self.board.servo_write(self.pin, max(0, min(180, int(angle))))
 
 
-finally:
-    board.shutdown()
+def initialize(board):
+    global servo1, servo2, servo3, servo4, servo5
+
+    servo1 = Servo(board, pins.servopan)
+    servo2 = Servo(board, pins.servotilt)
+    servo3 = Servo(board, pins.servo3)
+    servo4 = Servo(board, pins.servo4)
+    servo5 = Servo(board, pins.servo_gripper)
