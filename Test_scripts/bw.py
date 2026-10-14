@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 WIDTH = 416
 HEIGHT = 416
-THRESHOLD = 128
+THRESHOLD = 80
 
 picam2 = Picamera2()
 picam2.configure(
