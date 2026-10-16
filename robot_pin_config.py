@@ -44,3 +44,7 @@ SERVOS = (servopan, servotilt, servo3, servo4, servo_gripper)
 
 # ── Other hardware ──
 fire_sensor = PC15
+
+LED_RED = 17
+LED_GREEN = 27
+LED_BLUE = 22
