@@ -1,95 +1,100 @@
 
+#!/usr/bin/env python3
+
 import time
 from telemetrix import telemetrix
-import robot_pin_config as robot_pins
+
 import line_tracker
 import motors
 
+
 PORT = "/dev/serial0"
 
-BASE_SPEED = 110
+BASE_SPEED = 100
+MAX_SPEED = 170
+MIN_SPEED = -80
+
+# Start with proportional steering only.
+KP = 30.0
+
+# Your existing sensor weights are [-3, -2, -1, 0, 1, 2, 3, 4].
+# The four central sensors have a nominal weighted center of 0.5.
+TARGET_POSITION = 0.5
+
 LOOP_DELAY = 0.04
-LOST_LINE_LIMIT = 10
 
-# Assumes normalized sensor values are higher when detecting the line.
-LINE_THRESHOLD = 0.5
 
-board = None
+def clamp(value, low, high):
+    return max(low, min(high, value))
 
 
 def main():
-    global board
-    board = telemetrix.Telemetrix(com_port=PORT)
+    board = None
 
     try:
+        board = telemetrix.Telemetrix(com_port=PORT)
+
         motors.initialize(board)
         line_tracker.initialize(board)
 
         calibration = line_tracker.load_calibration()
         if calibration is None:
-            print("No line-sensor calibration found.")
-            print("Calibrate the sensors before running the robot.")
+            print("No calibration found. Calibrate the sensors first.")
             return
 
-        lost_count = 0
-        print("Binary line follower running. Ctrl+C to stop.")
+        print("Differential steering active. Ctrl+C to stop.")
 
         while True:
             result = line_tracker.update(calibration)
 
-            if result is None:
+            if result is None or result["position"] is None:
                 motors.motor_stop()
                 time.sleep(LOOP_DELAY)
                 continue
 
-            normalized = result["normalized"]
+            position = result["position"]
 
-            # LINE_SENSORS is physically reversed in the tracker.
-            # After reversal, index 0 should be the leftmost sensor.
-            left_detected = any(
-                value > LINE_THRESHOLD for value in normalized[:4]
+            # Positive error means the line is to the right
+            # of the target position.
+            error = position - TARGET_POSITION
+            correction = KP * error
+
+            left_speed = clamp(
+                BASE_SPEED + correction,
+                MIN_SPEED,
+                MAX_SPEED,
             )
-            right_detected = any(
-                value > LINE_THRESHOLD for value in normalized[4:]
+            right_speed = clamp(
+                BASE_SPEED - correction,
+                MIN_SPEED,
+                MAX_SPEED,
             )
 
-            if left_detected or right_detected:
-                lost_count = 0
-            else:
-                lost_count += 1
-                motors.motor_stop()
+            motors.set_speeds(
+                round(left_speed),
+                round(right_speed),
+            )
 
-                if lost_count >= LOST_LINE_LIMIT:
-                    print("Line lost. Stopping.")
-                    break
-
-                time.sleep(LOOP_DELAY)
-                continue
-
-            if left_detected and right_detected:
-                # Line under both halves: proceed straight.
-                motors.motor_forward(BASE_SPEED)
-
-            elif left_detected:
-                # Line detected on the left half.
-                motors.motor_left(BASE_SPEED)
-
-            else:
-                # Line detected on the right half.
-                motors.motor_right(BASE_SPEED)
+            print(
+                f"Position: {position:+.2f} | "
+                f"Error: {error:+.2f} | "
+                f"L: {left_speed:6.1f} | "
+                f"R: {right_speed:6.1f}",
+                end="\r",
+            )
 
             time.sleep(LOOP_DELAY)
 
     except KeyboardInterrupt:
-        print("\nStopping robot.")
+        print("\nStopping.")
 
     finally:
         if board is not None:
             try:
                 motors.motor_stop()
-            except Exception:
-                pass
-            board.shutdown()
+                line_tracker.shutdown()
+            finally:
+                board.shutdown()
 
 
 if __name__ == "__main__":
