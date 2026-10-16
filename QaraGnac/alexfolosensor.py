@@ -50,13 +50,13 @@ def motor_a_forward():
 
 def motor_b_forward():
     """Right motor forward."""
-    board.digital_write(pins.motorr1, 0)
-    board.digital_write(pins.motorr2, 1)
+    board.digital_write(pins.motorr1, 1)
+    board.digital_write(pins.motorr2, 0)
 
 def motor_b_back():
     """Right motor forward."""
-    board.digital_write(pins.motorr1, 1)
-    board.digital_write(pins.motorr2, 0)
+    board.digital_write(pins.motorr1, 0)
+    board.digital_write(pins.motorr2, 1)
 
 def motor_a_back():
     """Right motor forward."""

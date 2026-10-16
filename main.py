@@ -4,12 +4,16 @@
 import time
 
 from telemetrix import telemetrix
+<<<<<<< HEAD
 from smbus2 import SMBus
+=======
+>>>>>>> 96d21bc (File updates, working differential steering)
 
 import line_tracker
 import motors
 
 
+<<<<<<< HEAD
 # ── Hardware configuration ──────────────────────────────────────
 
 PORT = "/dev/serial0"
@@ -220,10 +224,31 @@ def is_all_white(result):
         value < WHITE_THRESHOLD
         for value in result["normalized"]
     )
+=======
+PORT = "/dev/serial0"
+
+BASE_SPEED = 100
+MAX_SPEED = 170
+MIN_SPEED = -80
+
+# Start with proportional steering only.
+KP = 30.0
+
+# Your existing sensor weights are [-3, -2, -1, 0, 1, 2, 3, 4].
+# The four central sensors have a nominal weighted center of 0.5.
+TARGET_POSITION = 0.5
+
+LOOP_DELAY = 0.04
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+>>>>>>> 96d21bc (File updates, working differential steering)
 
 
 def main():
     board = None
+<<<<<<< HEAD
     gyro = None
 
     state = "FOLLOW"
@@ -240,6 +265,10 @@ def main():
 
     try:
         # This is the ONLY Telemetrix session.
+=======
+
+    try:
+>>>>>>> 96d21bc (File updates, working differential steering)
         board = telemetrix.Telemetrix(com_port=PORT)
 
         motors.initialize(board)
@@ -251,6 +280,7 @@ def main():
             print("No calibration found. Calibrate the sensors first.")
             return
 
+<<<<<<< HEAD
         gyro = MPU6050()
 
         motors.motor_stop()
@@ -258,6 +288,9 @@ def main():
 
         print("Line follower ready. Ctrl+C to stop.")
         time.sleep(0.5)
+=======
+        print("Differential steering active. Ctrl+C to stop.")
+>>>>>>> 96d21bc (File updates, working differential steering)
 
         while True:
             now = time.monotonic()
@@ -266,6 +299,7 @@ def main():
             # use this exact same result.
             result = line_tracker.update(calibration)
 
+<<<<<<< HEAD
             # ── Debug display ───────────────────────────────────
             if now - last_display_time >= DISPLAY_INTERVAL:
                 show_position(result, state, pending_turn)
@@ -429,6 +463,43 @@ def main():
                     )
 
                     motors.set_speeds(search_speed, search_speed)
+=======
+            if result is None or result["position"] is None:
+                motors.motor_stop()
+                time.sleep(LOOP_DELAY)
+                continue
+
+            position = result["position"]
+
+            # Positive error means the line is to the right
+            # of the target position.
+            error = position - TARGET_POSITION
+            correction = KP * error
+
+            left_speed = clamp(
+                BASE_SPEED + correction,
+                MIN_SPEED,
+                MAX_SPEED,
+            )
+            right_speed = clamp(
+                BASE_SPEED - correction,
+                MIN_SPEED,
+                MAX_SPEED,
+            )
+
+            motors.set_speeds(
+                round(left_speed),
+                round(right_speed),
+            )
+
+            print(
+                f"Position: {position:+.2f} | "
+                f"Error: {error:+.2f} | "
+                f"L: {left_speed:6.1f} | "
+                f"R: {right_speed:6.1f}",
+                end="\r",
+            )
+>>>>>>> 96d21bc (File updates, working differential steering)
 
             time.sleep(LOOP_DELAY)
 
@@ -439,6 +510,7 @@ def main():
         if board is not None:
             try:
                 motors.motor_stop()
+<<<<<<< HEAD
             except Exception:
                 pass
 
@@ -451,6 +523,11 @@ def main():
             gyro.close()
 
         print("Disconnected.")
+=======
+                line_tracker.shutdown()
+            finally:
+                board.shutdown()
+>>>>>>> 96d21bc (File updates, working differential steering)
 
 
 if __name__ == "__main__":
