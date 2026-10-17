@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 import time
 from telemetrix import telemetrix
 from pins import PB13
@@ -30,7 +29,7 @@ time.sleep(3)
 
 board.shutdown()
 print("Done.")
-=======
+#=======
 import robot_pin_config as pins
 
 
@@ -52,4 +51,4 @@ def initialize(board):
     servo3 = Servo(board, pins.servo3)
     servo4 = Servo(board, pins.servo4)
     servo5 = Servo(board, pins.servo_gripper)
->>>>>>> 2995d10e65a6ee1ae4b1e77f9e92fa7c1ba59a4b
+#>>>>>>> 2995d10e65a6ee1ae4b1e77f9e92fa7c1ba59a4b

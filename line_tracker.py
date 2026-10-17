@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Non-blocking line tracker using a shared Telemetrix board."""
+"""Non-blocking 8-channel line tracker using a shared Telemetrix board."""
 
 import json
 import os
@@ -7,27 +7,35 @@ import time
 
 import robot_pin_config as robot_pins
 
-# The physical sensor array is wired backwards.
-# Reverse the centralized configuration to preserve the validated ordering.
+
+# Preserve the sensor order already used by the robot.
 SENSOR_PINS = list(reversed(robot_pins.LINE_SENSORS))
 
 CALIBRATION_FILE = os.path.expanduser(
     "~/ArmRobotics/linetracker/calibration.json"
 )
 
-SENSOR_NAMES = [f"S{i}" for i in range(1, 9)]
-WEIGHTS = [-3, -2, -1, 0, 1, 2, 3, 4]
 SENSOR_COUNT = 8
 
-LINE_DETECTED_THRESHOLD = 0.15
-CROSSING_SIDE_THRESHOLD = 0.45
-CROSSING_CENTER_THRESHOLD = 0.20
+# Normalized readings represent BLACKNESS:
+#   0.0 = white
+#   1.0 = black
+#
+# Position is negative on the left, positive on the right.
+WEIGHTS = [-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5]
 
-LEFT_SENSORS = [0, 1]
-RIGHT_SENSORS = [6, 7]
-CENTER_SENSORS = [3, 4]
+LINE_DETECTED_THRESHOLD = 0.15
+
+# A side group is considered black when it sees <= 10% white.
+CROSSING_WHITE_THRESHOLD = 0.10
+CROSSING_CENTER_BLACKNESS_MIN = 0.20
+
+LEFT_SENSORS = (0, 1)
+CENTER_SENSORS = (3, 4)
+RIGHT_SENSORS = (6, 7)
 
 CALIBRATION_SAMPLES = 100
+
 sensor_values = [0] * SENSOR_COUNT
 board = None
 
@@ -38,19 +46,24 @@ def _make_callback(index):
             sensor_values[index] = int(data[2])
         except (IndexError, TypeError, ValueError):
             pass
+
     return callback
 
 
 def initialize(board_instance):
-    """Configure analog inputs on an already-connected Telemetrix board."""
+    """Configure sensors on an already-connected Telemetrix board."""
     global board
+
     if board_instance is None:
         raise ValueError("A connected Telemetrix board is required.")
 
     board = board_instance
+
     for index, pin in enumerate(SENSOR_PINS):
         board.set_pin_mode_analog_input(
-            pin, differential=0, callback=_make_callback(index)
+            pin,
+            differential=0,
+            callback=_make_callback(index),
         )
 
 
@@ -66,50 +79,61 @@ def load_calibration():
             return None
 
         return data
+
     except (OSError, ValueError, TypeError):
         return None
 
 
 def save_calibration(calibration):
     directory = os.path.dirname(CALIBRATION_FILE)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
+    os.makedirs(directory, exist_ok=True)
 
     temporary_path = CALIBRATION_FILE + ".tmp"
+
     with open(temporary_path, "w", encoding="utf-8") as file:
         json.dump(calibration, file, indent=2)
+
     os.replace(temporary_path, CALIBRATION_FILE)
 
 
 def _read_average_samples(sample_count=CALIBRATION_SAMPLES):
-    """Blocking sampling used only during explicitly requested calibration."""
+    """Blocking sampling is used only during explicit calibration."""
     samples = [[] for _ in range(SENSOR_COUNT)]
     time.sleep(0.2)
 
     for _ in range(sample_count):
         for index, value in enumerate(sensor_values):
             samples[index].append(value)
+
         time.sleep(0.005)
 
-    return [sum(channel) / len(channel) for channel in samples]
+    return [
+        sum(channel) / len(channel)
+        for channel in samples
+    ]
 
 
 def calibrate():
-    """Interactively calibrate white and black surfaces at startup."""
     if board is None:
         raise RuntimeError("Call initialize(board) before calibration.")
 
     input("Place all sensors over WHITE, then press ENTER...")
     white = _read_average_samples()
+
     input("Place all sensors over BLACK, then press ENTER...")
     black = _read_average_samples()
 
-    calibration = {"white": white, "black": black}
+    calibration = {
+        "white": white,
+        "black": black,
+    }
+
     save_calibration(calibration)
     return calibration
 
 
 def normalize_sensor(index, raw_value, calibration):
+    """Convert raw ADC values to normalized blackness in [0, 1]."""
     white = float(calibration["white"][index])
     black = float(calibration["black"][index])
 
@@ -132,40 +156,68 @@ def get_normalized_values(calibration):
 
 
 def calculate_position(values):
+    """Return a signed line position: left < 0, center = 0, right > 0."""
     total = sum(values)
+
     if total < LINE_DETECTED_THRESHOLD:
         return None
 
-    return sum(value * weight for value, weight in zip(values, WEIGHTS)) / total
+    return sum(
+        value * weight
+        for value, weight in zip(values, WEIGHTS)
+    ) / total
 
 
-def _group_strength(values, indexes):
+def _group_mean(values, indexes):
     return sum(values[i] for i in indexes) / len(indexes)
 
 
-def detect_crossing(values):
-    center = _group_strength(values, CENTER_SENSORS)
-    left = (
-        _group_strength(values, LEFT_SENSORS) >= CROSSING_SIDE_THRESHOLD
-        and center >= CROSSING_CENTER_THRESHOLD
-    )
-    right = (
-        _group_strength(values, RIGHT_SENSORS) >= CROSSING_SIDE_THRESHOLD
-        and center >= CROSSING_CENTER_THRESHOLD
-    )
+def _group_white_fraction(values, indexes):
+    """Normalized values are blackness, so white fraction is 1 - value."""
+    return sum(1.0 - values[i] for i in indexes) / len(indexes)
 
-    if left and right:
+
+def detect_crossing(values):
+    """
+    Detect a branch from the outer sensor groups.
+
+    Requested mapping:
+      - right group <= 10% white -> LEFT
+      - left group <= 10% white  -> RIGHT
+      - both groups <= 10% white -> BOTH
+
+    This intentionally follows the robot's specified branch convention.
+    The center must also see enough black to reject isolated side readings.
+    """
+    if len(values) != SENSOR_COUNT:
+        return None
+
+    center_blackness = _group_mean(values, CENTER_SENSORS)
+
+    if center_blackness < CROSSING_CENTER_BLACKNESS_MIN:
+        return None
+
+    left_white = _group_white_fraction(values, LEFT_SENSORS)
+    right_white = _group_white_fraction(values, RIGHT_SENSORS)
+
+    left_is_black = left_white <= CROSSING_WHITE_THRESHOLD
+    right_is_black = right_white <= CROSSING_WHITE_THRESHOLD
+
+    if left_is_black and right_is_black:
         return "BOTH"
-    if left:
-        return "LEFT"
-    if right:
+
+    if right_is_black:
         return "RIGHT"
+
+    if left_is_black:
+        return "LEFT"
+
     return None
 
 
 def update(calibration):
     """
-    Return the latest tracker state without sleeping or printing.
+    Return the latest readings without sleeping or printing.
 
     Telemetrix updates sensor_values asynchronously through callbacks.
     """
@@ -173,10 +225,12 @@ def update(calibration):
         raise RuntimeError("Call initialize(board) before update().")
 
     raw = sensor_values.copy()
+
     normalized = [
         normalize_sensor(i, raw[i], calibration)
         for i in range(SENSOR_COUNT)
     ]
+
     position = calculate_position(normalized)
 
     return {
@@ -189,6 +243,6 @@ def update(calibration):
 
 
 def shutdown():
-    """Release module references; the caller owns and closes the board."""
+    """Release this module's board reference; the caller closes the board."""
     global board
     board = None

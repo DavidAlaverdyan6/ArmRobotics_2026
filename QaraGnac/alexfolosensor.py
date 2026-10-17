@@ -44,8 +44,14 @@ def motor_a_forward():
 
 
 def motor_b_forward():
+<<<<<<< HEAD:alexfolosensor.py
     board.digital_write(pins.motorr1, 0)
     board.digital_write(pins.motorr2, 1)
+=======
+    """Right motor forward."""
+    board.digital_write(pins.motorr1, 1)
+    board.digital_write(pins.motorr2, 0)
+>>>>>>> f5890c7ba5e950b7ebf8fbcba250b9b04e7c0289:QaraGnac/alexfolosensor.py
 
 def motor_a_back():
     board.digital_write(pins.motorl1, 0)
@@ -53,8 +59,14 @@ def motor_a_back():
 
 
 def motor_b_back():
+<<<<<<< HEAD:alexfolosensor.py
     board.digital_write(pins.motorr1, 1)
     board.digital_write(pins.motorr2, 0)
+=======
+    """Right motor forward."""
+    board.digital_write(pins.motorr1, 0)
+    board.digital_write(pins.motorr2, 1)
+>>>>>>> f5890c7ba5e950b7ebf8fbcba250b9b04e7c0289:QaraGnac/alexfolosensor.py
 
 
 def motor_a_stop():
