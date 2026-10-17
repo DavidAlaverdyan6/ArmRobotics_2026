@@ -11,13 +11,14 @@ import motors
 import led
 import robot_pin_config as pins
 
+
 rgb = led.RGBLED(
     pins.LED_RED,
     pins.LED_GREEN,
     pins.LED_BLUE,
 )
 
-# ── Hardware configuration ──────────────────────────────────────
+# Hardware configuration
 
 PORT = "/dev/serial0"
 
@@ -29,21 +30,22 @@ KP = 30.0
 TARGET_POSITION = 0.5
 LOOP_DELAY = 0.04
 
-# ── Intersection handling ───────────────────────────────────────
-STARTUP_INTERSECTION_IGNORE = 0.5  # seconds
+# Intersection handling
+
+STARTUP_INTERSECTION_IGNORE = 0.5
 CROSSING_CONFIRM_FRAMES = 3
 
-# Outer sensors must fall below this blackness level to count
-# as clear of the perpendicular junction bar.
 JUNCTION_EDGE_THRESHOLD = 0.20
-
-# Require several consecutive frames of the exit pattern.
 EXIT_CONFIRM_FRAMES = 3
 
 CLEAR_SPEED = 100
 CLEAR_TIMEOUT = 3.0
 
-# ── Gyro-controlled turns ───────────────────────────────────────
+# Movement before turning
+
+APPROACH_TIME = 0.5
+
+# Gyro-controlled turns
 
 I2C_BUS = 1
 MPU_ADDRESS = 0x68
@@ -59,7 +61,12 @@ GYRO_CALIBRATION_SAMPLES = 300
 GYRO_CALIBRATION_DELAY = 0.005
 GYRO_DEADBAND_DPS = 1.0
 
-# Sensor indices: S1..S8, ordered left to right.
+# Post-turn line correction
+
+POST_TURN_TIME = 1.0
+
+# Sensor indices: S1..S8, ordered left to right
+
 LEFT_SENSORS = (0, 1, 2)
 CENTER_SENSORS = (3, 4)
 RIGHT_SENSORS = (5, 6, 7)
@@ -70,8 +77,6 @@ def clamp(value, low, high):
 
 
 class MPU6050:
-    """Minimal MPU6050 gyro reader using Raspberry Pi I2C."""
-
     PWR_MGMT_1 = 0x6B
     CONFIG = 0x1A
     GYRO_CONFIG = 0x1B
@@ -154,16 +159,13 @@ class MPU6050:
 
 
 def junction_exit_detected(result):
-    """
-    Return True when the outer junction bar has cleared
-    but the continuing center line remains visible.
-    """
     values = result["normalized"]
 
     left_clear = all(
         values[i] < JUNCTION_EDGE_THRESHOLD
         for i in LEFT_SENSORS
     )
+
     right_clear = all(
         values[i] < JUNCTION_EDGE_THRESHOLD
         for i in RIGHT_SENSORS
@@ -177,6 +179,34 @@ def junction_exit_detected(result):
     return center_detected and (left_clear or right_clear)
 
 
+def follow_line(result):
+    position = result["position"]
+
+    if position is None:
+        motors.motor_stop()
+        return
+
+    error = position - TARGET_POSITION
+    correction = KP * error
+
+    left_speed = clamp(
+        BASE_SPEED + correction,
+        MIN_SPEED,
+        MAX_SPEED,
+    )
+
+    right_speed = clamp(
+        BASE_SPEED - correction,
+        MIN_SPEED,
+        MAX_SPEED,
+    )
+
+    motors.set_speeds(
+        round(left_speed),
+        round(right_speed),
+    )
+
+
 def main():
     board = None
     gyro = None
@@ -188,6 +218,7 @@ def main():
     exit_frames = 0
 
     pending_turn = None
+
     state_started = 0.0
     turn_started = 0.0
 
@@ -209,14 +240,17 @@ def main():
         gyro.calibrate()
 
         print("Line follower ready. Ctrl+C to stop.")
+
         robot_start_time = time.monotonic()
+
         while True:
             now = time.monotonic()
             result = line_tracker.update(calibration)
 
-            # ── FOLLOW ──────────────────────────────────────────
+            # FOLLOW: normal line tracking and crossing detection
+
             if state == "FOLLOW":
-                elapsed_since_start = time.monotonic() - robot_start_time
+                elapsed_since_start = now - robot_start_time
 
                 if elapsed_since_start < STARTUP_INTERSECTION_IGNORE:
                     crossing = None
@@ -251,34 +285,14 @@ def main():
                     crossing_frames = 0
 
                     print(f"\nIntersection detected: {pending_turn}")
+
                     time.sleep(LOOP_DELAY)
                     continue
 
-                position = result["position"]
+                follow_line(result)
 
-                if position is None:
-                    motors.motor_stop()
-                else:
-                    error = position - TARGET_POSITION
-                    correction = KP * error
+            # CLEAR: move through the junction until its exit is detected
 
-                    left_speed = clamp(
-                        BASE_SPEED + correction,
-                        MIN_SPEED,
-                        MAX_SPEED,
-                    )
-                    right_speed = clamp(
-                        BASE_SPEED - correction,
-                        MIN_SPEED,
-                        MAX_SPEED,
-                    )
-
-                    motors.set_speeds(
-                        round(left_speed),
-                        round(right_speed),
-                    )
-
-            # ── CLEAR: detect the junction exit pattern ──────────
             elif state == "CLEAR":
                 crossing = result["crossing"]
 
@@ -293,25 +307,50 @@ def main():
                     if pending_turn == "STRAIGHT":
                         state = "FOLLOW"
                         pending_turn = None
+
                         crossing_candidate = None
                         crossing_frames = 0
+                        exit_frames = 0
+
                         print("Crossing cleared. Resuming line following.")
+
                     else:
-                        gyro.reset_angle()
-                        turn_started = now
-                        state = "TURN"
-                        print(f"Starting {pending_turn} gyro turn.")
+                        state = "APPROACH"
+                        state_started = now
+
+                        print(
+                            f"Crossing cleared. Moving forward for "
+                            f"{APPROACH_TIME:.1f} seconds before turning."
+                        )
 
                 elif now - state_started > CLEAR_TIMEOUT:
                     motors.motor_stop()
+
                     raise RuntimeError(
                         "Crossing pattern did not clear. "
                         "Check line_tracker crossing classification."
                     )
+
                 else:
                     motors.set_speeds(CLEAR_SPEED, CLEAR_SPEED)
 
-            # ── TURN: gyro-controlled pivot ──────────────────────
+            # APPROACH: move forward before starting the pivot
+
+            elif state == "APPROACH":
+                if now - state_started >= APPROACH_TIME:
+                    motors.motor_stop()
+
+                    gyro.reset_angle()
+                    turn_started = time.monotonic()
+                    state = "TURN"
+
+                    print(f"Starting {pending_turn} gyro turn.")
+
+                else:
+                    motors.set_speeds(CLEAR_SPEED, CLEAR_SPEED)
+
+            # TURN: gyro-controlled pivot
+
             elif state == "TURN":
                 angle = gyro.update_angle()
 
@@ -326,17 +365,21 @@ def main():
                 if progress >= TURN_ANGLE:
                     motors.motor_stop()
 
-                    # Resume differential steering immediately.
-                    state = "FOLLOW"
-                    pending_turn = None
+                    state = "POST_TURN"
+                    state_started = time.monotonic()
+
                     crossing_candidate = None
                     crossing_frames = 0
                     exit_frames = 0
 
-                    print("Turn complete. Resuming line following.")
+                    print(
+                        "Turn complete. Starting "
+                        f"{POST_TURN_TIME:.1f}-second line correction."
+                    )
 
                 elif now - turn_started > TURN_TIMEOUT:
                     motors.motor_stop()
+
                     raise RuntimeError(
                         f"{pending_turn} turn timed out at "
                         f"{progress:.1f} degrees. "
@@ -347,6 +390,24 @@ def main():
                     motors.set_speeds(
                         -sign * TURN_SPEED,
                         sign * TURN_SPEED,
+                    )
+
+            # POST_TURN: follow the line, but ignore crossings temporarily
+
+            elif state == "POST_TURN":
+                follow_line(result)
+
+                if now - state_started >= POST_TURN_TIME:
+                    state = "FOLLOW"
+                    pending_turn = None
+
+                    crossing_candidate = None
+                    crossing_frames = 0
+                    exit_frames = 0
+
+                    print(
+                        "Post-turn correction complete. "
+                        "Resuming normal line following."
                     )
 
             time.sleep(LOOP_DELAY)
