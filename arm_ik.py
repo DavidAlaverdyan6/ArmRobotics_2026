@@ -10,12 +10,13 @@ LINK2 = 120.0
 
 BASE_CENTER = 90.0
 BASE_DIRECTION = 1.0
-SHOULDER_VERTICAL = 90.0
+# Measured servo calibration: shoulder horizontal=0°, links straight=elbow 40°.
+SHOULDER_ZERO = 0.0
 SHOULDER_DIRECTION = 1.0
-ELBOW_STRAIGHT = 90.0
+ELBOW_STRAIGHT = 40.0
 ELBOW_DIRECTION = 1.0
 WRIST_REFERENCE = 90.0
-WRIST_DIRECTION = -1.0
+WRIST_DIRECTION = 1.0
 
 SERVO_MIN = 0.0
 SERVO_MAX = 180.0
@@ -112,7 +113,7 @@ def inverse_kinematics(x, y, z, tool_pitch=0.0, elbow_up=False):
     base_deg = degrees(atan2(y, x))
 
     base = BASE_CENTER + BASE_DIRECTION * base_deg
-    shoulder = SHOULDER_VERTICAL + SHOULDER_DIRECTION * (q1_deg - 90.0)
+    shoulder = SHOULDER_ZERO + SHOULDER_DIRECTION * q1_deg
     elbow = ELBOW_STRAIGHT + ELBOW_DIRECTION * q2_deg
     wrist = WRIST_REFERENCE + WRIST_DIRECTION * (
         pitch - q1_deg - q2_deg
@@ -130,8 +131,8 @@ def inverse_kinematics(x, y, z, tool_pitch=0.0, elbow_up=False):
 def forward_kinematics(base, shoulder, elbow):
     """Return the modeled forearm endpoint (x, y, z), in mm."""
     base_deg = (float(base) - BASE_CENTER) / BASE_DIRECTION
-    q1_deg = 90.0 + (
-        float(shoulder) - SHOULDER_VERTICAL
+    q1_deg = (
+        float(shoulder) - SHOULDER_ZERO
     ) / SHOULDER_DIRECTION
     q2_deg = (
         float(elbow) - ELBOW_STRAIGHT
