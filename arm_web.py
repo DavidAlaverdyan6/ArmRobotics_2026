@@ -1058,6 +1058,7 @@ def main():
     global board, arm
 
     server = None
+    controller_thread = None
 
     try:
         print("Connecting to STM32 via Telemetrix...")
