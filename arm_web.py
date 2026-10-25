@@ -30,11 +30,14 @@ STEP_DELAY = 0.04
 board = None
 arm = None
 
-# Only one physical movement can run at a time.
-motion_lock = threading.Lock()
-
-# Protect individual Telemetrix command/state accesses.
+# Protect Telemetrix writes and shared controller state.
 arm_lock = threading.Lock()
+target_lock = threading.Lock()
+latest_cartesian_target = None
+target_generation = 0
+cartesian_active = False
+controller_stop = threading.Event()
+controller_thread = None
 
 
 # ------------------------------------------------------------
@@ -619,68 +622,88 @@ def joint_names():
 
 
 def current_angles():
-    """Read the software's last commanded angles."""
+    """Read last commanded/reference angles; None means unreferenced."""
     with arm_lock:
         return {
-            name: float(getattr(arm, name).angle)
+            name: (
+                None if getattr(arm, name).angle is None
+                else float(getattr(arm, name).angle)
+            )
             for name in joint_names()
         }
 
 
-def synchronized_joint_move(targets):
-    """
-    Move several joints together using a shared smoothstep profile.
+def controller_loop():
+    """Continuously move toward the newest Cartesian target."""
+    global cartesian_active
 
-    Each update commands all selected joints during the same control
-    cycle. Hobby servos perform their own internal position control;
-    this function ramps the commanded targets rather than controlling
-    their internal motor current or speed.
-    """
-    start = current_angles()
+    while not controller_stop.is_set():
+        with target_lock:
+            target = latest_cartesian_target
+            generation = target_generation
 
-    for name, target in targets.items():
-        target = float(target)
+        if target is None or not arm.is_referenced():
+            with target_lock:
+                cartesian_active = False
+            controller_stop.wait(0.03)
+            continue
 
-        if not math.isfinite(target) or not 0 <= target <= 180:
-            raise ValueError(
-                f"{name} target must be between 0 and 180 degrees."
+        try:
+            solution = inverse_kinematics(
+                target["x"], target["y"], target["z"],
+                tool_pitch=target["tool_pitch"],
+                elbow_up=target["elbow_up"],
             )
+            desired = {
+                "base": solution.base,
+                "shoulder": solution.shoulder,
+                "elbow": solution.elbow,
+                "wrist": solution.wrist,
+            }
 
-    maximum_delta = max(
-        (abs(float(targets[name]) - start[name])
-         for name in targets),
-        default=0.0
-    )
+            angles = current_angles()
+            commands = {}
+            for name, goal in desired.items():
+                current = angles[name]
+                delta = goal - current
+                commands[name] = (
+                    goal if abs(delta) <= MAX_JOINT_STEP_DEG
+                    else current + math.copysign(MAX_JOINT_STEP_DEG, delta)
+                )
 
-    if maximum_delta == 0:
-        return
+            # Do not issue an obsolete step if the target changed
+            # while inverse kinematics was being calculated.
+            with target_lock:
+                if generation != target_generation:
+                    continue
+                cartesian_active = any(
+                    abs(commands[name] - desired[name]) > 1e-6
+                    for name in desired
+                )
 
-    # Smoothstep's maximum slope is 1.5. This step count limits
-    # the largest commanded change to approximately MAX_JOINT_STEP_DEG.
-    steps = max(
-        1,
-        math.ceil(
-            1.5 * maximum_delta / MAX_JOINT_STEP_DEG
-        )
-    )
+            with arm_lock:
+                arm.write(**commands)
 
-    for index in range(1, steps + 1):
-        t = index / steps
-        smooth = t * t * (3.0 - 2.0 * t)
+            controller_stop.wait(STEP_DELAY)
 
-        commands = {
-            name: round(
-                start[name]
-                + (float(targets[name]) - start[name]) * smooth
-            )
-            for name in targets
-        }
+        except Exception as error:
+            print("[motion controller] Target rejected:", repr(error))
+            with target_lock:
+                if generation == target_generation:
+                    latest_cartesian_target = None
+                    cartesian_active = False
+            controller_stop.wait(0.05)
 
-        # Keep the multi-joint command batch together.
-        with arm_lock:
-            arm.write(**commands)
+    with target_lock:
+        cartesian_active = False
 
-        time.sleep(STEP_DELAY)
+
+def set_cartesian_target(target):
+    """Replace the target atomically; the controller always follows newest."""
+    global latest_cartesian_target, target_generation
+    with target_lock:
+        latest_cartesian_target = target
+        target_generation += 1
 
 
 # ------------------------------------------------------------
@@ -721,8 +744,20 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 self.send_json(200, {
                     "connected": board is not None,
-                    "busy": motion_lock.locked(),
-                    "angles": current_angles()
+                    "busy": cartesian_active,
+                    "referenced": arm.is_referenced(),
+                    "angles": current_angles(),
+                    "modelled_xyz": (
+                        None if not arm.is_referenced()
+                        else dict(zip(
+                            ("x", "y", "z"),
+                            [round(v, 1) for v in forward_kinematics(
+                                current_angles()["base"],
+                                current_angles()["shoulder"],
+                                current_angles()["elbow"]
+                            )]
+                        ))
+                    )
                 })
             except Exception as error:
                 self.send_json(500, {"error": str(error)})
@@ -789,23 +824,11 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return
 
-                # Reject a conflicting command rather than waiting
-                # behind an active Cartesian movement.
-                if not motion_lock.acquire(blocking=False):
-                    self.send_json(
-                        409,
-                        {
-                            "error":
-                            "Another movement is in progress."
-                        }
-                    )
-                    return
-
-                try:
-                    with arm_lock:
-                        arm.write(**commands)
-                finally:
-                    motion_lock.release()
+                # Manual joint control takes precedence over any
+                # queued Cartesian target.
+                set_cartesian_target(None)
+                with arm_lock:
+                    arm.write(**commands)
 
                 self.send_json(200, {
                     "ok": True,
@@ -823,7 +846,14 @@ class Handler(BaseHTTPRequestHandler):
                 pitch = float(data.get("tool_pitch", 0))
                 elbow_up = bool(data.get("elbow_up", False))
 
-                # Validate the complete target before moving anything.
+                if not arm.is_referenced():
+                    self.send_json(
+                        409,
+                        {"error": "Set the reference pose before Cartesian control."}
+                    )
+                    return
+
+                # Validate the complete target before accepting it.
                 solution = inverse_kinematics(
                     x, y, z,
                     tool_pitch=pitch,
@@ -837,46 +867,45 @@ class Handler(BaseHTTPRequestHandler):
                     "wrist": solution.wrist
                 }
 
-                if not motion_lock.acquire(blocking=False):
+                if not arm.is_referenced():
                     self.send_json(
                         409,
-                        {
-                            "error":
-                            "Another movement is in progress."
-                        }
+                        {"error": "Set the reference pose before Cartesian control."}
                     )
                     return
 
-                try:
-                    # All four joints use one shared ramp.
-                    synchronized_joint_move(targets)
+                target = {
+                    "x": x, "y": y, "z": z,
+                    "tool_pitch": pitch,
+                    "elbow_up": elbow_up,
+                }
+                set_cartesian_target(target)
 
-                    model_x, model_y, model_z = forward_kinematics(
-                        solution.base,
-                        solution.shoulder,
-                        solution.elbow
-                    )
+                self.send_json(202, {
+                    "ok": True,
+                    "queued": True,
+                    "target": {"x": x, "y": y, "z": z}
+                })
+                return
 
-                    self.send_json(200, {
-                        "ok": True,
-                        "angles": current_angles(),
-                        "target": {
-                            "x": x,
-                            "y": y,
-                            "z": z
-                        },
-                        "modelled_xyz": {
-                            "x": round(model_x, 1),
-                            "y": round(model_y, 1),
-                            "z": round(model_z, 1)
-                        }
-                    })
+            if path == "/api/reference":
+                values = {}
+                for name in joint_names():
+                    angle = float(data[name])
+                    if not math.isfinite(angle) or not 0 <= angle <= 180:
+                        self.send_json(400, {"error": f"{name} must be between 0 and 180."})
+                        return
+                    values[name] = angle
 
-                finally:
-                    # Always release the lock, even if a servo command
-                    # or the response handler raises an exception.
-                    motion_lock.release()
+                set_cartesian_target(None)
+                with arm_lock:
+                    arm.set_reference(**values)
 
+                self.send_json(200, {
+                    "ok": True,
+                    "referenced": True,
+                    "angles": current_angles()
+                })
                 return
 
             self.send_json(404, {"error": "Not found."})
@@ -913,6 +942,13 @@ def main():
 
         arm = RoboArm(board)
 
+        controller_thread = threading.Thread(
+            target=controller_loop,
+            name="cartesian-motion-controller",
+            daemon=True,
+        )
+        controller_thread.start()
+
         server = ThreadingHTTPServer(
             (WEB_HOST, WEB_PORT),
             Handler
@@ -930,6 +966,10 @@ def main():
         print("\nStopping web server.")
 
     finally:
+        controller_stop.set()
+        if controller_thread is not None:
+            controller_thread.join(timeout=2.0)
+
         if server is not None:
             server.server_close()
 
