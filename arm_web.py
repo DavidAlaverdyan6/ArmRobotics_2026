@@ -35,6 +35,7 @@ arm_lock = threading.Lock()
 target_lock = threading.Lock()
 latest_cartesian_target = None
 target_generation = 0
+latest_client_sequence = -1
 cartesian_active = False
 controller_stop = threading.Event()
 controller_thread = None
@@ -480,7 +481,8 @@ async function sendJoint(name, angle) {
 
 function updateAngleControls(values) {
     for (const name of names) {
-        if (!Number.isFinite(Number(values[name]))) {
+        if (values[name] === null || values[name] === undefined ||
+            !Number.isFinite(Number(values[name]))) {
             continue;
         }
 
@@ -504,7 +506,8 @@ async function sendCartesianTarget() {
         y: Number($("y").value),
         z: Number($("z").value),
         tool_pitch: Number($("pitch").value),
-        elbow_up: $("elbowUp").checked
+        elbow_up: $("elbowUp").checked,
+        sequence: version
     };
 
     $("ikStatus").textContent = "Updating live target...";
@@ -699,6 +702,7 @@ createJointSliders();
 createReferenceControls();
 drawArm();
 refreshStatus();
+setInterval(refreshStatus, 500);
 
 document.addEventListener("pointerup", () => { userDraggingJoint = false; });
 document.addEventListener("keyup", event => {
@@ -796,11 +800,20 @@ def controller_loop():
 
 
 def set_cartesian_target(target):
-    """Replace the target atomically; the controller always follows newest."""
-    global latest_cartesian_target, target_generation
+    """Replace the target atomically; ignore out-of-order browser requests."""
+    global latest_cartesian_target, target_generation, latest_client_sequence
     with target_lock:
+        if target is not None:
+            sequence = int(target.get("sequence", 0))
+            if sequence < latest_client_sequence:
+                return False
+            latest_client_sequence = sequence
+        else:
+            # Manual joint commands invalidate any pending Cartesian request.
+            latest_client_sequence += 1
         latest_cartesian_target = target
         target_generation += 1
+        return True
 
 
 # ------------------------------------------------------------
@@ -975,12 +988,14 @@ class Handler(BaseHTTPRequestHandler):
                     "x": x, "y": y, "z": z,
                     "tool_pitch": pitch,
                     "elbow_up": elbow_up,
+                    "sequence": int(data.get("sequence", 0)),
                 }
-                set_cartesian_target(target)
+                accepted = set_cartesian_target(target)
 
                 self.send_json(202, {
                     "ok": True,
-                    "queued": True,
+                    "queued": accepted,
+                    "stale": not accepted,
                     "target": {"x": x, "y": y, "z": z}
                 })
                 return
