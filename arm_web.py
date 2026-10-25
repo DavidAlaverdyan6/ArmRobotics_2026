@@ -339,7 +339,7 @@ button.secondary { background: #3b4658; }
             </div>
 
             <label>
-                <input id="elbowUp" type="checkbox">
+                <input id="elbowUp" type="checkbox" checked>
                 Elbow-up solution
             </label>
 
