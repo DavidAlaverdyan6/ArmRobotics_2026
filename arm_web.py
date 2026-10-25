@@ -808,9 +808,8 @@ def set_cartesian_target(target):
             if sequence < latest_client_sequence:
                 return False
             latest_client_sequence = sequence
-        else:
-            # Manual joint commands invalidate any pending Cartesian request.
-            latest_client_sequence += 1
+        # A manual override clears the target but does not consume browser
+        # sequence numbers; the next live slider event can resume control.
         latest_cartesian_target = target
         target_generation += 1
         return True
