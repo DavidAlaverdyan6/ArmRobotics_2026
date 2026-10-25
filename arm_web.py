@@ -911,6 +911,8 @@ class Handler(BaseHTTPRequestHandler):
                 commands = {}
 
                 for name, value in data.items():
+                    if name == "cancel_sequence":
+                        continue
                     if name not in allowed:
                         self.send_json(
                             400, {"error": f"Unknown joint: {name}"}
