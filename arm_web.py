@@ -323,10 +323,10 @@ button.secondary { background: #3b4658; }
             <div class="control">
                 <label for="z">
                     <span>Z</span>
-                    <strong id="zValue">100 mm</strong>
+                    <strong id="zValue">120 mm</strong>
                 </label>
                 <input id="z" type="range"
-                       min="-230" max="230" value="100" step="1">
+                       min="-230" max="230" value="120" step="1">
             </div>
 
             <div class="control">
@@ -388,10 +388,10 @@ const names = [
 // Initial page load does not issue servo commands.
 const angles = {
     base: 90,
-    shoulder: 90,
-    elbow: 90,
+    shoulder: 0,
+    elbow: 40,
     wrist: 90,
-    gripper: 90
+    gripper: 0
 };
 
 const $ = id => document.getElementById(id);
@@ -558,7 +558,7 @@ function createReferenceControls() {
         input.min = "0";
         input.max = "180";
         input.step = "1";
-        input.value = "90";
+        input.value = ({base: 90, shoulder: 0, elbow: 40, wrist: 90, gripper: 0})[name];
         input.id = "reference-" + name;
         input.setAttribute("aria-label", name + " reference angle");
         label.appendChild(input);
@@ -606,8 +606,10 @@ function drawArm() {
     const originX = 350;
     const originY = 320;
 
-    const q1 = (180 - angles.shoulder) * Math.PI / 180;
-    const q2 = (angles.elbow - 90) * Math.PI / 180;
+    // Match arm_ik.py: shoulder servo 0° is horizontal,
+    // and elbow servo 40° is the straight-link configuration.
+    const q1 = angles.shoulder * Math.PI / 180;
+    const q2 = (angles.elbow - 40) * Math.PI / 180;
 
     const x1 = originX + link1 * Math.cos(q1) * scale;
     const y1 = originY - link1 * Math.sin(q1) * scale;
@@ -616,7 +618,7 @@ function drawArm() {
     const y2 = y1 - link2 * Math.sin(q1 + q2) * scale;
 
     const toolAngle =
-        q1 + q2 + (90 - angles.wrist) * Math.PI / 180;
+        q1 + q2 + (angles.wrist - 90) * Math.PI / 180;
 
     const toolLength = 42;
 
