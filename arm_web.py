@@ -439,6 +439,7 @@ function createJointSliders() {
             drawArm();
 
             clearTimeout(sliderTimers[name]);
+            clearTimeout(cartesianTimer);
 
             // Manual joint control takes precedence over Cartesian targets.
             sliderTimers[name] = setTimeout(() => sendJoint(name, angle), 120);
