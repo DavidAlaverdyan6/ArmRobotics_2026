@@ -112,6 +112,15 @@ input[type="checkbox"] {
     accent-color: #60a5fa;
 }
 
+input[type="number"] {
+    width: 76px;
+    padding: 8px;
+    border: 1px solid #536174;
+    border-radius: 6px;
+    background: #10151d;
+    color: #e8edf5;
+}
+
 button {
     padding: 11px 15px;
     border: 0;
@@ -332,12 +341,34 @@ button.secondary { background: #3b4658; }
                 Elbow-up solution
             </label>
 
-            <div class="buttons">
-                <button id="moveCartesian">Move to XYZ target</button>
-            </div>
+            <p class="muted">
+                The arm follows the latest target while you drag.
+                Set a reference pose below before using Cartesian control.
+            </p>
 
             <p id="ikStatus" class="status" role="status">
-                Target not sent.
+                Waiting for reference pose.
+            </p>
+
+            <p id="xyzStatus" class="status" role="status">
+                Modelled XYZ: unavailable
+            </p>
+        </section>
+
+        <section class="panel wide">
+            <h2>Reference pose</h2>
+            <p class="muted">
+                Enter the angles that match the arm's current physical pose,
+                then record them. This does not move any servo. Hobby servos
+                do not report actual position, so estimate the angles from
+                the physical arm. Cartesian control stays disabled until set.
+            </p>
+            <div id="referenceControls" class="buttons"></div>
+            <div class="buttons">
+                <button id="setReference">Record reference pose (no movement)</button>
+            </div>
+            <p id="referenceStatus" class="status" role="status">
+                Reference pose not set.
             </p>
         </section>
 
@@ -364,8 +395,9 @@ const angles = {
 const $ = id => document.getElementById(id);
 
 let sliderTimers = {};
-let requestChain = Promise.resolve();
-let cartesianBusy = false;
+let cartesianTimer = null;
+let targetRequestVersion = 0;
+let userDraggingJoint = false;
 
 
 function createJointSliders() {
@@ -397,6 +429,7 @@ function createJointSliders() {
         slider.value = angles[name];
 
         slider.addEventListener("input", () => {
+            userDraggingJoint = true;
             const angle = Number(slider.value);
 
             angles[name] = angle;
@@ -405,12 +438,8 @@ function createJointSliders() {
 
             clearTimeout(sliderTimers[name]);
 
-            // Coalesce slider events so we don't flood Telemetrix.
-            sliderTimers[name] = setTimeout(() => {
-                requestChain = requestChain
-                    .then(() => sendJoint(name, angle))
-                    .catch(() => {});
-            }, 120);
+            // Manual joint control takes precedence over Cartesian targets.
+            sliderTimers[name] = setTimeout(() => sendJoint(name, angle), 120);
         });
 
         container.append(label, slider);
@@ -441,7 +470,7 @@ async function sendJoint(name, angle) {
         await postJSON("/api/servo", {[name]: angle});
 
         $("jointStatus").textContent =
-            name + " commanded to " + angle + "°.";
+            name + " commanded to " + angle + "°. Cartesian target cancelled.";
     } catch (error) {
         $("jointStatus").textContent =
             "Command failed: " + error.message;
@@ -468,42 +497,91 @@ function updateAngleControls(values) {
 }
 
 
+async function sendCartesianTarget() {
+    const version = ++targetRequestVersion;
+    const payload = {
+        x: Number($("x").value),
+        y: Number($("y").value),
+        z: Number($("z").value),
+        tool_pitch: Number($("pitch").value),
+        elbow_up: $("elbowUp").checked
+    };
+
+    $("ikStatus").textContent = "Updating live target...";
+    try {
+        await postJSON("/api/ik", payload);
+        if (version === targetRequestVersion) {
+            $("ikStatus").textContent =
+                "Following latest XYZ target (" + payload.x + ", " +
+                payload.y + ", " + payload.z + ") mm.";
+        }
+    } catch (error) {
+        if (version === targetRequestVersion) {
+            $("ikStatus").textContent = "Target rejected: " + error.message;
+        }
+    }
+}
+
+function scheduleCartesianTarget() {
+    clearTimeout(cartesianTimer);
+    cartesianTimer = setTimeout(sendCartesianTarget, 100);
+}
+
 for (const id of ["x", "y", "z", "pitch"]) {
     $(id).addEventListener("input", () => {
         const suffix = id === "pitch" ? "°" : " mm";
         $(id + "Value").textContent = $(id).value + suffix;
+        scheduleCartesianTarget();
     });
 }
+$("elbowUp").addEventListener("change", scheduleCartesianTarget);
 
+function createReferenceControls() {
+    const root = $("referenceControls");
+    for (const name of names) {
+        const label = document.createElement("label");
+        label.style.display = "flex";
+        label.style.alignItems = "center";
+        label.style.gap = "8px";
+        label.textContent = name.charAt(0).toUpperCase() + name.slice(1);
 
-$("moveCartesian").addEventListener("click", async () => {
-    if (cartesianBusy) return;
+        const input = document.createElement("input");
+        input.type = "number";
+        input.min = "0";
+        input.max = "180";
+        input.step = "1";
+        input.value = "90";
+        input.id = "reference-" + name;
+        input.setAttribute("aria-label", name + " reference angle");
+        label.appendChild(input);
+        root.appendChild(label);
+    }
+}
 
-    cartesianBusy = true;
+$("setReference").addEventListener("click", async () => {
+    const button = $("setReference");
+    const values = {};
+    for (const name of names) {
+        const value = Number($("reference-" + name).value);
+        if (!Number.isFinite(value) || value < 0 || value > 180) {
+            $("referenceStatus").textContent =
+                "Every reference angle must be between 0° and 180°.";
+            return;
+        }
+        values[name] = value;
+    }
 
-    const button = $("moveCartesian");
     button.disabled = true;
-    $("ikStatus").textContent = "Calculating and moving...";
-
     try {
-        const result = await postJSON("/api/ik", {
-            x: Number($("x").value),
-            y: Number($("y").value),
-            z: Number($("z").value),
-            tool_pitch: Number($("pitch").value),
-            elbow_up: $("elbowUp").checked
-        });
-
+        const result = await postJSON("/api/reference", values);
         updateAngleControls(result.angles);
-
-        $("ikStatus").textContent =
-            "Movement complete. Final angles: " +
-            JSON.stringify(result.angles);
+        $("referenceStatus").textContent =
+            "Reference recorded. No servo was moved; Cartesian control is enabled.";
+        $("ikStatus").textContent = "Ready. Drag an XYZ slider to move.";
     } catch (error) {
-        $("ikStatus").textContent =
-            "Movement failed: " + error.message;
+        $("referenceStatus").textContent =
+            "Could not set reference: " + error.message;
     } finally {
-        cartesianBusy = false;
         button.disabled = false;
     }
 });
@@ -593,9 +671,22 @@ async function refreshStatus() {
 
         const result = await response.json();
 
-        if (result.angles) {
+        if (result.angles && !userDraggingJoint) {
             // Reading status never sends commands to the servos.
             updateAngleControls(result.angles);
+        }
+
+        $("referenceStatus").textContent = result.referenced
+            ? "Reference pose is set."
+            : "Reference pose not set.";
+
+        if (result.modelled_xyz) {
+            const p = result.modelled_xyz;
+            $("xyzStatus").textContent = "Modelled XYZ: X " + p.x +
+                " mm, Y " + p.y + " mm, Z " + p.z +
+                " mm (not physical feedback).";
+        } else {
+            $("xyzStatus").textContent = "Modelled XYZ: unavailable until referenced.";
         }
     } catch (_) {
         $("jointStatus").textContent =
@@ -605,8 +696,14 @@ async function refreshStatus() {
 
 
 createJointSliders();
+createReferenceControls();
 drawArm();
 refreshStatus();
+
+document.addEventListener("pointerup", () => { userDraggingJoint = false; });
+document.addEventListener("keyup", event => {
+    if (event.target && event.target.type === "range") userDraggingJoint = false;
+});
 </script>
 </body>
 </html>
@@ -635,7 +732,7 @@ def current_angles():
 
 def controller_loop():
     """Continuously move toward the newest Cartesian target."""
-    global cartesian_active
+    global cartesian_active, latest_cartesian_target
 
     while not controller_stop.is_set():
         with target_lock:
@@ -680,9 +777,9 @@ def controller_loop():
                     abs(commands[name] - desired[name]) > 1e-6
                     for name in desired
                 )
-
-            with arm_lock:
-                arm.write(**commands)
+                # Serialize target changes with physical writes.
+                with arm_lock:
+                    arm.write(**commands)
 
             controller_stop.wait(STEP_DELAY)
 
