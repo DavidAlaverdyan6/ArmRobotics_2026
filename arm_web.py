@@ -36,6 +36,7 @@ target_lock = threading.Lock()
 latest_cartesian_target = None
 target_generation = 0
 latest_client_sequence = -1
+manual_cutoff_sequence = -1
 cartesian_active = False
 controller_stop = threading.Event()
 controller_thread = None
@@ -468,7 +469,10 @@ async function postJSON(path, payload) {
 
 async function sendJoint(name, angle) {
     try {
-        await postJSON("/api/servo", {[name]: angle});
+        await postJSON("/api/servo", {
+            [name]: angle,
+            cancel_sequence: targetRequestVersion
+        });
 
         $("jointStatus").textContent =
             name + " commanded to " + angle + "°. Cartesian target cancelled.";
@@ -799,17 +803,20 @@ def controller_loop():
         cartesian_active = False
 
 
-def set_cartesian_target(target):
-    """Replace the target atomically; ignore out-of-order browser requests."""
-    global latest_cartesian_target, target_generation, latest_client_sequence
+def set_cartesian_target(target, manual_cutoff=None):
+    """Replace the target atomically; ignore stale/out-of-order requests."""
+    global latest_cartesian_target, target_generation
+    global latest_client_sequence, manual_cutoff_sequence
     with target_lock:
         if target is not None:
             sequence = int(target.get("sequence", 0))
-            if sequence < latest_client_sequence:
+            if sequence <= manual_cutoff_sequence or sequence < latest_client_sequence:
                 return False
             latest_client_sequence = sequence
-        # A manual override clears the target but does not consume browser
-        # sequence numbers; the next live slider event can resume control.
+        elif manual_cutoff is not None:
+            manual_cutoff_sequence = max(
+                manual_cutoff_sequence, int(manual_cutoff)
+            )
         latest_cartesian_target = target
         target_generation += 1
         return True
@@ -935,7 +942,10 @@ class Handler(BaseHTTPRequestHandler):
 
                 # Manual joint control takes precedence over any
                 # queued Cartesian target.
-                set_cartesian_target(None)
+                set_cartesian_target(
+                    None,
+                    manual_cutoff=int(data.get("cancel_sequence", 0))
+                )
                 with arm_lock:
                     arm.write(**commands)
 
