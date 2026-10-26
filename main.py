@@ -1,430 +1,550 @@
-
 #!/usr/bin/env python3
 
 import time
-
+import smbus
 from telemetrix import telemetrix
-from smbus2 import SMBus
 
 import line_tracker
 import motors
-import led
-import robot_pin_config as pins
 
 
-rgb = led.RGBLED(
-    pins.LED_RED,
-    pins.LED_GREEN,
-    pins.LED_BLUE,
-)
+# =============== CONFIGURATION ===============
 
-# Hardware configuration
+SERIAL_PORT = "/dev/serial0"
+UPDATE_INTERVAL = 0.02
 
-PORT = "/dev/serial0"
+# S2-S7 line sensors
+LINE_SENSORS = (1, 2, 3, 4, 5, 6)
 
-BASE_SPEED = 150
-MAX_SPEED = 180
-MIN_SPEED = -60
+S1_INDEX = 0
+S8_INDEX = 7
 
-KP = 30.0
-TARGET_POSITION = 0.5
-LOOP_DELAY = 0.04
+BASE_SPEED = 255
+TURN_SPEED = 90
 
-# Intersection handling
+LEFT_THRESHOLD = 3.3
+RIGHT_THRESHOLD = 3.7
+BLACK_THRESHOLD = 0.95
 
-STARTUP_INTERSECTION_IGNORE = 0.5
-CROSSING_CONFIRM_FRAMES = 3
+# MPU-6050
+I2C_BUS_NUMBER = 1
+MPU6050_ADDR = 0x68
+GYRO_Z_REGISTER = 0x47
+GYRO_SENSITIVITY = 131.0
 
-JUNCTION_EDGE_THRESHOLD = 0.20
-EXIT_CONFIRM_FRAMES = 3
+# Turning
+TARGET_ANGLE = 80.0
+TURN_FAST_SPEED = 250
+TURN_SLOW_SPEED = 90
+TURN_TIMEOUT = 5.0
 
-CLEAR_SPEED = 100
-CLEAR_TIMEOUT = 3.0
+# Straight movement through junction
+STRAIGHT_TIME = 0.5
 
-# Movement before turning
-
-APPROACH_TIME = 0.5
-
-# Gyro-controlled turns
-
-I2C_BUS = 1
-MPU_ADDRESS = 0x68
-
-TURN_SPEED = 130
-TURN_ANGLE = 88.0
-TURN_TIMEOUT = 3.0
-
-LEFT_TURN_SIGN = 1
-RIGHT_TURN_SIGN = -1
-
-GYRO_CALIBRATION_SAMPLES = 300
-GYRO_CALIBRATION_DELAY = 0.005
-GYRO_DEADBAND_DPS = 1.0
-
-# Post-turn line correction
-
-POST_TURN_TIME = 1.0
-
-# Sensor indices: S1..S8, ordered left to right
-
-LEFT_SENSORS = (0, 1, 2)
-CENTER_SENSORS = (3, 4)
-RIGHT_SENSORS = (5, 6, 7)
+# Anti-Bug
+ANTIBUG_CHECK_TIME = 0.5
 
 
-def clamp(value, low, high):
-    return max(low, min(high, value))
+# =============== ROUTE ===============
+# L = Left, R = Right, S = Straight
+
+ROUTE = [
+    "S",
+    "L",
+    "S",
+    "R",
+    "R",
+    "L",
+    "R",
+    "S",
+    "R",
+    "R",
+    "L",
+    "L",
+    "R",
+]
 
 
-class MPU6050:
-    PWR_MGMT_1 = 0x6B
-    CONFIG = 0x1A
-    GYRO_CONFIG = 0x1B
-    GYRO_ZOUT_H = 0x47
+# =============== HELPERS ===============
 
-    def __init__(self, bus_number=I2C_BUS, address=MPU_ADDRESS):
-        self.bus = SMBus(bus_number)
-        self.address = address
-        self.bias_z = 0.0
-        self.angle = 0.0
-        self.last_time = None
-
-        self.bus.write_byte_data(
-            self.address, self.PWR_MGMT_1, 0x00
-        )
-        self.bus.write_byte_data(
-            self.address, self.CONFIG, 0x03
-        )
-        self.bus.write_byte_data(
-            self.address, self.GYRO_CONFIG, 0x00
-        )
-
-        time.sleep(0.1)
-
-    def _read_signed_word(self, register):
-        high, low = self.bus.read_i2c_block_data(
-            self.address, register, 2
-        )
-        value = (high << 8) | low
-
-        if value >= 32768:
-            value -= 65536
-
-        return value
-
-    def read_z_dps(self):
-        return self._read_signed_word(self.GYRO_ZOUT_H) / 131.0
-
-    def calibrate(self):
-        print("Calibrating gyro. Keep the robot stationary...")
-
-        readings = []
-
-        for _ in range(GYRO_CALIBRATION_SAMPLES):
-            readings.append(self.read_z_dps())
-            time.sleep(GYRO_CALIBRATION_DELAY)
-
-        self.bias_z = sum(readings) / len(readings)
-        self.last_time = time.monotonic()
-
-        print(f"Gyro Z bias: {self.bias_z:+.3f} deg/s")
-
-    def reset_angle(self):
-        self.angle = 0.0
-        self.last_time = time.monotonic()
-
-    def update_angle(self):
-        now = time.monotonic()
-
-        if self.last_time is None:
-            self.last_time = now
-            return self.angle
-
-        dt = now - self.last_time
-        self.last_time = now
-
-        if dt <= 0 or dt > 0.2:
-            return self.angle
-
-        rate = self.read_z_dps() - self.bias_z
-
-        if abs(rate) < GYRO_DEADBAND_DPS:
-            rate = 0.0
-
-        self.angle += rate * dt
-        return self.angle
-
-    def close(self):
-        self.bus.close()
+def clamp_speed(speed):
+    return max(-255, min(255, int(speed)))
 
 
-def junction_exit_detected(result):
-    values = result["normalized"]
+def is_black(value):
+    return float(value) > BLACK_THRESHOLD
 
-    left_clear = all(
-        values[i] < JUNCTION_EDGE_THRESHOLD
-        for i in LEFT_SENSORS
+
+def get_line_position(normalized):
+    values = [
+        max(0.0, float(normalized[i]))
+        for i in LINE_SENSORS
+    ]
+
+    total = sum(values)
+
+    if total < 0.01:
+        return None
+
+    weighted_sum = sum(
+        (i + 1) * values[i]
+        for i in range(6)
     )
 
-    right_clear = all(
-        values[i] < JUNCTION_EDGE_THRESHOLD
-        for i in RIGHT_SENSORS
-    )
-
-    center_detected = any(
-        values[i] >= JUNCTION_EDGE_THRESHOLD
-        for i in CENTER_SENSORS
-    )
-
-    return center_detected and (left_clear or right_clear)
+    return weighted_sum / total
 
 
-def follow_line(result):
-    position = result["position"]
+def follow_line(position):
+    if position < LEFT_THRESHOLD:
+        left_speed = TURN_SPEED
+        right_speed = BASE_SPEED
+        direction = "LEFT"
 
-    if position is None:
-        motors.motor_stop()
-        return
+    elif position > RIGHT_THRESHOLD:
+        left_speed = BASE_SPEED
+        right_speed = TURN_SPEED
+        direction = "RIGHT"
 
-    error = position - TARGET_POSITION
-    correction = KP * error
-
-    left_speed = clamp(
-        BASE_SPEED + correction,
-        MIN_SPEED,
-        MAX_SPEED,
-    )
-
-    right_speed = clamp(
-        BASE_SPEED - correction,
-        MIN_SPEED,
-        MAX_SPEED,
-    )
+    else:
+        left_speed = BASE_SPEED
+        right_speed = BASE_SPEED
+        direction = "STRAIGHT"
 
     motors.set_speeds(
-        round(left_speed),
-        round(right_speed),
+        clamp_speed(left_speed),
+        clamp_speed(right_speed)
     )
 
+    return direction
+
+
+# =============== MPU-6050 ===============
+
+def read_word_2c(bus, register):
+    high = bus.read_byte_data(MPU6050_ADDR, register)
+    low = bus.read_byte_data(MPU6050_ADDR, register + 1)
+
+    value = (high << 8) | low
+
+    if value >= 0x8000:
+        value -= 0x10000
+
+    return value
+
+
+def initialize_mpu(bus):
+    bus.write_byte_data(MPU6050_ADDR, 0x6B, 0x00)
+    bus.write_byte_data(MPU6050_ADDR, 0x1B, 0x00)
+
+    time.sleep(0.2)
+
+    print("MPU-6050-ը միացված է։")
+
+
+def calibrate_gyro(bus):
+    print("Գիրոսկոպի կալիբրացիա։ Ռոբոտին մի շարժիր...")
+
+    readings = []
+
+    for _ in range(300):
+        readings.append(
+            read_word_2c(bus, GYRO_Z_REGISTER)
+        )
+
+        time.sleep(0.005)
+
+    offset = sum(readings) / len(readings)
+
+    print(f"Գիրոսկոպի շեղում՝ {offset:.2f}")
+    print("Կալիբրացիան ավարտվեց։")
+
+    return offset
+
+
+# =============== TURN 80 DEGREES ===============
+
+def turn_80_degrees(
+    bus,
+    gyro_offset,
+    direction,
+    antibug=False
+):
+    # Anti-Bug-ի հետադարձ պտույտի արագություններ
+    if antibug:
+
+        if direction == "LEFT":
+            left_speed = -TURN_FAST_SPEED
+            right_speed = TURN_SLOW_SPEED
+
+            print(
+                "\nAnti-Bug: հետադարձ պտույտ ՁԱԽ՝ 80°..."
+            )
+
+        else:
+            left_speed = TURN_SLOW_SPEED
+            right_speed = -TURN_FAST_SPEED
+
+            print(
+                "\nAnti-Bug: հետադարձ պտույտ ԱՋ՝ 80°..."
+            )
+
+    # Սովորական պտույտների արագություններ
+    else:
+
+        if direction == "LEFT":
+            left_speed = -TURN_SLOW_SPEED
+            right_speed = TURN_FAST_SPEED
+
+            print("\nՊտտվում եմ ՁԱԽ՝ 80°...")
+
+        else:
+            left_speed = TURN_FAST_SPEED
+            right_speed = -TURN_SLOW_SPEED
+
+            print("\nՊտտվում եմ ԱՋ՝ 80°...")
+
+    angle = 0.0
+    start_time = time.monotonic()
+    previous_time = start_time
+
+    motors.set_speeds(left_speed, right_speed)
+
+    try:
+        while angle < TARGET_ANGLE:
+
+            current_time = time.monotonic()
+
+            dt = current_time - previous_time
+            previous_time = current_time
+
+            if current_time - start_time > TURN_TIMEOUT:
+                print("\nՊտույտի ժամանակը լրացավ։")
+                return False
+
+            gyro_raw = read_word_2c(
+                bus,
+                GYRO_Z_REGISTER
+            )
+
+            gyro_rate = (
+                gyro_raw - gyro_offset
+            ) / GYRO_SENSITIVITY
+
+            angle += abs(gyro_rate) * dt
+
+            print(
+                f"\rԱնկյուն՝ {angle:.1f}° / "
+                f"{TARGET_ANGLE:.1f}°   ",
+                end="",
+                flush=True
+            )
+
+            time.sleep(0.005)
+
+        print("\n80° պտույտն ավարտվեց։")
+
+        return True
+
+    finally:
+        motors.motor_stop()
+        time.sleep(0.2)
+
+
+# =============== ANTIBUG CHECK ===============
+
+def check_line_after_turn(calibration):
+    print("Anti-Bug: ստուգում եմ գիծը...")
+
+    start_time = time.monotonic()
+
+    while (
+        time.monotonic() - start_time
+        < ANTIBUG_CHECK_TIME
+    ):
+        result = line_tracker.update(calibration)
+        normalized = result["normalized"]
+
+        if len(normalized) < 8:
+            raise ValueError(
+                "Anti-Bug-ի համար սպասվում են "
+                "8 սենսորների տվյալներ։"
+            )
+
+        # Եթե թեկուզ մեկ սենսոր սև է տեսնում
+        if any(
+            is_black(normalized[i])
+            for i in range(8)
+        ):
+            print("Anti-Bug: գիծը հայտնաբերվեց։")
+            return True
+
+        time.sleep(0.01)
+
+    print("Anti-Bug: բոլոր սենսորները սպիտակ են։")
+
+    return False
+
+
+# =============== MAIN ===============
 
 def main():
     board = None
-    gyro = None
+    bus = None
 
-    state = "FOLLOW"
+    tracker_ready = False
+    motors_ready = False
 
-    crossing_candidate = None
-    crossing_frames = 0
-    exit_frames = 0
+    junction_latched = False
+    junction_count = 0
+    route_index = 0
 
-    pending_turn = None
+    valid_directions = {"R", "L", "S"}
 
-    state_started = 0.0
-    turn_started = 0.0
+    if any(
+        direction not in valid_directions
+        for direction in ROUTE
+    ):
+        print(
+            'Սխալ ROUTE։ Օգտագործիր միայն "R", "L", "S"։'
+        )
+        return
 
     try:
-        board = telemetrix.Telemetrix(com_port=PORT)
+        print("Միանում եմ MPU-6050-ին...")
 
-        motors.initialize(board)
+        bus = smbus.SMBus(I2C_BUS_NUMBER)
+        initialize_mpu(bus)
+
+        print("Միանում եմ Telemetrix-ին...")
+
+        board = telemetrix.Telemetrix(
+            com_port=SERIAL_PORT
+        )
+
         line_tracker.initialize(board)
+        tracker_ready = True
 
         calibration = line_tracker.load_calibration()
 
         if calibration is None:
-            print("No calibration found. Calibrate the sensors first.")
+            print("Գծի սենսորների կալիբրացիան չի գտնվել։")
+            print("Նախ կատարիր սենսորների կալիբրացիան։")
             return
 
-        gyro = MPU6050()
+        motors.initialize(board)
+        motors_ready = True
 
         motors.motor_stop()
-        gyro.calibrate()
 
-        print("Line follower ready. Ctrl+C to stop.")
+        gyro_offset = calibrate_gyro(bus)
 
-        robot_start_time = time.monotonic()
+        print("\nՌոբոտը պատրաստ է։")
+        print("Սկսում եմ գծին հետևելը։")
+        print(f"Երթուղի՝ {ROUTE}")
+        print("R՝ աջ, L՝ ձախ, S՝ ուղիղ։")
+        print("Anti-Bug-ը միացված է։")
+        print("Դադարեցնելու համար՝ Ctrl+C։")
 
         while True:
-            now = time.monotonic()
+
             result = line_tracker.update(calibration)
+            normalized = result["normalized"]
 
-            # FOLLOW: normal line tracking and crossing detection
-
-            if state == "FOLLOW":
-                elapsed_since_start = now - robot_start_time
-
-                if elapsed_since_start < STARTUP_INTERSECTION_IGNORE:
-                    crossing = None
-                else:
-                    crossing = result["crossing"]
-
-                if crossing is not None:
-                    if crossing == crossing_candidate:
-                        crossing_frames += 1
-                    else:
-                        crossing_candidate = crossing
-                        crossing_frames = 1
-                else:
-                    crossing_candidate = None
-                    crossing_frames = 0
-
-                if crossing_frames >= CROSSING_CONFIRM_FRAMES:
-                    if crossing_candidate == "LEFT":
-                        pending_turn = "LEFT"
-                    elif crossing_candidate == "RIGHT":
-                        pending_turn = "RIGHT"
-                    else:
-                        pending_turn = "STRAIGHT"
-
-                    motors.motor_stop()
-
-                    state = "CLEAR"
-                    state_started = now
-                    exit_frames = 0
-
-                    crossing_candidate = None
-                    crossing_frames = 0
-
-                    print(f"\nIntersection detected: {pending_turn}")
-
-                    time.sleep(LOOP_DELAY)
-                    continue
-
-                follow_line(result)
-
-            # CLEAR: move through the junction until its exit is detected
-
-            elif state == "CLEAR":
-                crossing = result["crossing"]
-
-                if crossing is None:
-                    exit_frames += 1
-                else:
-                    exit_frames = 0
-
-                if exit_frames >= EXIT_CONFIRM_FRAMES:
-                    motors.motor_stop()
-
-                    if pending_turn == "STRAIGHT":
-                        state = "FOLLOW"
-                        pending_turn = None
-
-                        crossing_candidate = None
-                        crossing_frames = 0
-                        exit_frames = 0
-
-                        print("Crossing cleared. Resuming line following.")
-
-                    else:
-                        state = "APPROACH"
-                        state_started = now
-
-                        print(
-                            f"Crossing cleared. Moving forward for "
-                            f"{APPROACH_TIME:.1f} seconds before turning."
-                        )
-
-                elif now - state_started > CLEAR_TIMEOUT:
-                    motors.motor_stop()
-
-                    raise RuntimeError(
-                        "Crossing pattern did not clear. "
-                        "Check line_tracker crossing classification."
-                    )
-
-                else:
-                    motors.set_speeds(CLEAR_SPEED, CLEAR_SPEED)
-
-            # APPROACH: move forward before starting the pivot
-
-            elif state == "APPROACH":
-                if now - state_started >= APPROACH_TIME:
-                    motors.motor_stop()
-
-                    gyro.reset_angle()
-                    turn_started = time.monotonic()
-                    state = "TURN"
-
-                    print(f"Starting {pending_turn} gyro turn.")
-
-                else:
-                    motors.set_speeds(CLEAR_SPEED, CLEAR_SPEED)
-
-            # TURN: gyro-controlled pivot
-
-            elif state == "TURN":
-                angle = gyro.update_angle()
-
-                sign = (
-                    LEFT_TURN_SIGN
-                    if pending_turn == "LEFT"
-                    else RIGHT_TURN_SIGN
+            if len(normalized) < 8:
+                raise ValueError(
+                    "Սպասվում են 8 սենսորների տվյալներ։"
                 )
 
-                progress = sign * angle
+            s1_black = is_black(normalized[S1_INDEX])
+            s8_black = is_black(normalized[S8_INDEX])
 
-                if progress >= TURN_ANGLE:
-                    motors.motor_stop()
+            # Խաչմերուկի հայտնաբերման վերագործարկում
+            if not s1_black and not s8_black:
+                junction_latched = False
 
-                    state = "POST_TURN"
-                    state_started = time.monotonic()
+            # =============== JUNCTION ===============
 
-                    crossing_candidate = None
-                    crossing_frames = 0
-                    exit_frames = 0
+            if (
+                (s1_black or s8_black)
+                and not junction_latched
+            ):
+                junction_latched = True
+                junction_count += 1
 
-                    print(
-                        "Turn complete. Starting "
-                        f"{POST_TURN_TIME:.1f}-second line correction."
+                motors.motor_stop()
+
+                print(f"\nԽաչմերուկ #{junction_count}")
+
+                if route_index >= len(ROUTE):
+                    print("Երթուղին ավարտված է։")
+                    print("Ռոբոտը կանգնած է։")
+                    break
+
+                direction = ROUTE[route_index]
+                route_index += 1
+
+                print(f"Ընտրված հրահանգ՝ {direction}")
+
+                # =============== STRAIGHT ===============
+
+                if direction == "S":
+                    print("Շարժվում եմ ուղիղ...")
+
+                    motors.set_speeds(
+                        BASE_SPEED,
+                        BASE_SPEED
                     )
 
-                elif now - turn_started > TURN_TIMEOUT:
-                    motors.motor_stop()
+                    time.sleep(STRAIGHT_TIME)
 
-                    raise RuntimeError(
-                        f"{pending_turn} turn timed out at "
-                        f"{progress:.1f} degrees. "
-                        "Check gyro direction and motor polarity."
-                    )
+                    motors.motor_stop()
+                    time.sleep(0.2)
+
+                # =============== LEFT / RIGHT ===============
 
                 else:
-                    motors.set_speeds(
-                        -sign * TURN_SPEED,
-                        sign * TURN_SPEED,
+                    turn_direction = (
+                        "LEFT"
+                        if direction == "L"
+                        else "RIGHT"
                     )
 
-            # POST_TURN: follow the line, but ignore crossings temporarily
-
-            elif state == "POST_TURN":
-                follow_line(result)
-
-                if now - state_started >= POST_TURN_TIME:
-                    state = "FOLLOW"
-                    pending_turn = None
-
-                    crossing_candidate = None
-                    crossing_frames = 0
-                    exit_frames = 0
-
-                    print(
-                        "Post-turn correction complete. "
-                        "Resuming normal line following."
+                    success = turn_80_degrees(
+                        bus,
+                        gyro_offset,
+                        turn_direction
                     )
 
-            time.sleep(LOOP_DELAY)
+                    if not success:
+                        print(
+                            "Պտույտը չավարտվեց։ "
+                            "Ռոբոտը կանգնած է։"
+                        )
+                        break
+
+                    # =============== ANTIBUG ===============
+
+                    line_found = check_line_after_turn(
+                        calibration
+                    )
+
+                    if not line_found:
+                        print(
+                            "Anti-Bug: անհաջող պտույտ։ "
+                            "Վերադառնում եմ հակառակ ուղղությամբ։"
+                        )
+
+                        opposite_direction = (
+                            "RIGHT"
+                            if turn_direction == "LEFT"
+                            else "LEFT"
+                        )
+
+                        rollback_success = turn_80_degrees(
+                            bus,
+                            gyro_offset,
+                            opposite_direction,
+                            antibug=True
+                        )
+
+                        motors.motor_stop()
+
+                        if not rollback_success:
+                            print(
+                                "Հետադարձ պտույտը չավարտվեց։ "
+                                "Ռոբոտը կանգնած է։"
+                            )
+                            break
+
+                        # Նույն հրամանը կրկին փորձելու համար
+                        route_index = max(
+                            0,
+                            route_index - 1
+                        )
+
+                        print(
+                            "Հրամանը պահպանվեց՝ "
+                            f"{ROUTE[route_index]}"
+                        )
+
+                    else:
+                        print(
+                            "Anti-Bug: պտույտը հաջող է։"
+                        )
+
+                print(
+                    "Հրամանի մշակումը ավարտվեց։ "
+                    "Շարունակում եմ գծին հետևել։"
+                )
+
+                continue
+
+            # =============== LINE FOLLOWING ===============
+
+            position = get_line_position(normalized)
+
+            if position is None:
+                motors.motor_stop()
+
+                direction_text = "LINE LOST"
+                position_text = "---"
+
+            else:
+                direction_text = follow_line(position)
+                position_text = f"{position:.2f}"
+
+            next_route = (
+                ROUTE[route_index]
+                if route_index < len(ROUTE)
+                else "END"
+            )
+
+            print(
+                f"\rPosition: {position_text} | "
+                f"Direction: {direction_text} | "
+                f"S1: {normalized[S1_INDEX]:.2f} | "
+                f"S8: {normalized[S8_INDEX]:.2f} | "
+                f"Խաչմերուկներ: {junction_count} | "
+                f"Հաջորդ ROUTE: {next_route}   ",
+                end="",
+                flush=True
+            )
+
+            time.sleep(UPDATE_INTERVAL)
 
     except KeyboardInterrupt:
-        print("\nStopping.")
+        print("\nԾրագիրը կանգնեցվում է։")
+
+    except Exception as error:
+        print(f"\nՍխալ՝ {error}")
 
     finally:
-        if board is not None:
+        if motors_ready:
             try:
                 motors.motor_stop()
-                line_tracker.shutdown()
-            finally:
-                board.shutdown()
+            except Exception:
+                pass
 
-        if gyro is not None:
-            gyro.close()
+        if tracker_ready:
+            try:
+                line_tracker.shutdown()
+            except Exception:
+                pass
+
+        if board is not None:
+            try:
+                board.shutdown()
+            except Exception:
+                pass
+
+        if bus is not None:
+            try:
+                bus.close()
+            except Exception:
+                pass
+
+        print(f"\nԽաչմերուկների քանակը՝ {junction_count}")
+        print("Ռոբոտը կանգնեցված է։")
 
 
 if __name__ == "__main__":
