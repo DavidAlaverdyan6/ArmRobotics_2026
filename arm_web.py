@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 
 import json
@@ -11,7 +10,9 @@ from urllib.parse import urlparse
 from telemetrix import telemetrix
 
 from roboarm import RoboArm
-from arm_ik import inverse_kinematics, forward_kinematics, IKError
+from arm_ik import (
+    inverse_kinematics, forward_kinematics, cartesian_interpolation, IKError
+)
 
 
 # ------------------------------------------------------------
@@ -348,7 +349,7 @@ button.secondary { background: #3b4658; }
                 Set a reference pose below before using Cartesian control.
             </p>
 
-            <p id="ikStatus" class="status" role="status">
+            <p id="ikStatus" class="status">
                 Waiting for reference pose.
             </p>
 
@@ -369,7 +370,7 @@ button.secondary { background: #3b4658; }
             <div class="buttons">
                 <button id="setReference">Record reference pose (no movement)</button>
             </div>
-            <p id="referenceStatus" class="status" role="status">
+            <p id="referenceStatus" class="status">
                 Reference pose not set.
             </p>
         </section>
@@ -742,8 +743,12 @@ def current_angles():
 
 
 def controller_loop():
-    """Continuously move toward the newest Cartesian target."""
+    """Follow a Cartesian waypoint trajectory for the newest target."""
     global cartesian_active, latest_cartesian_target
+
+    trajectory = None
+    trajectory_generation = -1
+    waypoint_index = 0
 
     while not controller_stop.is_set():
         with target_lock:
@@ -753,20 +758,39 @@ def controller_loop():
         if target is None or not arm.is_referenced():
             with target_lock:
                 cartesian_active = False
+            trajectory = None
+            waypoint_index = 0
             controller_stop.wait(0.03)
             continue
 
         try:
-            solution = inverse_kinematics(
-                target["x"], target["y"], target["z"],
-                tool_pitch=target["tool_pitch"],
-                elbow_up=target["elbow_up"],
-            )
+            # Plan once per target update. A newer target starts a new path
+            # from the latest commanded/modelled pose, not measured feedback.
+            if trajectory is None or generation != trajectory_generation:
+                angles = current_angles()
+                start = forward_kinematics(
+                    angles["base"], angles["shoulder"], angles["elbow"]
+                )
+                trajectory = cartesian_interpolation(
+                    start,
+                    (target["x"], target["y"], target["z"]),
+                    tool_pitch=target["tool_pitch"],
+                    elbow_up=target["elbow_up"],
+                )
+                trajectory_generation = generation
+                waypoint_index = 0
+
+            if waypoint_index >= len(trajectory.waypoints):
+                with target_lock:
+                    if generation == target_generation:
+                        cartesian_active = False
+                controller_stop.wait(STEP_DELAY)
+                continue
+
+            waypoint = trajectory.waypoints[waypoint_index]
             desired = {
-                "base": solution.base,
-                "shoulder": solution.shoulder,
-                "elbow": solution.elbow,
-                "wrist": solution.wrist,
+                name: getattr(waypoint, name)
+                for name in ("base", "shoulder", "elbow", "wrist")
             }
 
             angles = current_angles()
@@ -779,18 +803,26 @@ def controller_loop():
                     else current + math.copysign(MAX_JOINT_STEP_DEG, delta)
                 )
 
-            # Do not issue an obsolete step if the target changed
-            # while inverse kinematics was being calculated.
+            reached_waypoint = all(
+                abs(commands[name] - desired[name]) <= 1e-6
+                for name in desired
+            )
+
+            # Do not issue an obsolete step if the target changed while
+            # planning or calculating this waypoint.
             with target_lock:
                 if generation != target_generation:
                     continue
-                cartesian_active = any(
-                    abs(commands[name] - desired[name]) > 1e-6
-                    for name in desired
+                cartesian_active = not (
+                    reached_waypoint
+                    and waypoint_index == len(trajectory.waypoints) - 1
                 )
                 # Serialize target changes with physical writes.
                 with arm_lock:
                     arm.write(**commands)
+
+            if reached_waypoint:
+                waypoint_index += 1
 
             controller_stop.wait(STEP_DELAY)
 
@@ -800,6 +832,8 @@ def controller_loop():
                 if generation == target_generation:
                     latest_cartesian_target = None
                     cartesian_active = False
+            trajectory = None
+            waypoint_index = 0
             controller_stop.wait(0.05)
 
     with target_lock:
