@@ -20,7 +20,7 @@ S1_INDEX = 0
 S8_INDEX = 7
 
 BASE_SPEED = 255
-TURN_SPEED = 90
+TURN_SPEED = 80
 
 LEFT_THRESHOLD = 3.3
 RIGHT_THRESHOLD = 3.7
@@ -34,7 +34,7 @@ GYRO_SENSITIVITY = 131.0
 
 # Turning
 TARGET_ANGLE = 80.0
-TURN_FAST_SPEED = 250
+TURN_FAST_SPEED = 255
 TURN_SLOW_SPEED = 90
 TURN_TIMEOUT = 5.0
 
@@ -56,8 +56,10 @@ ROUTE = [
     "R",
     "L",
     "R",
-    "S",
+    "L",
     "R",
+    "R",
+    "S",
     "R",
     "L",
     "L",
