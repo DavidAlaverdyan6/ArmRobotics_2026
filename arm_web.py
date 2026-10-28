@@ -173,7 +173,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
     <h2>Arm position — kinematic model</h2>
     <p class="muted">
         The diagrams update from the angles commanded by Arm Web. They show the model, not sensor feedback.
-        Floor height, mounting height, wrist geometry and real joint directions must be calibrated before using this as a collision-safety check.
+        The photographed home pose is approximated. Link lengths are 120 mm each; wrist length and joint offsets are estimates. Not suitable for collision-safety checks.
     </p>
     <div class="views">
         <div class="view"><h3>X–Y · Top view</h3><canvas id="viewXY"></canvas></div>
@@ -184,7 +184,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
         <span style="--dot:#62a5ff">Base / shoulder</span>
         <span style="--dot:#65d6a6">Link 1</span>
         <span style="--dot:#ffbf69">Link 2</span>
-        <span style="--dot:#ff6b6b">End point</span>
+        <span style="--dot:#b79cff">Wrist / tool</span>\n        <span style="--dot:#ff6b6b">End point</span>
     </div>
     <p id="modelStatus" class="status">Waiting for angle data…</p>
 </section>
@@ -328,21 +328,38 @@ const LINK1_MM = 120;
 const LINK2_MM = 120;
 let lastModelAngles = {...angles};
 
+// Approximate geometry inferred from the photographed home pose.
+// X points toward the robot front, Y toward its right side, Z upward.
+// These offsets affect the drawing only, not motor commands or Cartesian IK.
+const HOME_SHOULDER_DEG = 170;
+const HOME_ELBOW_BEND_DEG = -120;
+const WRIST_LENGTH_MM = 55;
+const HOME_WRIST_PITCH_DEG = 160;
+
 function armPoints(a) {
-    const base = (a.base - 95) * Math.PI / 180;
-    const q1 = (90 + a.shoulder - 180) * Math.PI / 180;
-    const q2 = (a.elbow - 180) * Math.PI / 180;
+    const yaw = (a.base - 95) * Math.PI / 180;
+    const shoulder = (HOME_SHOULDER_DEG - (a.shoulder - 180)) * Math.PI / 180;
+    const elbow = shoulder + (HOME_ELBOW_BEND_DEG + (a.elbow - 180)) * Math.PI / 180;
+    const wrist = (HOME_WRIST_PITCH_DEG + (a.wrist - 20)) * Math.PI / 180;
 
-    const r1 = LINK1_MM * Math.cos(q1);
-    const z1 = LINK1_MM * Math.sin(q1);
-    const r2 = r1 + LINK2_MM * Math.cos(q1 + q2);
-    const z2 = z1 + LINK2_MM * Math.sin(q1 + q2);
-
-    return [
-        {x: 0, y: 0, z: -LINK1_MM - LINK2_MM},
-        {x: r1 * Math.cos(base), y: r1 * Math.sin(base), z: z1 - LINK1_MM - LINK2_MM},
-        {x: r2 * Math.cos(base), y: r2 * Math.sin(base), z: z2 - LINK1_MM - LINK2_MM}
+    const planar = [
+        {r: 0, z: 0},
+        {r: LINK1_MM * Math.cos(shoulder), z: LINK1_MM * Math.sin(shoulder)}
     ];
+    planar.push({
+        r: planar[1].r + LINK2_MM * Math.cos(elbow),
+        z: planar[1].z + LINK2_MM * Math.sin(elbow)
+    });
+    planar.push({
+        r: planar[2].r + WRIST_LENGTH_MM * Math.cos(wrist),
+        z: planar[2].z + WRIST_LENGTH_MM * Math.sin(wrist)
+    });
+    const home = planar[3];
+    return planar.map(p => ({
+        x: p.r * Math.cos(yaw) - home.r,
+        y: p.r * Math.sin(yaw),
+        z: p.z - home.z
+    }));
 }
 
 function drawProjection(canvasId, points, horizontal, vertical, horizontalLabel, verticalLabel) {
@@ -376,25 +393,22 @@ function drawProjection(canvasId, points, horizontal, vertical, horizontalLabel,
     ctx.fillText(verticalLabel, ox + 8, 16);
     ctx.fillText("0", ox + 5, oy + 14);
 
-    ctx.strokeStyle = "#65d6a6";
+    const segmentColors = ["#65d6a6", "#ffbf69", "#b79cff"];
     ctx.lineWidth = 5;
     ctx.lineCap = "round";
-    ctx.beginPath();
-    ctx.moveTo(px(values[0][0]), py(values[0][1]));
-    ctx.lineTo(px(values[1][0]), py(values[1][1]));
-    ctx.stroke();
+    for (let i = 0; i < values.length - 1; i++) {
+        ctx.strokeStyle = segmentColors[i];
+        ctx.beginPath();
+        ctx.moveTo(px(values[i][0]), py(values[i][1]));
+        ctx.lineTo(px(values[i + 1][0]), py(values[i + 1][1]));
+        ctx.stroke();
+    }
 
-    ctx.strokeStyle = "#ffbf69";
-    ctx.beginPath();
-    ctx.moveTo(px(values[1][0]), py(values[1][1]));
-    ctx.lineTo(px(values[2][0]), py(values[2][1]));
-    ctx.stroke();
-
-    const colors = ["#62a5ff", "#65d6a6", "#ff6b6b"];
+    const colors = ["#62a5ff", "#65d6a6", "#ffbf69", "#ff6b6b"];
     points.forEach((p, i) => {
         ctx.beginPath();
         ctx.fillStyle = colors[i];
-        ctx.arc(px(p[horizontal]), py(p[vertical]), i === 2 ? 6 : 5, 0, Math.PI * 2);
+        ctx.arc(px(p[horizontal]), py(p[vertical]), i === points.length - 1 ? 6 : 5, 0, Math.PI * 2);
         ctx.fill();
     });
 }
@@ -407,8 +421,8 @@ function renderArmModel(a) {
     document.getElementById("modelStatus").textContent =
         "Base " + a.base + "° · Shoulder " + a.shoulder +
         "° · Elbow " + a.elbow + "° · Endpoint relative to home grip: X " +
-        points[2].x.toFixed(1) + " mm, Y " + points[2].y.toFixed(1) +
-        " mm, Z " + points[2].z.toFixed(1) + " mm.";
+        points[3].x.toFixed(1) + " mm, Y " + points[3].y.toFixed(1) +
+        " mm, Z " + points[3].z.toFixed(1) + " mm.";
 }
 
 async function refreshModel() {
