@@ -119,7 +119,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 <header style="grid-column:1/-1">
     <h1>ArmRobotics 2026</h1>
     <p class="muted">
-        XYZ coordinates are millimeters relative to the home gripper position.
+        Cartesian target coordinates use the IK model. The arm drawing uses the base as its origin.
         Move to target commands a straight Cartesian path.
     </p>
 </header>
@@ -354,15 +354,14 @@ function armPoints(a) {
         r: planar[2].r + WRIST_LENGTH_MM * Math.cos(wrist),
         z: planar[2].z + WRIST_LENGTH_MM * Math.sin(wrist)
     });
-    const home = planar[3];
     return planar.map(p => ({
-        x: home.r - p.r * Math.cos(yaw),
+        x: -p.r * Math.cos(yaw),
         y: p.r * Math.sin(yaw),
-        z: p.z - home.z
+        z: p.z
     }));
 }
 
-function drawProjection(canvasId, points, horizontal, vertical, horizontalLabel, verticalLabel) {
+function drawProjection(canvasId, points, horizontal, vertical, horizontalLabel, verticalLabel, verticalDown = false) {
     const canvas = document.getElementById(canvasId);
     const rect = canvas.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
@@ -378,7 +377,7 @@ function drawProjection(canvasId, points, horizontal, vertical, horizontalLabel,
     const scale = Math.min((w - 54) / (2 * extent), (h - 54) / (2 * extent));
     const ox = w / 2, oy = h / 2;
     const px = v => ox + v * scale;
-    const py = v => oy - v * scale;
+    const py = v => oy + (verticalDown ? v : -v) * scale;
 
     ctx.strokeStyle = "#303b4b";
     ctx.lineWidth = 1;
@@ -415,12 +414,12 @@ function drawProjection(canvasId, points, horizontal, vertical, horizontalLabel,
 
 function renderArmModel(a) {
     const points = armPoints(a);
-    drawProjection("viewXY", points, "y", "x", "Y", "X");
+    drawProjection("viewXY", points, "y", "x", "Y", "X", true);
     drawProjection("viewXZ", points, "x", "z", "X", "Z");
     drawProjection("viewYZ", points, "y", "z", "Y", "Z");
     document.getElementById("modelStatus").textContent =
         "Base " + a.base + "° · Shoulder " + a.shoulder +
-        "° · Elbow " + a.elbow + "° · Endpoint relative to home grip: X " +
+        "° · Elbow " + a.elbow + "° · Endpoint relative to base: X " +
         points[3].x.toFixed(1) + " mm, Y " + points[3].y.toFixed(1) +
         " mm, Z " + points[3].z.toFixed(1) + " mm.";
 }
