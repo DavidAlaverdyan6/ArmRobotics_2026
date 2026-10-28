@@ -340,7 +340,7 @@ function armPoints(a) {
     const yaw = (a.base - 95) * Math.PI / 180;
     const shoulder = (HOME_SHOULDER_DEG - (a.shoulder - 180)) * Math.PI / 180;
     const elbow = shoulder + (HOME_ELBOW_BEND_DEG + (a.elbow - 180)) * Math.PI / 180;
-    const wrist = (HOME_WRIST_PITCH_DEG + (a.wrist - 20)) * Math.PI / 180;
+    const wrist = (HOME_WRIST_PITCH_DEG - (a.wrist - 20)) * Math.PI / 180;
 
     const planar = [
         {r: 0, z: 0},
