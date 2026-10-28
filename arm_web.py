@@ -275,25 +275,102 @@ function buildJointControls() {
     }
 }
 
-for (const id of ["x", "y", "z", "pitch"]) {
-    document.getElementById(id).addEventListener("input", () => {
-        document.getElementById(id + "Value").textContent =
-            document.getElementById(id).value;
-    });
+const coordinateIds = ["x", "y", "z", "pitch"];
+let validTarget = null;
+let validationSerial = 0;
+let validationTimer = null;
+let validating = false;
+
+function readTarget() {
+    return {
+        x: Number(document.getElementById("x").value),
+        y: Number(document.getElementById("y").value),
+        z: Number(document.getElementById("z").value),
+        tool_pitch: Number(document.getElementById("pitch").value),
+        elbow_up: document.getElementById("elbowUp").checked
+    };
 }
 
+function displayTarget() {
+    for (const id of coordinateIds) {
+        document.getElementById(id + "Value").textContent =
+            document.getElementById(id).value;
+    }
+}
+
+function restoreValidTarget() {
+    if (!validTarget) return;
+    for (const id of ["x", "y", "z"]) {
+        document.getElementById(id).value = validTarget[id];
+    }
+    document.getElementById("pitch").value = validTarget.tool_pitch;
+    document.getElementById("elbowUp").checked = validTarget.elbow_up;
+    displayTarget();
+}
+
+async function validateTarget() {
+    const serial = ++validationSerial;
+    const target = readTarget();
+    validating = true;
+    setBusy(true);
+    document.getElementById("ikStatus").textContent = "Checking reachability...";
+    try {
+        await postJSON("/api/ik/check", target);
+        if (serial !== validationSerial) return;
+        validTarget = target;
+        document.getElementById("ikStatus").textContent = "Reachable target.";
+    } catch (error) {
+        if (serial !== validationSerial) return;
+        restoreValidTarget();
+        document.getElementById("ikStatus").textContent =
+            "Unreachable position. Reverted: " + error.message;
+    } finally {
+        if (serial === validationSerial) {
+            validating = false;
+            setBusy(false);
+        }
+    }
+}
+
+function scheduleValidation() {
+    displayTarget();
+    clearTimeout(validationTimer);
+    validating = true;
+    setBusy(true);
+    validationTimer = setTimeout(validateTarget, 160);
+}
+
+for (const id of coordinateIds) {
+    document.getElementById(id).addEventListener("input", scheduleValidation);
+}
+document.getElementById("elbowUp").addEventListener("change", scheduleValidation);
+
 document.getElementById("zero").addEventListener("click", async () => {
+    clearTimeout(validationTimer);
+    ++validationSerial;
+    validating = true;
+    setBusy(true);
     try {
         const response = await fetch("/api/status", {cache: "no-store"});
         const data = await response.json();
-        if (!data.xyz) throw new Error("No XYZ data");
+        if (!data.xyz || !data.angles) throw new Error("No position data");
         for (const [i, id] of ["x", "y", "z"].entries()) {
             document.getElementById(id).value = Math.round(data.xyz[i]);
-            document.getElementById(id + "Value").textContent =
-                document.getElementById(id).value;
         }
+        const a = data.angles;
+        const q2 = 170 + (a.shoulder - 180) - 120 - (a.elbow - 180);
+        document.getElementById("pitch").value =
+            Math.round(q2 - 50 + (a.wrist - 20) * 90 / 124);
+        displayTarget();
+        validTarget = readTarget();
+        document.getElementById("ikStatus").textContent =
+            "Current XYZ loaded. Adjust sliders to check new targets.";
     } catch (error) {
+        restoreValidTarget();
         document.getElementById("ikStatus").textContent = error.message;
+    } finally {
+        validating = false;
+        setBusy(false);
     }
 });
 
@@ -307,6 +384,10 @@ document.getElementById("move").addEventListener("click", async () => {
         elbow_up: document.getElementById("elbowUp").checked
     };
 
+    if (validating || !validTarget) {
+        status.textContent = "Wait for coordinate validation or load current XYZ.";
+        return;
+    }
     setBusy(true);
     status.textContent = "Planning and checking the path...";
 
@@ -331,6 +412,8 @@ document.getElementById("move").addEventListener("click", async () => {
 });
 
 buildJointControls();
+document.getElementById("move").disabled = true;
+document.getElementById("zero").click();
 
 const LINK1_MM = 120;
 const LINK2_MM = 120;
@@ -615,6 +698,18 @@ class Handler(BaseHTTPRequestHandler):
                     arm.write(**commands)
 
                 self.send_json(200, {"ok": True, "angles": commands})
+                return
+
+            if path == "/api/ik/check":
+                with arm_lock:
+                    if moving:
+                        self.send_json(409, {"error": "Arm is moving."})
+                        return
+                    path_angles = plan_cartesian_path(data)
+                self.send_json(200, {
+                    "ok": True,
+                    "angles": path_angles[-1] if path_angles else {},
+                })
                 return
 
             if path == "/api/ik":
