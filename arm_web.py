@@ -1,5 +1,6 @@
 
 import json
+import math
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -35,6 +36,7 @@ IK_JOINTS = ("base", "shoulder", "elbow", "wrist")
 
 MOVE_STEPS = 30
 STEP_DELAY = 0.03
+AUTO_MAX_STEP_DEG = 2.0
 
 board = None
 arm = None
@@ -161,6 +163,19 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 </section>
 
 <section class="panel">
+    <h2>Automatic XYZ destination</h2>
+    <p class="muted">Enter the closed-gripper tip position in mm. The arm chooses the wrist angle and a joint-space route. The tip may follow a curved path.</p>
+    <div class="control"><label for="autoX">X (mm)</label><input id="autoX" type="number" min="-415" max="415" step="1" value="0"></div>
+    <div class="control"><label for="autoY">Y (mm)</label><input id="autoY" type="number" min="-415" max="415" step="1" value="0"></div>
+    <div class="control"><label for="autoZ">Z (mm)</label><input id="autoZ" type="number" min="-415" max="415" step="1" value="0"></div>
+    <div class="buttons">
+        <button id="autoMove">Move automatically</button>
+        <button id="autoCurrent" class="secondary">Fill current XYZ</button>
+    </div>
+    <p id="autoStatus" class="status">Ready. Automatic mode does not check collisions.</p>
+</section>
+
+<section class="panel">
     <h2>Manual joint control</h2>
     <p class="muted">
         Manual controls move joints directly. They do not follow a Cartesian path.
@@ -221,6 +236,8 @@ async function postJSON(path, data) {
 function setBusy(busy) {
     document.getElementById("move").disabled = busy;
     document.getElementById("zero").disabled = busy;
+    document.getElementById("autoMove").disabled = busy;
+    document.getElementById("autoCurrent").disabled = busy;
 }
 
 function buildJointControls() {
@@ -411,6 +428,51 @@ document.getElementById("move").addEventListener("click", async () => {
     }
 });
 
+async function fillAutoCurrent() {
+    try {
+        const response = await fetch("/api/status", {cache: "no-store"});
+        if (!response.ok) throw new Error("Cannot read robot position");
+        const data = await response.json();
+        if (!data.xyz) throw new Error("No position data");
+        ["autoX", "autoY", "autoZ"].forEach((id, i) => {
+            document.getElementById(id).value = Math.round(data.xyz[i]);
+        });
+        document.getElementById("autoStatus").textContent = "Current position loaded.";
+    } catch (error) {
+        document.getElementById("autoStatus").textContent = error.message;
+    }
+}
+document.getElementById("autoCurrent").addEventListener("click", fillAutoCurrent);
+document.getElementById("autoMove").addEventListener("click", async () => {
+    const status = document.getElementById("autoStatus");
+    const xyz = ["autoX", "autoY", "autoZ"].map(id =>
+        Number(document.getElementById(id).value));
+    if (xyz.some(v => !Number.isFinite(v)) ||
+        ["autoX", "autoY", "autoZ"].some(id => document.getElementById(id).value.trim() === "")) {
+        status.textContent = "Enter valid X, Y and Z.";
+        return;
+    }
+    setBusy(true);
+    status.textContent = "Searching for reachable arm pose...";
+    try {
+        const result = await postJSON("/api/auto", {
+            x: xyz[0], y: xyz[1], z: xyz[2]
+        });
+        for (const name of ["base", "shoulder", "elbow", "wrist"]) {
+            angles[name] = result.angles[name];
+            document.getElementById("joint-" + name).value = angles[name];
+            document.getElementById("value-" + name).textContent = angles[name] + "°";
+        }
+        status.textContent = "Reached target in model. Tool pitch: " +
+            result.pitch.toFixed(1) + "°. Check actual position.";
+        fillAutoCurrent();
+    } catch (error) {
+        status.textContent = "Automatic move failed: " + error.message;
+    } finally {
+        setBusy(false);
+    }
+});
+
 buildJointControls();
 document.getElementById("move").disabled = true;
 document.getElementById("zero").click();
@@ -592,6 +654,65 @@ def plan_cartesian_path(target):
     return path
 
 
+def plan_auto_path(target):
+    """Find a reachable tool pitch and interpolate servo angles to the pose.
+
+    This deliberately does not guarantee straight-line Cartesian travel.
+    It cannot detect collisions or mechanical interference.
+    """
+    x, y, z = (float(target[k]) for k in ("x", "y", "z"))
+    if not all(math.isfinite(v) for v in (x, y, z)):
+        raise IKError("XYZ must be finite.")
+    if math.sqrt(x*x + y*y + z*z) > 415.01:
+        raise IKError("Target is beyond the 415 mm maximum theoretical reach.")
+
+    current = get_current_angles()
+    q2 = 170.0 + (current["shoulder"] - 180.0) - 120.0 - (current["elbow"] - 180.0)
+    current_pitch = q2 - 50.0 + (current["wrist"] - 20.0) * 90.0 / 124.0
+
+    # First try orientations near the current tool direction to avoid
+    # unnecessarily large wrist and shoulder movements.
+    pitches = sorted(
+        [float(p) for p in range(-180, 181, 3)] + [current_pitch],
+        key=lambda p: abs(p - current_pitch)
+    )
+    candidates = []
+    for pitch in pitches:
+        for elbow_up in (False, True):
+            try:
+                solution = inverse_kinematics(
+                    x, y, z, tool_pitch=pitch, elbow_up=elbow_up
+                )
+            except IKError:
+                continue
+            joints = {
+                name: getattr(solution, name)
+                for name in IK_JOINTS
+            }
+            delta = [abs(joints[n] - current[n]) for n in IK_JOINTS]
+            score = sum(d*d for d in delta) + 0.03 * (pitch-current_pitch)**2
+            candidates.append((score, joints, pitch))
+
+    if not candidates:
+        raise IKError(
+            "No reachable joint configuration for this XYZ within servo limits."
+        )
+    _, final, pitch = min(candidates, key=lambda item: item[0])
+    steps = max(1, math.ceil(max(
+        abs(final[n] - current[n]) for n in IK_JOINTS
+    ) / AUTO_MAX_STEP_DEG))
+    path = []
+    for index in range(1, steps + 1):
+        t = index / steps
+        # Smooth start and finish.
+        t = t*t*(3 - 2*t)
+        path.append({
+            n: round(current[n] + (final[n] - current[n]) * t, 2)
+            for n in IK_JOINTS
+        })
+    return path, pitch
+
+
 def execute_path(path):
     global moving
 
@@ -698,6 +819,30 @@ class Handler(BaseHTTPRequestHandler):
                     arm.write(**commands)
 
                 self.send_json(200, {"ok": True, "angles": commands})
+                return
+
+            if path == "/api/auto":
+                # Reserve the arm while planning and executing to prevent
+                # simultaneous commands from another browser request.
+                with arm_lock:
+                    if moving:
+                        self.send_json(409, {"error": "Arm is already moving."})
+                        return
+                    path_angles, chosen_pitch = plan_auto_path(data)
+                    moving = True
+                try:
+                    for step in path_angles:
+                        with arm_lock:
+                            arm.write(**step)
+                        time.sleep(STEP_DELAY)
+                finally:
+                    with arm_lock:
+                        moving = False
+                self.send_json(200, {
+                    "ok": True,
+                    "angles": path_angles[-1],
+                    "pitch": chosen_pitch,
+                })
                 return
 
             if path == "/api/ik/check":
