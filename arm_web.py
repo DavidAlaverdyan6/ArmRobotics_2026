@@ -339,9 +339,9 @@ function armPoints(a) {
     const z2 = z1 + LINK2_MM * Math.sin(q1 + q2);
 
     return [
-        {x: 0, y: 0, z: 0},
-        {x: r1 * Math.cos(base), y: r1 * Math.sin(base), z: z1},
-        {x: r2 * Math.cos(base), y: r2 * Math.sin(base), z: z2}
+        {x: 0, y: 0, z: -LINK1_MM - LINK2_MM},
+        {x: r1 * Math.cos(base), y: r1 * Math.sin(base), z: z1 - LINK1_MM - LINK2_MM},
+        {x: r2 * Math.cos(base), y: r2 * Math.sin(base), z: z2 - LINK1_MM - LINK2_MM}
     ];
 }
 
