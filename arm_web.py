@@ -373,7 +373,7 @@ function drawProjection(canvasId, points, horizontal, vertical, horizontalLabel,
     ctx.clearRect(0, 0, w, h);
 
     const values = points.map(p => [p[horizontal], p[vertical]]);
-    const extent = Math.max(140, ...values.flat().map(v => Math.abs(v))) * 1.25;
+    const extent = LINK1_MM + LINK2_MM + WRIST_LENGTH_MM + 25;
     const scale = Math.min((w - 54) / (2 * extent), (h - 54) / (2 * extent));
     const ox = w / 2, oy = h / 2;
     const px = v => ox + v * scale;
