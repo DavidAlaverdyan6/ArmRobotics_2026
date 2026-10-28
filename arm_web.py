@@ -104,6 +104,14 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
     overflow-wrap: anywhere;
 }
 .muted { color: #aab5c5; font-size: 0.9rem; }
+.visual-panel { grid-column: 1 / -1; }
+.views { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.view { background: #11151c; border: 1px solid #303b4b; border-radius: 8px; padding: 8px; min-width: 0; }
+.view h3 { margin: 4px 4px 8px; font-size: 0.95rem; }
+.view canvas { display: block; width: 100%; height: 250px; }
+.legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 8px; font-size: 0.85rem; color: #aab5c5; }
+.legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; background: var(--dot); }
+
 </style>
 </head>
 <body>
@@ -159,6 +167,26 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
     </p>
     <div id="jointControls"></div>
     <p id="jointStatus" class="status">Waiting for connection.</p>
+</section>
+
+<section class="panel visual-panel">
+    <h2>Arm position — kinematic model</h2>
+    <p class="muted">
+        The diagrams update from the angles commanded by Arm Web. They show the model, not sensor feedback.
+        Floor height, mounting height, wrist geometry and real joint directions must be calibrated before using this as a collision-safety check.
+    </p>
+    <div class="views">
+        <div class="view"><h3>X–Y · Top view</h3><canvas id="viewXY"></canvas></div>
+        <div class="view"><h3>X–Z · Side view</h3><canvas id="viewXZ"></canvas></div>
+        <div class="view"><h3>Y–Z · Front view</h3><canvas id="viewYZ"></canvas></div>
+    </div>
+    <div class="legend">
+        <span style="--dot:#62a5ff">Base / shoulder</span>
+        <span style="--dot:#65d6a6">Link 1</span>
+        <span style="--dot:#ffbf69">Link 2</span>
+        <span style="--dot:#ff6b6b">End point</span>
+    </div>
+    <p id="modelStatus" class="status">Waiting for angle data…</p>
 </section>
 </div>
 
@@ -295,6 +323,110 @@ document.getElementById("move").addEventListener("click", async () => {
 });
 
 buildJointControls();
+
+const LINK1_MM = 120;
+const LINK2_MM = 120;
+let lastModelAngles = {...angles};
+
+function armPoints(a) {
+    const base = (a.base - 95) * Math.PI / 180;
+    const q1 = (90 + a.shoulder - 180) * Math.PI / 180;
+    const q2 = (a.elbow - 180) * Math.PI / 180;
+
+    const r1 = LINK1_MM * Math.cos(q1);
+    const z1 = LINK1_MM * Math.sin(q1);
+    const r2 = r1 + LINK2_MM * Math.cos(q1 + q2);
+    const z2 = z1 + LINK2_MM * Math.sin(q1 + q2);
+
+    return [
+        {x: 0, y: 0, z: 0},
+        {x: r1 * Math.cos(base), y: r1 * Math.sin(base), z: z1},
+        {x: r2 * Math.cos(base), y: r2 * Math.sin(base), z: z2}
+    ];
+}
+
+function drawProjection(canvasId, points, horizontal, vertical, horizontalLabel, verticalLabel) {
+    const canvas = document.getElementById(canvasId);
+    const rect = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.max(1, Math.round(rect.width * dpr));
+    canvas.height = Math.max(1, Math.round(rect.height * dpr));
+    const ctx = canvas.getContext("2d");
+    ctx.scale(dpr, dpr);
+    const w = rect.width, h = rect.height;
+    ctx.clearRect(0, 0, w, h);
+
+    const values = points.map(p => [p[horizontal], p[vertical]]);
+    const extent = Math.max(140, ...values.flat().map(v => Math.abs(v))) * 1.25;
+    const scale = Math.min((w - 54) / (2 * extent), (h - 54) / (2 * extent));
+    const ox = w / 2, oy = h / 2;
+    const px = v => ox + v * scale;
+    const py = v => oy - v * scale;
+
+    ctx.strokeStyle = "#303b4b";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(18, oy); ctx.lineTo(w - 18, oy);
+    ctx.moveTo(ox, 18); ctx.lineTo(ox, h - 18);
+    ctx.stroke();
+
+    ctx.fillStyle = "#aab5c5";
+    ctx.font = "12px system-ui";
+    ctx.fillText(horizontalLabel, w - 32, oy - 8);
+    ctx.fillText(verticalLabel, ox + 8, 16);
+    ctx.fillText("0", ox + 5, oy + 14);
+
+    ctx.strokeStyle = "#65d6a6";
+    ctx.lineWidth = 5;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(px(values[0][0]), py(values[0][1]));
+    ctx.lineTo(px(values[1][0]), py(values[1][1]));
+    ctx.stroke();
+
+    ctx.strokeStyle = "#ffbf69";
+    ctx.beginPath();
+    ctx.moveTo(px(values[1][0]), py(values[1][1]));
+    ctx.lineTo(px(values[2][0]), py(values[2][1]));
+    ctx.stroke();
+
+    const colors = ["#62a5ff", "#65d6a6", "#ff6b6b"];
+    points.forEach((p, i) => {
+        ctx.beginPath();
+        ctx.fillStyle = colors[i];
+        ctx.arc(px(p[horizontal]), py(p[vertical]), i === 2 ? 6 : 5, 0, Math.PI * 2);
+        ctx.fill();
+    });
+}
+
+function renderArmModel(a) {
+    const points = armPoints(a);
+    drawProjection("viewXY", points, "x", "y", "X", "Y");
+    drawProjection("viewXZ", points, "x", "z", "X", "Z");
+    drawProjection("viewYZ", points, "y", "z", "Y", "Z");
+    document.getElementById("modelStatus").textContent =
+        "Base " + a.base + "° · Shoulder " + a.shoulder +
+        "° · Elbow " + a.elbow + "° · Model endpoint: X " +
+        points[2].x.toFixed(1) + " mm, Y " + points[2].y.toFixed(1) +
+        " mm, Z " + points[2].z.toFixed(1) + " mm from the shoulder pivot.";
+}
+
+async function refreshModel() {
+    try {
+        const response = await fetch("/api/status", {cache: "no-store"});
+        if (!response.ok) return;
+        const result = await response.json();
+        if (result.connected && result.angles) {
+            lastModelAngles = {...lastModelAngles, ...result.angles};
+            renderArmModel(lastModelAngles);
+        }
+    } catch (_) {}
+}
+
+renderArmModel(lastModelAngles);
+refreshModel();
+setInterval(refreshModel, 500);
+window.addEventListener("resize", () => renderArmModel(lastModelAngles));
 </script>
 </body>
 </html>
