@@ -1,23 +1,45 @@
+
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 from telemetrix import telemetrix
-
 from roboarm import RoboArm
-from arm_ik import inverse_kinematics, forward_kinematics, IKError
-
+from arm_ik import (
+    inverse_kinematics,
+    forward_kinematics,
+    IKError,
+    HOME_BASE,
+    HOME_SHOULDER,
+    HOME_ELBOW,
+    HOME_WRIST,
+    HOME_GRIPPER,
+)
 
 PORT = "/dev/serial0"
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 8080
 
+START_ANGLES = {
+    "base": HOME_BASE,
+    "shoulder": HOME_SHOULDER,
+    "elbow": HOME_ELBOW,
+    "wrist": HOME_WRIST,
+    "gripper": HOME_GRIPPER,
+}
+
+JOINT_NAMES = ("base", "shoulder", "elbow", "wrist", "gripper")
+IK_JOINTS = ("base", "shoulder", "elbow", "wrist")
+
+MOVE_STEPS = 30
+STEP_DELAY = 0.03
+
 board = None
 arm = None
-
-# Prevent simultaneous web requests from issuing conflicting servo commands.
 arm_lock = threading.Lock()
+moving = False
 
 
 HTML = r"""
@@ -27,242 +49,158 @@ HTML = r"""
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ArmRobotics 2026</title>
-
 <style>
-    * { box-sizing: border-box; }
-
-    body {
-        margin: 0;
-        padding: 20px;
-        background: #11151c;
-        color: #e8edf5;
-        font-family: system-ui, sans-serif;
-    }
-
-    h1 { margin-top: 0; font-size: 1.6rem; }
-    h2 { font-size: 1.1rem; margin-top: 0; }
-
-    .layout {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-        gap: 16px;
-        max-width: 1100px;
-        margin: auto;
-    }
-
-    .panel {
-        background: #1b222d;
-        border: 1px solid #303b4b;
-        border-radius: 12px;
-        padding: 18px;
-        min-width: 0;
-    }
-
-    .control { margin: 18px 0; }
-
-    .control label {
-        display: flex;
-        justify-content: space-between;
-        gap: 12px;
-        margin-bottom: 8px;
-    }
-
-    input[type="range"] {
-        width: 100%;
-        accent-color: #62a5ff;
-    }
-
-    input[type="number"] {
-        width: 90px;
-        background: #11151c;
-        color: white;
-        border: 1px solid #46536a;
-        border-radius: 6px;
-        padding: 6px;
-    }
-
-    button {
-        padding: 10px 14px;
-        border: 0;
-        border-radius: 7px;
-        background: #3478d4;
-        color: white;
-        cursor: pointer;
-        font-weight: 600;
-    }
-
-    button.secondary { background: #394658; }
-
-    .buttons {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-        margin-top: 16px;
-    }
-
-    .status {
-        padding: 10px;
-        border-radius: 7px;
-        background: #11151c;
-        color: #a9c7ef;
-        overflow-wrap: anywhere;
-    }
-
-    .warning { color: #ffcf83; }
-    .muted { color: #aab5c5; font-size: 0.9rem; }
-
-    #preview {
-        width: 100%;
-        height: auto;
-        background: #11151c;
-        border-radius: 8px;
-    }
-
-    .checkbox {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        margin-top: 14px;
-    }
+* { box-sizing: border-box; }
+body {
+    margin: 0;
+    padding: 20px;
+    background: #11151c;
+    color: #e8edf5;
+    font-family: system-ui, sans-serif;
+}
+h1 { margin-top: 0; }
+h2 { font-size: 1.1rem; }
+.layout {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 16px;
+    max-width: 1100px;
+    margin: auto;
+}
+.panel {
+    background: #1b222d;
+    border: 1px solid #303b4b;
+    border-radius: 12px;
+    padding: 18px;
+}
+.control { margin: 18px 0; }
+.control label {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 8px;
+}
+input[type="range"] {
+    width: 100%;
+    accent-color: #62a5ff;
+}
+button {
+    padding: 10px 14px;
+    border: 0;
+    border-radius: 7px;
+    background: #3478d4;
+    color: white;
+    cursor: pointer;
+    font-weight: 600;
+}
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+.secondary { background: #394658; }
+.buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+.status {
+    padding: 10px;
+    border-radius: 7px;
+    background: #11151c;
+    color: #a9c7ef;
+    overflow-wrap: anywhere;
+}
+.muted { color: #aab5c5; font-size: 0.9rem; }
 </style>
 </head>
-
 <body>
 <div class="layout">
-    <header style="grid-column: 1 / -1">
-        <h1>ArmRobotics 2026</h1>
-        <p class="muted">
-            Live joint control and inverse kinematics.
-            Keep clear of the arm while testing.
-        </p>
-    </header>
+<header style="grid-column:1/-1">
+    <h1>ArmRobotics 2026</h1>
+    <p class="muted">
+        XYZ coordinates are millimeters relative to the home gripper position.
+        Move to target commands a straight Cartesian path.
+    </p>
+</header>
 
-    <section class="panel">
-        <h2>Cartesian control (mm)</h2>
+<section class="panel">
+    <h2>Cartesian control</h2>
 
-        <p class="muted">
-            X and Y are measured from the base axis.
-            Z is measured from the shoulder pivot, not the table.
-        </p>
+    <div class="control">
+        <label for="x"><span>X — forward/back</span><strong id="xValue">0</strong></label>
+        <input id="x" type="range" min="-100" max="100" value="0" step="1">
+    </div>
 
-        <div class="control">
-            <label for="x">
-                <span>X</span><strong id="xValue">120</strong>
-            </label>
-            <input id="x" type="range" min="-240" max="240"
-                   value="120" step="1">
-        </div>
+    <div class="control">
+        <label for="y"><span>Y — left/right</span><strong id="yValue">0</strong></label>
+        <input id="y" type="range" min="-100" max="100" value="0" step="1">
+    </div>
 
-        <div class="control">
-            <label for="y">
-                <span>Y</span><strong id="yValue">0</strong>
-            </label>
-            <input id="y" type="range" min="-240" max="240"
-                   value="0" step="1">
-        </div>
+    <div class="control">
+        <label for="z"><span>Z — up/down</span><strong id="zValue">0</strong></label>
+        <input id="z" type="range" min="-200" max="0" value="0" step="1">
+    </div>
 
-        <div class="control">
-            <label for="z">
-                <span>Z</span><strong id="zValue">120</strong>
-            </label>
-            <input id="z" type="range" min="-240" max="240"
-                   value="120" step="1">
-        </div>
+    <div class="control">
+        <label for="pitch"><span>Tool pitch</span><strong id="pitchValue">0</strong></label>
+        <input id="pitch" type="range" min="-90" max="90" value="0" step="1">
+    </div>
 
-        <div class="control">
-            <label for="pitch">
-                <span>Tool pitch (degrees)</span>
-                <strong id="pitchValue">0</strong>
-            </label>
-            <input id="pitch" type="range" min="-90" max="90"
-                   value="0" step="1">
-        </div>
+    <label>
+        <input id="elbowUp" type="checkbox">
+        Elbow-up solution
+    </label>
 
-        <label class="checkbox">
-            <input id="elbowUp" type="checkbox">
-            Elbow-up solution
-        </label>
+    <div class="buttons">
+        <button id="move">Move to target</button>
+        <button id="zero" class="secondary">Set XYZ to zero</button>
+    </div>
 
-        <div class="buttons">
-            <button id="moveCartesian">Move to target</button>
-        </div>
+    <p id="ikStatus" class="status">Ready.</p>
+</section>
 
-        <p class="muted">
-            Cartesian controls move the physical arm when you press
-            the button. Joint sliders below move the arm immediately.
-        </p>
-
-        <div id="ikStatus" class="status" role="status">
-            Ready. No movement commanded yet.
-        </div>
-    </section>
-
-    <section class="panel">
-        <h2>Joint control</h2>
-        <p class="muted">
-            Servo angles are commanded positions, not measured feedback.
-        </p>
-
-        <div id="jointControls"></div>
-
-        <div class="buttons">
-            <button id="refreshPreview" class="secondary">
-                Refresh preview
-            </button>
-        </div>
-
-        <p id="jointStatus" class="status" role="status">
-            Waiting for connection.
-        </p>
-    </section>
-
-    <section class="panel">
-        <h2>Arm preview</h2>
-        <svg id="preview" viewBox="0 0 360 320"
-             role="img" aria-label="Simplified arm pose preview">
-            <line x1="20" y1="270" x2="340" y2="270"
-                  stroke="#526176" stroke-width="1"/>
-            <circle cx="180" cy="270" r="8" fill="#62a5ff"/>
-            <text x="180" y="300" text-anchor="middle"
-                  fill="#aab5c5" font-size="12">
-                Simplified side-view model
-            </text>
-            <polyline id="armShape" points="180,270 180,190 180,110"
-                      fill="none" stroke="#62a5ff"
-                      stroke-width="8" stroke-linecap="round"
-                      stroke-linejoin="round"/>
-            <circle id="shoulderPoint" cx="180" cy="190" r="7"
-                    fill="#e8edf5"/>
-            <circle id="elbowPoint" cx="180" cy="110" r="7"
-                    fill="#e8edf5"/>
-            <circle id="toolPoint" cx="180" cy="110" r="5"
-                    fill="#ffcf83"/>
-        </svg>
-        <p class="muted">
-            Preview is a simplified side view based on the commanded
-            base, shoulder and elbow angles. It is not sensor feedback.
-        </p>
-    </section>
+<section class="panel">
+    <h2>Manual joint control</h2>
+    <p class="muted">
+        Manual controls move joints directly. They do not follow a Cartesian path.
+    </p>
+    <div id="jointControls"></div>
+    <p id="jointStatus" class="status">Waiting for connection.</p>
+</section>
 </div>
 
 <script>
-const jointNames = ["base", "shoulder", "elbow", "wrist", "gripper"];
-const jointAngles = {
-    base: 90,
-    shoulder: 90,
-    elbow: 90,
-    wrist: 90,
-    gripper: 90
+const names = ["base", "shoulder", "elbow", "wrist", "gripper"];
+
+const angles = {
+    base: 95,
+    shoulder: 180,
+    elbow: 180,
+    wrist: 20,
+    gripper: 180
 };
 
-const jointControls = document.getElementById("jointControls");
-let requestTimer = null;
-let requestSequence = 0;
+let debounce = null;
+let requestId = 0;
 
-function makeJointControls() {
-    for (const name of jointNames) {
-        const container = document.createElement("div");
-        container.className = "control";
+async function postJSON(path, data) {
+    const response = await fetch(path, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(data)
+    });
+
+    const result = await response.json();
+    if (!response.ok) {
+        throw new Error(result.error || "Request failed");
+    }
+    return result;
+}
+
+function setBusy(busy) {
+    document.getElementById("move").disabled = busy;
+    document.getElementById("zero").disabled = busy;
+}
+
+function buildJointControls() {
+    const parent = document.getElementById("jointControls");
+
+    for (const name of names) {
+        const wrapper = document.createElement("div");
+        wrapper.className = "control";
 
         const label = document.createElement("label");
         label.htmlFor = "joint-" + name;
@@ -271,8 +209,8 @@ function makeJointControls() {
         title.textContent = name.charAt(0).toUpperCase() + name.slice(1);
 
         const value = document.createElement("strong");
-        value.id = "jointValue-" + name;
-        value.textContent = jointAngles[name] + "°";
+        value.id = "value-" + name;
+        value.textContent = angles[name] + "°";
 
         label.append(title, value);
 
@@ -282,151 +220,154 @@ function makeJointControls() {
         slider.min = 0;
         slider.max = 180;
         slider.step = 1;
-        slider.value = jointAngles[name];
+        slider.value = angles[name];
 
         slider.addEventListener("input", () => {
-            const angle = Number(slider.value);
-            jointAngles[name] = angle;
-            value.textContent = angle + "°";
-            drawPreview();
+            angles[name] = Number(slider.value);
+            value.textContent = angles[name] + "°";
 
-            // Coalesce rapid slider events into the latest command.
-            clearTimeout(requestTimer);
-            requestTimer = setTimeout(
-                () => sendJoint(name, angle), 100
-            );
+            clearTimeout(debounce);
+            debounce = setTimeout(async () => {
+                const id = ++requestId;
+                try {
+                    await postJSON("/api/servo", {[name]: angles[name]});
+                    if (id === requestId) {
+                        document.getElementById("jointStatus").textContent =
+                            name + " commanded to " + angles[name] + "°.";
+                    }
+                } catch (error) {
+                    document.getElementById("jointStatus").textContent =
+                        "Error: " + error.message;
+                }
+            }, 100);
         });
 
-        container.append(label, slider);
-        jointControls.appendChild(container);
+        wrapper.append(label, slider);
+        parent.appendChild(wrapper);
     }
 }
 
-async function postJSON(path, payload) {
-    const response = await fetch(path, {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify(payload)
+for (const id of ["x", "y", "z", "pitch"]) {
+    document.getElementById(id).addEventListener("input", () => {
+        document.getElementById(id + "Value").textContent =
+            document.getElementById(id).value;
     });
-
-    const result = await response.json();
-
-    if (!response.ok) {
-        throw new Error(result.error || "Request failed");
-    }
-
-    return result;
 }
 
-async function sendJoint(name, angle) {
-    const sequence = ++requestSequence;
-
-    try {
-        await postJSON("/api/servo", {[name]: angle});
-
-        if (sequence === requestSequence) {
-            document.getElementById("jointStatus").textContent =
-                name + " commanded to " + angle + "°.";
-        }
-    } catch (error) {
-        if (sequence === requestSequence) {
-            document.getElementById("jointStatus").textContent =
-                "Error: " + error.message;
-        }
+document.getElementById("zero").addEventListener("click", () => {
+    for (const id of ["x", "y", "z"]) {
+        document.getElementById(id).value = 0;
+        document.getElementById(id + "Value").textContent = "0";
     }
-}
+});
 
-function readCartesianTarget() {
-    return {
+document.getElementById("move").addEventListener("click", async () => {
+    const status = document.getElementById("ikStatus");
+    const target = {
         x: Number(document.getElementById("x").value),
         y: Number(document.getElementById("y").value),
         z: Number(document.getElementById("z").value),
         tool_pitch: Number(document.getElementById("pitch").value),
         elbow_up: document.getElementById("elbowUp").checked
     };
-}
 
-for (const id of ["x", "y", "z", "pitch"]) {
-    const slider = document.getElementById(id);
-    slider.addEventListener("input", () => {
-        document.getElementById(id + "Value").textContent = slider.value;
-    });
-}
-
-document.getElementById("moveCartesian").addEventListener("click", async () => {
-    const status = document.getElementById("ikStatus");
-    status.textContent = "Calculating and commanding movement...";
+    setBusy(true);
+    status.textContent = "Planning and checking the path...";
 
     try {
-        const result = await postJSON("/api/ik", readCartesianTarget());
+        const result = await postJSON("/api/ik", target);
 
         for (const name of ["base", "shoulder", "elbow", "wrist"]) {
-            jointAngles[name] = result.angles[name];
-            document.getElementById("joint-" + name).value =
-                result.angles[name];
-            document.getElementById("jointValue-" + name).textContent =
-                result.angles[name] + "°";
+            angles[name] = result.angles[name];
+            document.getElementById("joint-" + name).value = angles[name];
+            document.getElementById("value-" + name).textContent =
+                angles[name] + "°";
         }
 
-        drawPreview();
-
         status.textContent =
-            "Commanded angles: " + JSON.stringify(result.angles) +
-            ". Modelled XYZ: " + JSON.stringify(result.modelled_xyz);
+            "Movement complete. Final angles: " +
+            JSON.stringify(result.angles);
     } catch (error) {
-        status.textContent = "IK error: " + error.message;
+        status.textContent = "Movement failed: " + error.message;
+    } finally {
+        setBusy(false);
     }
 });
 
-function drawPreview() {
-    // A simplified planar preview using the two 120 mm links.
-    const l1 = 120;
-    const l2 = 120;
-
-    const shoulder = Number(jointAngles.shoulder);
-    const elbow = Number(jointAngles.elbow);
-
-    // This drawing convention is only a rough visualization.
-    // It may need adjustment after physical servo calibration.
-    const q1 = (180 - shoulder) * Math.PI / 180;
-    const q2 = (elbow - 90) * Math.PI / 180;
-
-    const originX = 180;
-    const originY = 270;
-    const scale = 0.55;
-
-    const x1 = originX + l1 * Math.cos(q1) * scale;
-    const y1 = originY - l1 * Math.sin(q1) * scale;
-
-    const x2 = x1 + l2 * Math.cos(q1 + q2) * scale;
-    const y2 = y1 - l2 * Math.sin(q1 + q2) * scale;
-
-    document.getElementById("armShape").setAttribute(
-        "points",
-        `${originX},${originY} ${x1},${y1} ${x2},${y2}`
-    );
-
-    for (const [id, x, y] of [
-        ["shoulderPoint", x1, y1],
-        ["elbowPoint", x2, y2],
-        ["toolPoint", x2, y2]
-    ]) {
-        const point = document.getElementById(id);
-        point.setAttribute("cx", x);
-        point.setAttribute("cy", y);
-    }
-}
-
-document.getElementById("refreshPreview").addEventListener(
-    "click", drawPreview
-);
-
-makeJointControls();
-drawPreview();
+buildJointControls();
 </script>
 </body>
 </html>
 """
+
+
+def get_current_xyz():
+    return forward_kinematics(
+        arm.base.angle,
+        arm.shoulder.angle,
+        arm.elbow.angle,
+    )
+
+
+def get_current_angles():
+    return {
+        name: float(getattr(arm, name).angle)
+        for name in JOINT_NAMES
+    }
+
+
+def plan_cartesian_path(target):
+    start_x, start_y, start_z = get_current_xyz()
+
+    target_x = float(target["x"])
+    target_y = float(target["y"])
+    target_z = float(target["z"])
+    pitch = float(target.get("tool_pitch", 0))
+    elbow_up = bool(target.get("elbow_up", False))
+
+    path = []
+
+    for index in range(1, MOVE_STEPS + 1):
+        t = index / MOVE_STEPS
+
+        x = start_x + (target_x - start_x) * t
+        y = start_y + (target_y - start_y) * t
+        z = start_z + (target_z - start_z) * t
+
+        solution = inverse_kinematics(
+            x,
+            y,
+            z,
+            tool_pitch=pitch,
+            elbow_up=elbow_up,
+        )
+
+        path.append({
+            "base": solution.base,
+            "shoulder": solution.shoulder,
+            "elbow": solution.elbow,
+            "wrist": solution.wrist,
+        })
+
+    return path
+
+
+def execute_path(path):
+    global moving
+
+    with arm_lock:
+        moving = True
+
+        try:
+            for angles in path:
+                arm.write(**angles)
+
+                for name, angle in angles.items():
+                    getattr(arm, name).angle = int(angle)
+
+                time.sleep(STEP_DELAY)
+        finally:
+            moving = False
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -447,27 +388,32 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
             return
 
         if path == "/api/status":
-            with arm_lock:
-                angles = {
-                    name: getattr(arm, name).angle
-                    for name in jointNamesForServer()
-                }
-            self.send_json(200, {"connected": True, "angles": angles})
+            if arm is None:
+                self.send_json(503, {"connected": False})
+            else:
+                with arm_lock:
+                    self.send_json(200, {
+                        "connected": True,
+                        "angles": get_current_angles(),
+                        "xyz": get_current_xyz(),
+                    })
             return
 
         self.send_json(404, {"error": "Not found"})
 
     def do_POST(self):
+        global moving
+
         path = urlparse(self.path).path
 
         try:
             length = int(self.headers.get("Content-Length", "0"))
+
             if length <= 0 or length > 16384:
                 self.send_json(400, {"error": "Invalid request body size."})
                 return
@@ -478,16 +424,20 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "Expected a JSON object."})
                 return
 
+            if arm is None:
+                self.send_json(503, {"error": "Robot is not connected."})
+                return
+
             if path == "/api/servo":
-                allowed = {"base", "shoulder", "elbow", "wrist", "gripper"}
                 commands = {}
 
                 for name, angle in data.items():
-                    if name not in allowed:
+                    if name not in JOINT_NAMES:
                         self.send_json(400, {"error": f"Unknown joint: {name}"})
                         return
 
                     angle = float(angle)
+
                     if not 0 <= angle <= 180:
                         self.send_json(
                             400,
@@ -495,57 +445,44 @@ class Handler(BaseHTTPRequestHandler):
                         )
                         return
 
-                    commands[name] = angle
-
-                if not commands:
-                    self.send_json(400, {"error": "No joint commands supplied."})
-                    return
+                    commands[name] = int(angle)
 
                 with arm_lock:
+                    if moving:
+                        self.send_json(
+                            409,
+                            {"error": "Cartesian movement is in progress."}
+                        )
+                        return
+
                     arm.write(**commands)
 
                 self.send_json(200, {"ok": True, "angles": commands})
                 return
 
             if path == "/api/ik":
-                x = float(data["x"])
-                y = float(data["y"])
-                z = float(data["z"])
-                pitch = float(data.get("tool_pitch", 0))
-                elbow_up = bool(data.get("elbow_up", False))
-
-                solution = inverse_kinematics(
-                    x, y, z,
-                    tool_pitch=pitch,
-                    elbow_up=elbow_up
-                )
-
-                angles = {
-                    "base": solution.base,
-                    "shoulder": solution.shoulder,
-                    "elbow": solution.elbow,
-                    "wrist": solution.wrist,
-                }
-
-                # Validate all IK calculations before commanding any joint.
                 with arm_lock:
-                    arm.write(**angles)
+                    if moving:
+                        self.send_json(
+                            409,
+                            {"error": "Another movement is already in progress."}
+                        )
+                        return
 
-                model_x, model_y, model_z = forward_kinematics(
-                    solution.base,
-                    solution.shoulder,
-                    solution.elbow
-                )
+                    path_angles = plan_cartesian_path(data)
+
+                execute_path(path_angles)
+
+                final_angles = path_angles[-1] if path_angles else {}
 
                 self.send_json(200, {
                     "ok": True,
-                    "angles": angles,
-                    "target": {"x": x, "y": y, "z": z},
-                    "modelled_xyz": {
-                        "x": round(model_x, 1),
-                        "y": round(model_y, 1),
-                        "z": round(model_z, 1),
-                    }
+                    "angles": final_angles,
+                    "target": {
+                        "x": float(data["x"]),
+                        "y": float(data["y"]),
+                        "z": float(data["z"]),
+                    },
                 })
                 return
 
@@ -562,21 +499,25 @@ class Handler(BaseHTTPRequestHandler):
         print("[web]", format_string % args)
 
 
-def jointNamesForServer():
-    return ("base", "shoulder", "elbow", "wrist", "gripper")
-
-
 def main():
     global board, arm
 
-    print("Connecting to STM32 via Telemetrix...")
-    board = telemetrix.Telemetrix(com_port=PORT)
-
     try:
+        print("Connecting to controller...")
+        board = telemetrix.Telemetrix(com_port=PORT)
+
+        print("Initializing arm...")
         arm = RoboArm(board)
 
+        print("Sending startup positions:", START_ANGLES)
+        with arm_lock:
+            arm.write(**START_ANGLES)
+
+        print("Startup positions sent.")
+
         server = ThreadingHTTPServer((WEB_HOST, WEB_PORT), Handler)
-        print(f"Arm web interface: http://<raspberry-pi-ip>:{WEB_PORT}")
+
+        print(f"Arm web interface available on port {WEB_PORT}.")
         print("Stop with Ctrl+C.")
 
         try:
@@ -586,6 +527,10 @@ def main():
 
     except KeyboardInterrupt:
         print("\nStopping web server.")
+
+    except Exception as error:
+        print("Startup error:", repr(error))
+        raise
 
     finally:
         if board is not None:
