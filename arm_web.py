@@ -119,8 +119,8 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 <header style="grid-column:1/-1">
     <h1>ArmRobotics 2026</h1>
     <p class="muted">
-        Cartesian target coordinates use the IK model. The arm drawing uses the base as its origin.
-        Move to target commands a straight Cartesian path.
+        Cartesian XYZ is the closed-gripper tip in millimeters relative to the base model origin.
+        Move to target interpolates XYZ and tool pitch. Joint calibration is approximate.
     </p>
 </header>
 
@@ -129,17 +129,17 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 
     <div class="control">
         <label for="x"><span>X — forward/back</span><strong id="xValue">0</strong></label>
-        <input id="x" type="range" min="-100" max="100" value="0" step="1">
+        <input id="x" type="range" min="-415" max="415" value="0" step="1">
     </div>
 
     <div class="control">
         <label for="y"><span>Y — left/right</span><strong id="yValue">0</strong></label>
-        <input id="y" type="range" min="-100" max="100" value="0" step="1">
+        <input id="y" type="range" min="-415" max="415" value="0" step="1">
     </div>
 
     <div class="control">
         <label for="z"><span>Z — up/down</span><strong id="zValue">0</strong></label>
-        <input id="z" type="range" min="-200" max="0" value="0" step="1">
+        <input id="z" type="range" min="-415" max="415" value="0" step="1">
     </div>
 
     <div class="control">
@@ -154,7 +154,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 
     <div class="buttons">
         <button id="move">Move to target</button>
-        <button id="zero" class="secondary">Set XYZ to zero</button>
+        <button id="zero" class="secondary">Use current XYZ</button>
     </div>
 
     <p id="ikStatus" class="status">Ready.</p>
@@ -282,10 +282,18 @@ for (const id of ["x", "y", "z", "pitch"]) {
     });
 }
 
-document.getElementById("zero").addEventListener("click", () => {
-    for (const id of ["x", "y", "z"]) {
-        document.getElementById(id).value = 0;
-        document.getElementById(id + "Value").textContent = "0";
+document.getElementById("zero").addEventListener("click", async () => {
+    try {
+        const response = await fetch("/api/status", {cache: "no-store"});
+        const data = await response.json();
+        if (!data.xyz) throw new Error("No XYZ data");
+        for (const [i, id] of ["x", "y", "z"].entries()) {
+            document.getElementById(id).value = Math.round(data.xyz[i]);
+            document.getElementById(id + "Value").textContent =
+                document.getElementById(id).value;
+        }
+    } catch (error) {
+        document.getElementById("ikStatus").textContent = error.message;
     }
 });
 
@@ -335,12 +343,13 @@ const HOME_SHOULDER_DEG = 170;
 const HOME_ELBOW_BEND_DEG = -120;
 const WRIST_LENGTH_MM = 175;
 const HOME_WRIST_PITCH_DEG = 0;
+const WRIST_SCALE = 90 / 124;
 
 function armPoints(a) {
     const yaw = (a.base - 95) * Math.PI / 180;
     const shoulder = (HOME_SHOULDER_DEG + (a.shoulder - 180)) * Math.PI / 180;
     const elbow = shoulder + (HOME_ELBOW_BEND_DEG - (a.elbow - 180)) * Math.PI / 180;
-    const wrist = (HOME_WRIST_PITCH_DEG + (a.wrist - 20)) * Math.PI / 180;
+    const wrist = elbow + (HOME_WRIST_PITCH_DEG - (HOME_SHOULDER_DEG + HOME_ELBOW_BEND_DEG) + (a.wrist - 20) * WRIST_SCALE) * Math.PI / 180;
 
     const planar = [
         {r: 0, z: 0},
@@ -451,6 +460,7 @@ def get_current_xyz():
         arm.base.angle,
         arm.shoulder.angle,
         arm.elbow.angle,
+        arm.wrist.angle,
     )
 
 
@@ -468,6 +478,8 @@ def plan_cartesian_path(target):
     target_y = float(target["y"])
     target_z = float(target["z"])
     pitch = float(target.get("tool_pitch", 0))
+    current_q2 = 170.0 + (arm.shoulder.angle - 180.0) - 120.0 - (arm.elbow.angle - 180.0)
+    start_pitch = current_q2 - 50.0 + (arm.wrist.angle - 20.0) * (90.0 / 124.0)
     elbow_up = bool(target.get("elbow_up", False))
 
     path = []
@@ -483,7 +495,7 @@ def plan_cartesian_path(target):
             x,
             y,
             z,
-            tool_pitch=pitch,
+            tool_pitch=start_pitch + (pitch - start_pitch) * t,
             elbow_up=elbow_up,
         )
 
