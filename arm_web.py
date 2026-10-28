@@ -406,9 +406,9 @@ function renderArmModel(a) {
     drawProjection("viewYZ", points, "y", "z", "Y", "Z");
     document.getElementById("modelStatus").textContent =
         "Base " + a.base + "° · Shoulder " + a.shoulder +
-        "° · Elbow " + a.elbow + "° · Model endpoint: X " +
+        "° · Elbow " + a.elbow + "° · Endpoint relative to home grip: X " +
         points[2].x.toFixed(1) + " mm, Y " + points[2].y.toFixed(1) +
-        " mm, Z " + points[2].z.toFixed(1) + " mm from the shoulder pivot.";
+        " mm, Z " + points[2].z.toFixed(1) + " mm.";
 }
 
 async function refreshModel() {
