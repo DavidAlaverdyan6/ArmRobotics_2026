@@ -176,7 +176,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
         The photographed home pose is approximated. Link lengths are 120 mm each; wrist length and joint offsets are estimates. Not suitable for collision-safety checks.
     </p>
     <div class="views">
-        <div class="view"><h3>X–Y · Top view</h3><canvas id="viewXY"></canvas></div>
+        <div class="view"><h3>Y–X · Top view</h3><canvas id="viewXY"></canvas></div>
         <div class="view"><h3>X–Z · Side view</h3><canvas id="viewXZ"></canvas></div>
         <div class="view"><h3>Y–Z · Front view</h3><canvas id="viewYZ"></canvas></div>
     </div>
@@ -329,7 +329,7 @@ const LINK2_MM = 120;
 let lastModelAngles = {...angles};
 
 // Approximate geometry inferred from the photographed home pose.
-// X points toward the robot front, Y toward its right side, Z upward.
+// X points toward the gripper/front (down in top view), Y toward the right in front view, Z upward.
 // These offsets affect the drawing only, not motor commands or Cartesian IK.
 const HOME_SHOULDER_DEG = 170;
 const HOME_ELBOW_BEND_DEG = -120;
@@ -356,7 +356,7 @@ function armPoints(a) {
     });
     const home = planar[3];
     return planar.map(p => ({
-        x: p.r * Math.cos(yaw) - home.r,
+        x: home.r - p.r * Math.cos(yaw),
         y: p.r * Math.sin(yaw),
         z: p.z - home.z
     }));
@@ -415,7 +415,7 @@ function drawProjection(canvasId, points, horizontal, vertical, horizontalLabel,
 
 function renderArmModel(a) {
     const points = armPoints(a);
-    drawProjection("viewXY", points, "x", "y", "X", "Y");
+    drawProjection("viewXY", points, "y", "x", "Y", "X");
     drawProjection("viewXZ", points, "x", "z", "X", "Z");
     drawProjection("viewYZ", points, "y", "z", "Y", "Z");
     document.getElementById("modelStatus").textContent =
