@@ -334,13 +334,13 @@ let lastModelAngles = {...angles};
 const HOME_SHOULDER_DEG = 170;
 const HOME_ELBOW_BEND_DEG = -120;
 const WRIST_LENGTH_MM = 55;
-const HOME_WRIST_PITCH_DEG = 160;
+const HOME_WRIST_PITCH_DEG = 0;
 
 function armPoints(a) {
     const yaw = (a.base - 95) * Math.PI / 180;
-    const shoulder = (HOME_SHOULDER_DEG - (a.shoulder - 180)) * Math.PI / 180;
-    const elbow = shoulder + (HOME_ELBOW_BEND_DEG + (a.elbow - 180)) * Math.PI / 180;
-    const wrist = (HOME_WRIST_PITCH_DEG - (a.wrist - 20)) * Math.PI / 180;
+    const shoulder = (HOME_SHOULDER_DEG + (a.shoulder - 180)) * Math.PI / 180;
+    const elbow = shoulder + (HOME_ELBOW_BEND_DEG - (a.elbow - 180)) * Math.PI / 180;
+    const wrist = (HOME_WRIST_PITCH_DEG + (a.wrist - 20)) * Math.PI / 180;
 
     const planar = [
         {r: 0, z: 0},
@@ -355,7 +355,7 @@ function armPoints(a) {
         z: planar[2].z + WRIST_LENGTH_MM * Math.sin(wrist)
     });
     return planar.map(p => ({
-        x: -p.r * Math.cos(yaw),
+        x: p.r * Math.cos(yaw),
         y: p.r * Math.sin(yaw),
         z: p.z
     }));
