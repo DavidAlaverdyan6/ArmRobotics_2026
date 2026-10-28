@@ -173,7 +173,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
     <h2>Arm position — kinematic model</h2>
     <p class="muted">
         The diagrams update from the angles commanded by Arm Web. They show the model, not sensor feedback.
-        The photographed home pose is approximated. Link lengths are 120 mm each; wrist length and joint offsets are estimates. Not suitable for collision-safety checks.
+        The photographed home pose is approximated. Link lengths are 120 mm, 120 mm, and 175 mm; joint offsets are estimates. Not suitable for collision-safety checks.
     </p>
     <div class="views">
         <div class="view"><h3>Y–X · Top view</h3><canvas id="viewXY"></canvas></div>
@@ -333,7 +333,7 @@ let lastModelAngles = {...angles};
 // These offsets affect the drawing only, not motor commands or Cartesian IK.
 const HOME_SHOULDER_DEG = 170;
 const HOME_ELBOW_BEND_DEG = -120;
-const WRIST_LENGTH_MM = 55;
+const WRIST_LENGTH_MM = 175;
 const HOME_WRIST_PITCH_DEG = 0;
 
 function armPoints(a) {
