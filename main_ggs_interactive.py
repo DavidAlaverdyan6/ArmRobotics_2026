@@ -13,8 +13,8 @@ from sensors.vl53l0x_sensor import VL53L0XSensor
 
 # Previously tested differential2 line-following speeds.
 SERIAL_PORT = "/dev/serial0"
-# Let Telemetrix reboot the controller for three seconds (default is four).
-ARDUINO_WAIT_SECONDS = 3
+# Use the previously reliable four-second Telemetrix controller reboot wait.
+ARDUINO_WAIT_SECONDS = 4
 # The following startup pauses are only a buffer. The real ADC readiness
 # checks below must still succeed before motors can move.
 POST_CONNECT_WAIT_SECONDS = 0.5
