@@ -473,6 +473,37 @@ def main():
             print("No calibration found; run python calibrate.py.")
             return
 
+        # Telemetrix analog input callbacks arrive asynchronously.
+        # Do not confuse the eight initial zero placeholders with real ADC data.
+        # On this robot all eight channels normally report nonzero ADC values.
+        print("Waiting for first readings from all eight line sensors...")
+        ready_deadline = time.monotonic() + 6.0
+        ready_count = 0
+        last_report = 0.0
+        while time.monotonic() < ready_deadline:
+            startup_state = line_tracker.update(calibration)
+            raw = startup_state["raw"]
+            missing = [i + 1 for i, value in enumerate(raw) if value == 0]
+            now = time.monotonic()
+            if not missing:
+                ready_count += 1
+                if ready_count >= 3:
+                    break
+            else:
+                ready_count = 0
+            if now - last_report >= 1.0:
+                print(f"ADC startup: raw={raw}; missing S={missing}")
+                last_report = now
+            time.sleep(LOOP_DELAY)
+        if ready_count < 3:
+            print("ERROR: some analog channels have no data. Motors remain stopped.")
+            print(f"Latest RAW values: {startup_state['raw']}")
+            print(f"Latest normalized values: {startup_state['normalized']}")
+            print("Run python show_line_position.py to inspect the sensor board.")
+            return
+        print(f"All eight ADC channels ready: {startup_state['raw']}")
+        print(f"Initial line position: {startup_state['position']}")
+
         detector = JunctionDetector()
         print(
             "Differential2 ready: target 0.08, PWM 100. "
