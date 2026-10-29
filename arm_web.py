@@ -179,31 +179,44 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 <section class="panel">
     <h2>Tool orientation lock — both XYZ modes</h2>
-    <label style="display:block;margin-bottom:12px">
-        <input id="lockPitch" type="checkbox">
-        <strong>Maintain tool angle while moving in XYZ</strong>
-    </label>
+    <div class="control">
+        <label for="orientationMode"><span>How to control the gripper orientation</span></label>
+        <select id="orientationMode"
+                style="width:100%;background:#11151c;border:1px solid #53637a;color:#e8edf5;padding:10px;border-radius:7px">
+            <option value="auto">Free / automatic — previous behavior</option>
+            <option value="target">Fixed angle at destination — recommended for button</option>
+            <option value="hold">Fixed angle throughout the XYZ path — strict</option>
+        </select>
+    </div>
     <div class="control">
         <label for="lockedPitchAngle">
-            <span>Tool angle relative to horizontal</span><strong id="lockedPitchValue">+90°</strong>
+            <span>Gripper direction relative to horizontal</span><strong id="lockedPitchValue">0°</strong>
         </label>
-        <input id="lockedPitchAngle" type="number" min="-180" max="180" step="1" value="90"
+        <input id="lockedPitchAngle" type="number" min="-180" max="180" step="1" value="0"
                style="width:100%;background:#11151c;border:1px solid #53637a;color:#e8edf5;padding:10px;border-radius:7px">
     </div>
     <div class="buttons">
-        <button class="secondary" type="button" data-tool-pitch="0">Horizontal 0°</button>
-        <button class="secondary" type="button" data-tool-pitch="90">Vertical up +90°</button>
-        <button class="secondary" type="button" data-tool-pitch="-90">Vertical down −90°</button>
+        <button class="secondary" type="button" data-tool-pitch="0">Straight / horizontal 0°</button>
+        <button class="secondary" type="button" data-tool-pitch="90">Point up +90°</button>
+        <button class="secondary" type="button" data-tool-pitch="-90">Point down −90°</button>
     </div>
+    <div class="buttons" style="margin-top:12px">
+        <button id="pitchCheck" class="secondary" type="button">Check angles at Automatic XYZ</button>
+    </div>
+    <p id="pitchOptions" class="status">Check whether each orientation is possible at the same XYZ before moving.</p>
     <p class="muted">
-        0° = gripper horizontal; +90° = pointing up; −90° = pointing down.
-        This is the tool direction in space, NOT the angle written to the wrist servo.
-        When enabled, the arm first changes to the selected orientation at its current
-        XYZ, then maintains it along the entire XYZ path, adjusting the wrist automatically.
-        If the starting pose or the path is physically unreachable, movement is rejected.
-        Manual servo sliders are not orientation-locked.
+        0° = tip points straight forward; +90° = tip points vertically upward;
+        −90° = tip points vertically downward. These are absolute angles of the
+        gripper, NOT the servo's own Wrist angle.
+        <strong>Fixed at destination</strong> independently solves X, Y, Z and pitch,
+        then moves smoothly between joint poses. The tip can curve during travel.
+        <strong>Fixed throughout</strong> additionally requires a reachable fixed-pitch
+        Cartesian path and can reject targets that the destination-only mode accepts.
+        If no IK solution exists, the robot does not move. Geometry is approximate;
+        neither mode detects collisions or verifies physical position.
+        Manual joint sliders remain independent.
     </p>
-    <p id="lockStatus" class="status">Free orientation: previous XYZ behavior is preserved.</p>
+    <p id="lockStatus" class="status">Free / automatic: previous XYZ behavior.</p>
 </section>
 
 <section class="panel">
@@ -252,43 +265,71 @@ let debounce = null;
 let requestId = 0;
 
 function readOrientationSettings() {
-    const enabled = document.getElementById("lockPitch").checked;
+    const mode = document.getElementById("orientationMode").value;
     const field = document.getElementById("lockedPitchAngle");
     const pitch = Number(field.value);
-    if (enabled && (field.value.trim() === "" || !Number.isFinite(pitch) ||
-                    pitch < -180 || pitch > 180)) {
-        throw new Error("Enter a fixed tool angle between -180° and +180°.");
+    if (mode !== "auto" && (field.value.trim() === "" || !Number.isFinite(pitch) ||
+                            pitch < -180 || pitch > 180)) {
+        throw new Error("Enter a tool pitch between -180° and +180°.");
     }
-    return enabled ? {lock_pitch: true, tool_pitch: pitch} : {lock_pitch: false};
+    return mode === "auto"
+        ? {orientation_mode: "auto"}
+        : {orientation_mode: mode, tool_pitch: pitch};
 }
 
 function refreshOrientationDisplay() {
-    const locked = document.getElementById("lockPitch").checked;
+    const mode = document.getElementById("orientationMode").value;
     const field = document.getElementById("lockedPitchAngle");
     const angle = Number(field.value);
     document.getElementById("lockedPitchValue").textContent =
         (angle > 0 ? "+" : "") + field.value + "°";
-    document.getElementById("lockStatus").textContent = locked
-        ? "Orientation lock ON: " + angle + "° in world coordinates (subject to IK limits)."
-        : "Free orientation: previous XYZ behavior is preserved.";
+    document.getElementById("lockStatus").textContent =
+        mode === "auto" ? "Free / automatic: previous XYZ behavior."
+        : mode === "target" ? "Destination pitch " + angle + "°: tip may curve on the way."
+        : "Hold pitch " + angle + "° throughout the XYZ move (restricted reach).";
 }
 
-document.getElementById("lockPitch").addEventListener("change", () => {
+document.getElementById("orientationMode").addEventListener("change", () => {
     refreshOrientationDisplay();
     scheduleValidation();
 });
 document.getElementById("lockedPitchAngle").addEventListener("input", () => {
     refreshOrientationDisplay();
-    if (document.getElementById("lockPitch").checked) scheduleValidation();
+    if (document.getElementById("orientationMode").value !== "auto") scheduleValidation();
 });
 document.querySelectorAll("[data-tool-pitch]").forEach(button => {
     button.addEventListener("click", () => {
         document.getElementById("lockedPitchAngle").value = button.dataset.toolPitch;
+        // A preset selects the destination mode so it works on the next move.
+        // The stricter whole-path hold remains available from the dropdown.
+        document.getElementById("orientationMode").value = "target";
         refreshOrientationDisplay();
-        if (document.getElementById("lockPitch").checked) scheduleValidation();
+        scheduleValidation();
     });
 });
 refreshOrientationDisplay();
+
+document.getElementById("pitchCheck").addEventListener("click", async () => {
+    const status = document.getElementById("pitchOptions");
+    const inputs = ["autoX", "autoY", "autoZ"].map(id => document.getElementById(id));
+    if (inputs.some(el => el.value.trim() === "" || !Number.isFinite(Number(el.value)))) {
+        status.textContent = "Enter valid Automatic XYZ coordinates first.";
+        return;
+    }
+    status.textContent = "Checking each orientation with the IK solver...";
+    try {
+        const xyz = inputs.map(el => Number(el.value));
+        const result = await postJSON("/api/pitch/check", {
+            x: xyz[0], y: xyz[1], z: xyz[2]
+        });
+        const labels = {"0": "Horizontal 0°", "90": "Up +90°", "-90": "Down −90°"};
+        status.textContent = Object.entries(labels).map(([k, label]) =>
+            label + ": " + (result.reachable[k] ? "reachable in model" : "unreachable")
+        ).join(" | ");
+    } catch (error) {
+        status.textContent = "Cannot check pitches: " + error.message;
+    }
+});
 
 async function postJSON(path, data) {
     const response = await fetch(path, {
@@ -392,8 +433,15 @@ function restoreValidTarget() {
     for (const id of ["x", "y", "z"]) {
         document.getElementById(id).value = validTarget[id];
     }
+    if (validTarget.orientation_mode) {
+        document.getElementById("orientationMode").value = validTarget.orientation_mode;
+        if (validTarget.orientation_mode !== "auto") {
+            document.getElementById("lockedPitchAngle").value = validTarget.tool_pitch;
+        }
+    }
     document.getElementById("pitch").value = validTarget.tool_pitch;
     document.getElementById("elbowUp").checked = validTarget.elbow_up;
+    refreshOrientationDisplay();
     displayTarget();
 }
 
@@ -407,7 +455,7 @@ async function validateTarget() {
         await postJSON("/api/ik/check", target);
         if (serial !== validationSerial) return;
         validTarget = target;
-        document.getElementById("ikStatus").textContent = "Reachable target.";
+        document.getElementById("ikStatus").textContent = "Reachable target in model.";
     } catch (error) {
         if (serial !== validationSerial) return;
         restoreValidTarget();
@@ -695,6 +743,85 @@ def get_current_tool_pitch():
     return q2 - 50.0 + (angles["wrist"] - 20.0) * (90.0 / 124.0)
 
 
+def _orientation_mode(target, cartesian=False):
+    """Backwards compatible routing of existing and new XYZ commands."""
+    mode = target.get("orientation_mode")
+    if mode is None:
+        # Old clients may still send lock_pitch=True.
+        if target.get("lock_pitch", False):
+            return "hold"
+        return "legacy" if cartesian else "auto"
+
+    if mode not in ("auto", "target", "hold"):
+        raise IKError(f"Unknown orientation mode: {mode!r}")
+    return "legacy" if mode == "auto" and cartesian else mode
+
+
+def _can_solve_tool_pitch(x, y, z, pitch, elbow_up):
+    try:
+        inverse_kinematics(x, y, z, tool_pitch=pitch, elbow_up=elbow_up)
+        return True
+    except IKError:
+        return False
+
+
+def plan_target_pitch_path(target, branch_preference=None):
+    """Solve explicit XYZ + absolute final gripper angle.
+
+    This does NOT require a constant tool angle during travel. It guarantees
+    only that the target XYZ and pitch are solved together in the kinematic
+    model. The smooth servo-space transition can be curved and is not
+    collision-free. Calculate every servo pose before issuing commands.
+    """
+    x, y, z = (float(target[k]) for k in ("x", "y", "z"))
+    pitch = float(target["tool_pitch"])
+    if not all(math.isfinite(v) for v in (x, y, z, pitch)):
+        raise IKError("XYZ and tool pitch must be finite numbers.")
+    if pitch < -180 or pitch > 180:
+        raise IKError("Tool pitch must be between -180° and +180°.")
+
+    current = get_current_angles()
+    branches = [branch_preference] if branch_preference is not None else [False, True]
+    solutions = []
+    for elbow_up in branches:
+        try:
+            q = inverse_kinematics(
+                x, y, z, tool_pitch=pitch, elbow_up=elbow_up
+            )
+        except IKError:
+            continue
+        final = {name: float(getattr(q, name)) for name in IK_JOINTS}
+        cost = sum(
+            (final[name] - current[name]) ** 2
+            for name in IK_JOINTS
+        )
+        solutions.append((cost, final))
+
+    if not solutions:
+        raise IKError(
+            f"XYZ ({x:g}, {y:g}, {z:g}) mm cannot be reached with "
+            f"gripper pitch {pitch:+g}° in this model. "
+            "Move the robot or choose another XYZ/angle."
+        )
+
+    _, final = min(solutions, key=lambda entry: entry[0])
+    steps = max(1, math.ceil(
+        max(abs(final[name] - current[name]) for name in IK_JOINTS)
+        / AUTO_MAX_STEP_DEG
+    ))
+    path = []
+    for index in range(1, steps + 1):
+        t = index / steps
+        smooth = t*t*(3 - 2*t)
+        path.append({
+            name: round(
+                current[name] + (final[name] - current[name]) * smooth, 2
+            )
+            for name in IK_JOINTS
+        })
+    return path
+
+
 def plan_locked_pitch_path(target):
     """Plan a fixed-world-angle XYZ move, with all IK prechecked before motion.
 
@@ -795,8 +922,12 @@ def plan_locked_pitch_path(target):
 
 
 def plan_cartesian_path(target):
-    if target.get("lock_pitch", False):
+    mode = _orientation_mode(target, cartesian=True)
+    if mode == "hold":
         return plan_locked_pitch_path(target)
+    if mode == "target":
+        preference = bool(target["elbow_up"]) if "elbow_up" in target else None
+        return plan_target_pitch_path(target, branch_preference=preference)
 
     start_x, start_y, start_z = get_current_xyz()
 
@@ -841,8 +972,12 @@ def plan_auto_path(target):
     The free planner deliberately does not guarantee straight-line travel.
     Both modes require mechanical clearance checks by the operator.
     """
-    if target.get("lock_pitch", False):
+    mode = _orientation_mode(target)
+    if mode == "hold":
         path = plan_locked_pitch_path(target)
+        return path, float(target["tool_pitch"])
+    if mode == "target":
+        path = plan_target_pitch_path(target)
         return path, float(target["tool_pitch"])
 
     x, y, z = (float(target[k]) for k in ("x", "y", "z"))
@@ -1029,6 +1164,21 @@ class Handler(BaseHTTPRequestHandler):
                     "angles": path_angles[-1],
                     "pitch": chosen_pitch,
                 })
+                return
+
+            if path == "/api/pitch/check":
+                # Endpoint feasibility is independent of how the tip gets
+                # there. Check all three angles without moving a servo.
+                x, y, z = (float(data[k]) for k in ("x", "y", "z"))
+                if not all(math.isfinite(v) for v in (x, y, z)):
+                    raise IKError("XYZ must contain finite numbers.")
+                reachable = {}
+                for pitch in (-90, 0, 90):
+                    reachable[str(pitch)] = any(
+                        _can_solve_tool_pitch(x, y, z, pitch, elbow_up)
+                        for elbow_up in (False, True)
+                    )
+                self.send_json(200, {"reachable": reachable, "xyz": [x, y, z]})
                 return
 
             if path == "/api/ik/check":
