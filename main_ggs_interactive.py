@@ -57,7 +57,7 @@ RETURN_MAX_ANGLE = 30.0
 RETURN_RECOVERY_ANGLE = 12.0
 RETURN_RECOVERY_SAFE = 6.0
 RETURN_RECOVERY_TIMEOUT = 1.5
-RETURN_FORWARD_TIME = 0.5
+RETURN_FORWARD_TIME = 0.3
 RETURN_FORWARD_SPEED = 110
 
 
@@ -341,7 +341,7 @@ def button_task(calibration, vision, sensor, bus, offset):
         return False
     if not button_return(calibration, vision, bus, offset, left_sign):
         return False
-    print('B: forward adjustment for 0.5 seconds')
+    print('B: forward adjustment for 0.3 seconds')
     if not follow_for(calibration, vision, RETURN_FORWARD_TIME, RETURN_FORWARD_SPEED):
         return False
     print('B: right turn')
