@@ -463,10 +463,16 @@ def main():
         # SAME connection and initialization sequence as differential2.py.
         board = telemetrix.Telemetrix(com_port=SERIAL_PORT)
 
+        # Match the proven timing in show_line_position.py before ADC setup.
+        time.sleep(2.0)
+
         motors.initialize(board)
         motors_on = True
         line_tracker.initialize(board)
         tracker_on = True
+
+        # Let all asynchronous analog input subscriptions begin reporting.
+        time.sleep(1.0)
 
         calibration = line_tracker.load_calibration()
         if calibration is None:
