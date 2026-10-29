@@ -222,33 +222,7 @@ def pivot(bus, offset, direction, angle_target=TURN_ANGLE):
         time.sleep(0.2)
 
 
-class PD:
-    def __init__(self, kp, kd, sign, max_delta):
-        self.kp, self.kd = kp, kd
-        self.sign, self.max_delta = sign, max_delta
-        self.last_error = self.last_time = None
-
-    def correction(self, pos):
-        error = pos - CENTER
-        now = time.monotonic()
-        derivative = 0
-        if self.last_time is not None:
-            dt = now-self.last_time
-            if dt >= 0.01:
-                derivative = clamp((error-self.last_error)/dt, -20, 20)
-        self.last_time, self.last_error = now, error
-        return clamp(self.sign*(self.kp*error+self.kd*derivative),
-                     -self.max_delta, self.max_delta)
-
-
-def differential_forward(pos, speed):
-    c = pd.correction(pos)
-    # If line is towards S7, left wheel should be faster.
-    send(speed+c, speed-c)
-
-
 def follow_for(calibration, vision, seconds, speed):
-    pd = PD(FORWARD_KP, FORWARD_KD, FORWARD_SIGN, FORWARD_MAX_DELTA)
     start = time.monotonic()
     try:
         while time.monotonic()-start < seconds:
@@ -257,7 +231,7 @@ def follow_for(calibration, vision, seconds, speed):
             if pos is None:
                 print('Line lost during timed forward movement')
                 return False
-            forward_pd(pos, speed, pd)
+            differential_forward(pos, speed)
             time.sleep(LOOP_DELAY)
         return True
     finally:
@@ -277,7 +251,6 @@ def after_turn_line(calibration, vision):
 
 
 def button_approach(calibration, vision, sensor):
-    pd = PD(FORWARD_KP, FORWARD_KD, FORWARD_SIGN, FORWARD_MAX_DELTA)
     start = time.monotonic()
     clear = 0
     left_junction = False
@@ -285,7 +258,7 @@ def button_approach(calibration, vision, sensor):
     try:
         while time.monotonic()-start < BUTTON_MAX_TIME:
             vals,bits = vision.sample(calibration)
-            pos = position(vals)
+            pos = differential_position(vals)
             left,right = edges(bits)
             clear = clear+1 if not (left or right) else 0
             if clear >= JUNCTION_CLEAR:
@@ -322,7 +295,7 @@ def button_return(calibration, vision, bus, offset, left_sign):
     try:
         while time.monotonic()-start < RETURN_MAX_TIME:
             vals,bits = vision.sample(calibration)
-            pos = position(vals)
+            pos = differential_position(vals)
             l,r = edges(bits)
             now = time.monotonic()
             angle = heading.read()
@@ -429,8 +402,22 @@ def main():
         print(f'VL53L0X initially {sensor.read_distance_mm()/10:.1f} cm')
         gyro_offset = gyro_calibrate(bus)
         time.sleep(0.5)
+        print('Checking sensor readiness before motors start...')
+        ready_frames = 0
+        ready_deadline = time.monotonic() + 4.0
+        while time.monotonic() < ready_deadline:
+            v, _ = vision.sample(calibration)
+            if differential_position(v) is not None:
+                ready_frames += 1
+                if ready_frames >= 5:
+                    break
+            else:
+                ready_frames = 0
+            time.sleep(LOOP_DELAY)
+        if ready_frames < 5:
+            print('START CANCELLED: no stable line. Motors remain stopped.')
+            return
         print('Robot ready. Automatically follow line until a junction; then WAIT for terminal input.')
-        pd = PD(FORWARD_KP, FORWARD_KD, FORWARD_SIGN, FORWARD_MAX_DELTA)
         latched = False
         clear_count = junction_count = 0
         candidate_since = None
@@ -438,7 +425,7 @@ def main():
         last_line = time.monotonic()
         while True:
             vals,bits = vision.sample(calibration)
-            pos = position(vals)
+            pos = differential_position(vals)
             left,right = edges(bits)
             now = time.monotonic()
             clear_count = clear_count+1 if not(left or right) else 0
@@ -475,10 +462,9 @@ def main():
                     # Ensure old crossing is cleared; remain latched until then.
                     ignore_until = time.monotonic()+JUNCTION_COOLDOWN
                     candidate_since = None
-                    pd = PD(FORWARD_KP, FORWARD_KD, FORWARD_SIGN, FORWARD_MAX_DELTA)
                     last_line = time.monotonic()
                     continue
-            if pos is None or not sees_center(vals):
+            if pos is None:
                 stop()
                 if now-last_line >= LINE_LOST_TIMEOUT:
                     print('\nMain line lost. Robot stopped.')
