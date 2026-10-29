@@ -11,14 +11,11 @@ import motors
 from sensors.vl53l0x_sensor import VL53L0XSensor
 
 
-# Maximum-PWM line-following TEST. Set BASE_SPEED=100, MAX_SPEED=170
-# to revert to the previously tested and reliable travel speed.
+# Previously tested differential2 line-following speeds.
 SERIAL_PORT = "/dev/serial0"
-BASE_SPEED = 255
-MAX_SPEED = 255
+BASE_SPEED = 100
+MAX_SPEED = 170
 MIN_SPEED = -80
-# Keep short maneuvers, return-to-line and the 10 cm button approach
-# at their proven slower speeds to avoid overshooting.
 MANEUVER_SPEED = 100
 MANEUVER_MAX_SPEED = 170
 KP = 30.0
@@ -51,7 +48,7 @@ BUTTON_DISTANCE_CM = 10.0
 # Button tip target (mm, arm_web coordinate system). Arm moves in two stages.
 BUTTON_X_MM = 250.0
 BUTTON_Y_MM = 0.0
-BUTTON_Z_MM = -20.0
+BUTTON_Z_MM = -40.0
 
 # Parking: 9 s red blink, then 2 s solid green; total 11 s before R.
 PARK_SECONDS = 11.0
@@ -74,6 +71,20 @@ RETURN_RECOVERY_TIMEOUT = 1.5
 
 RETURN_FORWARD_TIME = 0.3
 BUTTON_FINAL_RIGHT_ANGLE = 90.0
+
+# Automatic route: one entry for each detected junction, in order.
+# L=left, R=right, S=straight, B=press button, P=parking, Q=stop.
+# Example: ROUTE = ["L", "S", "B", "R", "P", "Q"]
+# The commented entries below are placeholders: edit them before launching.
+ROUTE = [
+    # "L",
+    # "S",
+    # "B",
+    # "R",
+    # "P",
+    # "Q",
+]
+ALLOWED_ROUTE_COMMANDS = {"L", "R", "S", "B", "P", "Q"}
 
 
 def clamp(value, low, high):
@@ -541,15 +552,28 @@ def parking_task():
         stop()
 
 
-def ask_command(count, left, right):
-    stop()
-    print(f"\nJUNCTION #{count}: S1={int(left)}, S8={int(right)}")
-    print("STOPPED. L=left, R=right, S=straight, B=button, P=parking, Q=quit")
-    while True:
-        cmd = input("Command [L/R/S/B/P/Q]: ").strip().upper()
-        if cmd in ("L", "R", "S", "B", "P", "Q"):
-            return cmd
-        print("Enter L, R, S, B, P or Q.")
+def load_route():
+    """Read the user-edited ROUTE list before starting the robot."""
+    if not ROUTE:
+        raise ValueError(
+            "ROUTE is empty. Add your junction commands to the ROUTE list "
+            "in main_ggs_interactive.py before starting."
+        )
+
+    route = []
+    for index, command in enumerate(ROUTE, 1):
+        if not isinstance(command, str):
+            raise ValueError(f"ROUTE entry {index} is not a string.")
+        cmd = command.strip().upper()
+        if cmd not in ALLOWED_ROUTE_COMMANDS:
+            raise ValueError(
+                f"Invalid ROUTE entry #{index}: {command!r}. "
+                "Allowed: L, R, S, B, P, Q."
+            )
+        if cmd == "Q" and index != len(ROUTE):
+            raise ValueError("Q must be the last ROUTE entry.")
+        route.append(cmd)
+    return route
 
 
 def main():
@@ -557,6 +581,8 @@ def main():
     motors_on = tracker_on = False
 
     try:
+        route = load_route()
+        print(f"Automatic ROUTE loaded: {route}")
         # SAME connection and initialization sequence as differential2.py.
         board = telemetrix.Telemetrix(com_port=SERIAL_PORT)
 
@@ -610,10 +636,11 @@ def main():
         detector = JunctionDetector()
         print(
             f"Differential2 ready: target {TARGET_POSITION}, "
-            f"MAXIMUM PWM {BASE_SPEED} (test mode). "
-            "Follow line immediately; ask commands at junctions."
+            f"base PWM {BASE_SPEED}, max PWM {MAX_SPEED}. "
+            "Automatic route active."
         )
 
+        route_index = 0
         junction_count = 0
         candidate_count = 0
         clear_count = 0
@@ -650,8 +677,17 @@ def main():
                 candidate_count = 0
                 junction_count += 1
 
-                cmd = ask_command(junction_count, left, right)
+                if route_index >= len(route):
+                    print("\nROUTE finished. Robot stopped.")
+                    break
+                cmd = route[route_index]
+                route_index += 1
+                print(
+                    f"\nJUNCTION #{junction_count}: S1={int(left)} "
+                    f"S8={int(right)}; ROUTE {route_index}/{len(route)} -> {cmd}"
+                )
                 if cmd == "Q":
+                    print("ROUTE: stop command.")
                     break
 
                 if cmd in ("L", "R", "B", "P"):
@@ -682,6 +718,10 @@ def main():
 
                 if not ok:
                     print("\nManeuver failed. Robot stopped.")
+                    break
+                if route_index >= len(route):
+                    stop()
+                    print("\nAll ROUTE commands completed. Robot stopped.")
                     break
 
                 ignore_until = time.monotonic() + JUNCTION_COOLDOWN
