@@ -43,7 +43,8 @@ TURN_PWM_FAST = 255
 TURN_PWM_SLOW = 90
 
 BUTTON_DISTANCE_CM = 10.0
-BUTTON_WAIT = 1.0
+BUTTON_WAIT = 1.0  # fallback until measured arm XYZ is configured
+PARK_SECONDS = None  # until duration is confirmed, ask at each P command
 BUTTON_MAX_TIME = 12.0
 BUTTON_CONFIRM = 3
 BUTTON_CLEAR_TIMEOUT = 3.0
@@ -316,8 +317,7 @@ def button_approach(calibration, detector, sensor):
 
             if close_count >= BUTTON_CONFIRM:
                 stop()
-                print(f"\nB: button at {distance_cm:.1f} cm, pause 1 second.")
-                time.sleep(BUTTON_WAIT)
+                print(f"\nB: button at {distance_cm:.1f} cm. Stopped for arm task.")
                 return True
 
             if state["position"] is None:
@@ -417,7 +417,7 @@ def button_return(calibration, detector, bus, offset, left_sign):
         stop()
 
 
-def button_task(calibration, detector, sensor, bus, offset):
+def button_task(calibration, detector, sensor, bus, offset, board):
     print("\nB: turn LEFT.")
     ok, left_sign = pivot(bus, offset, "L")
     if not ok or left_sign is None:
@@ -428,6 +428,10 @@ def button_task(calibration, detector, sensor, bus, offset):
         return False
 
     if not button_approach(calibration, detector, sensor):
+        return False
+
+    # The drive motors stay stopped until the arm maneuver finishes.
+    if not button_arm_action(board):
         return False
 
     if not button_return(calibration, detector, bus, offset, left_sign):
@@ -444,15 +448,81 @@ def button_task(calibration, detector, sensor, bus, offset):
     return ok and reacquire_line(calibration)
 
 
+def button_arm_action(board):
+    """Use existing arm_web IK, or preserve the safe test pause until XYZ is known."""
+    stop()
+    from button_arm import BUTTON_TARGET_XYZ_MM, press_button
+
+    if BUTTON_TARGET_XYZ_MM is None:
+        print("\nB: arm button XYZ is not configured yet.")
+        print("B: keeping the proven 1-second test pause for now.")
+        time.sleep(BUTTON_WAIT)
+        return True
+
+    try:
+        return press_button(board)
+    except Exception as exc:
+        print(f"\nB: arm movement failed: {exc}")
+        print("B: stopping rather than reversing with the arm extended.")
+        return False
+
+
+def parking_task():
+    """Stop, illuminate RGB red, wait for selected seconds, then resume."""
+    stop()
+
+    seconds = PARK_SECONDS
+    if seconds is None:
+        while True:
+            answer = input(
+                "\nPARKING: enter duration in seconds (e.g. 5 or 10), "
+                "or Q to stop: "
+            ).strip().upper()
+            if answer == "Q":
+                print("PARKING cancelled.")
+                return False
+            try:
+                seconds = float(answer)
+            except ValueError:
+                print("Enter a number of seconds.")
+                continue
+            if 0 < seconds <= 120:
+                break
+            print("Duration must be between 0 and 120 seconds.")
+
+    rgb = None
+    try:
+        import led
+        import robot_pin_config as pins
+
+        rgb = led.RGBLED(pins.LED_RED, pins.LED_GREEN, pins.LED_BLUE)
+        rgb.red()
+        print(f"\nPARKING: motors OFF, RGB RED, duration {seconds:g} seconds.")
+        time.sleep(seconds)
+        print("\nPARKING: completed; RGB OFF.")
+        return True
+    except Exception as exc:
+        print(f"\nPARKING: RGB or timer failed: {exc}")
+        return False
+    finally:
+        if rgb is not None:
+            try:
+                rgb.off()
+                rgb.close()
+            except Exception:
+                pass
+        stop()
+
+
 def ask_command(count, left, right):
     stop()
     print(f"\nJUNCTION #{count}: S1={int(left)}, S8={int(right)}")
-    print("STOPPED. L=left, R=right, S=straight, B=button, Q=quit")
+    print("STOPPED. L=left, R=right, S=straight, B=button, P=parking, Q=quit")
     while True:
-        cmd = input("Command [L/R/S/B/Q]: ").strip().upper()
-        if cmd in ("L", "R", "S", "B", "Q"):
+        cmd = input("Command [L/R/S/B/P/Q]: ").strip().upper()
+        if cmd in ("L", "R", "S", "B", "P", "Q"):
             return cmd
-        print("Enter L, R, S, B or Q.")
+        print("Enter L, R, S, B, P or Q.")
 
 
 def main():
@@ -556,7 +626,9 @@ def main():
                 if cmd == "Q":
                     break
 
-                if cmd in ("L", "R", "B"):
+                if cmd == "P":
+                    ok = parking_task()
+                elif cmd in ("L", "R", "B"):
                     # Gyro and distance sensor are NOT initialized at startup.
                     # They cannot interfere with initial line following.
                     if bus is None:
@@ -569,7 +641,7 @@ def main():
                             sensor = VL53L0XSensor()
                             sensor.initialize()
                         ok = button_task(
-                            calibration, detector, sensor, bus, offset
+                            calibration, detector, sensor, bus, offset, board
                         )
                     else:
                         ok, _ = pivot(bus, offset, cmd)
