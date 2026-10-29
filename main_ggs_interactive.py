@@ -1,34 +1,37 @@
 #!/usr/bin/env python3
-"""Interactive line follower for ArmRobotics_2026 (Raspberry Pi + Telemetrix)."""
+"""ArmRobotics: differential2 line following + junction commands + button task."""
+
 import time
+
 import smbus
 from telemetrix import telemetrix
+
 import line_tracker
 import motors
 from sensors.vl53l0x_sensor import VL53L0XSensor
 
-SERIAL_PORT = '/dev/serial0'
+
+# The tested differential2.py parameters. Change speed only after testing.
+SERIAL_PORT = "/dev/serial0"
+BASE_SPEED = 100
+MAX_SPEED = 170
+MIN_SPEED = -80
+KP = 30.0
+TARGET_POSITION = 0.08
 LOOP_DELAY = 0.04
-DIFF_KP = 30.0
-DIFF_TARGET = 0.08
-DIFF_BASE = 100
-DIFF_MIN = -80
-DIFF_MAX = 170
-REACQUIRE_TIME = 1.2
-REACQUIRE_SPEED = 75
+
+# Junction recognition is separate from line tracking.
 BLACK_ON = 0.85
 BLACK_OFF = 0.65
-LINE_MIN = 0.20
-APPROACH_SPEED = 120
-SLOW_SPEED = 95
-
-CANDIDATE_TIMEOUT = 0.35
+JUNCTION_CENTER_MIN = 0.55
 JUNCTION_CONFIRM = 2
 JUNCTION_CLEAR = 4
 JUNCTION_COOLDOWN = 0.55
-LINE_LOST_TIMEOUT = 0.35
-STARTUP_DIFF_ONLY_SECONDS = 2.0  # test on a clear straight segment
-BUILD_ID = 'diff2-exact-start-v1'
+
+# After any gyro turn, differential2 centers the robot again.
+REACQUIRE_TIMEOUT = 2.0
+REACQUIRE_TOLERANCE = 0.65
+REACQUIRE_CONFIRM = 4
 
 I2C_BUS = 1
 MPU_ADDR = 0x68
@@ -44,107 +47,111 @@ BUTTON_WAIT = 1.0
 BUTTON_MAX_TIME = 12.0
 BUTTON_CONFIRM = 3
 BUTTON_CLEAR_TIMEOUT = 3.0
-RETURN_SPEED = 155
+
+RETURN_SPEED = 150
 RETURN_SLOW_SPEED = 95
-RETURN_LINE_KP = 30.0
 RETURN_GYRO_KP = 2.0
 RETURN_MAX_DELTA = 85
-RETURN_SIGN = 1
-RETURN_GYRO_SIGN = 1
 RETURN_MAX_TIME = 15.0
 RETURN_LINE_LOST = 0.4
 RETURN_MAX_ANGLE = 30.0
 RETURN_RECOVERY_ANGLE = 12.0
 RETURN_RECOVERY_SAFE = 6.0
 RETURN_RECOVERY_TIMEOUT = 1.5
+
 RETURN_FORWARD_TIME = 0.3
-RETURN_FORWARD_SPEED = 110
+BUTTON_FINAL_RIGHT_ANGLE = 90.0
 
 
-def clamp(n, lo, hi):
-    return max(lo, min(hi, n))
-
-
-def send(left, right):
-    motors.set_speeds(int(clamp(round(left), -255, 255)),
-                      int(clamp(round(right), -255, 255)))
+def clamp(value, low, high):
+    return max(low, min(high, value))
 
 
 def stop():
     motors.motor_stop()
 
 
-class Vision:
-    def __init__(self):
-        self.dark = [False] * 8
-        self.position = None
-
-    def sample(self, calibration):
-        state = line_tracker.update(calibration)
-        vals = state['normalized']
-        self.position = differential_position(state)
-        if len(vals) != 8:
-            raise ValueError('Expected 8 sensor values')
-        for i, v in enumerate(vals):
-            if self.dark[i]:
-                self.dark[i] = v > BLACK_OFF
-            else:
-                self.dark[i] = v >= BLACK_ON
-        return vals, tuple(self.dark)
-
-
-def differential_position(state):
-    """Reuse exact eight-sensor position from line_tracker.update(), as differential2.py does."""
-    return state['position']
-
-
-def differential_forward(pos, speed=DIFF_BASE):
-    # The same proportional controller and limits as differential2.py.
-    error = pos - DIFF_TARGET
-    correction = DIFF_KP * error
-    left = clamp(speed + correction, DIFF_MIN, DIFF_MAX)
-    right = clamp(speed - correction, DIFF_MIN, DIFF_MAX)
-    send(left, right)
-    return round(left), round(right)
-
-
-def reacquire_line(calibration, vision):
-    # Active differential centering immediately after a turn.
-    # It may recover even when only an outermost sensor sees black.
-    deadline = time.monotonic() + REACQUIRE_TIME
-    stable = 0
-    try:
-        while time.monotonic() < deadline:
-            vals, _ = vision.sample(calibration)
-            pos = vision.position
-            if pos is None:
-                stop()
-                stable = 0
-            else:
-                differential_forward(pos, REACQUIRE_SPEED)
-                stable = stable+1 if abs(pos-DIFF_TARGET) < 0.65 else 0
-                if stable >= 4:
-                    return True
-            time.sleep(LOOP_DELAY)
-        print('Differential: could not center on line after turn')
-        return False
-    finally:
+def differential_drive(state, speed=BASE_SPEED):
+    """Exact differential2.py forward algorithm, using all eight sensors."""
+    if state is None or state["position"] is None:
         stop()
+        return False
+
+    position = state["position"]
+    error = position - TARGET_POSITION
+    correction = KP * error
+
+    left_speed = clamp(speed + correction, MIN_SPEED, MAX_SPEED)
+    right_speed = clamp(speed - correction, MIN_SPEED, MAX_SPEED)
+
+    motors.set_speeds(round(left_speed), round(right_speed))
+    return True
 
 
-def edges(bits):
-    return bits[0], bits[7]
+def differential_reverse(state, speed, heading_correction=0.0):
+    """Same calibrated line position and P correction, adapted for reverse."""
+    if state is None or state["position"] is None:
+        stop()
+        return False
+
+    position = state["position"]
+    error = position - TARGET_POSITION
+    line_correction = KP * error
+    correction = clamp(
+        line_correction + heading_correction,
+        -RETURN_MAX_DELTA,
+        RETURN_MAX_DELTA,
+    )
+
+    # Keep both wheels in reverse; a large correction only changes their ratio.
+    left_speed = clamp(-speed + correction, -255, -15)
+    right_speed = clamp(-speed - correction, -255, -15)
+    motors.set_speeds(round(left_speed), round(right_speed))
+    return True
+
+
+class JunctionDetector:
+    """Only branch sensing. It never calculates line position or steers motors."""
+
+    def __init__(self):
+        self.left_black = False
+        self.right_black = False
+
+    @staticmethod
+    def hysteresis(previous, value):
+        return value > BLACK_OFF if previous else value >= BLACK_ON
+
+    def read(self, state):
+        values = state["normalized"]
+        if len(values) != 8:
+            raise ValueError("Expected eight line sensor values")
+
+        self.left_black = self.hysteresis(self.left_black, values[0])
+        self.right_black = self.hysteresis(self.right_black, values[7])
+
+        # An outer sensor alone means the robot is off-center, NOT a junction.
+        center_present = any(
+            values[index] >= JUNCTION_CENTER_MIN
+            for index in (2, 3, 4, 5)
+        )
+        candidate = (
+            state["position"] is not None
+            and center_present
+            and (self.left_black or self.right_black)
+        )
+
+        return self.left_black, self.right_black, candidate
 
 
 def gyro_raw(bus):
     hi = bus.read_byte_data(MPU_ADDR, GYRO_Z_REG)
-    lo = bus.read_byte_data(MPU_ADDR, GYRO_Z_REG+1)
-    val = (hi << 8) | lo
-    return val-65536 if val >= 32768 else val
+    lo = bus.read_byte_data(MPU_ADDR, GYRO_Z_REG + 1)
+    value = (hi << 8) | lo
+    return value - 65536 if value >= 32768 else value
 
 
 def gyro_rate(bus, offset):
-    return (gyro_raw(bus)-offset)/GYRO_SCALE
+    return (gyro_raw(bus) - offset) / GYRO_SCALE
 
 
 def gyro_setup(bus):
@@ -154,12 +161,13 @@ def gyro_setup(bus):
 
 
 def gyro_calibrate(bus):
-    print('Gyro calibration: do not move the robot.')
-    vals = []
+    stop()
+    print("\nGyroscope calibration: keep the robot still.")
+    values = []
     for _ in range(300):
-        vals.append(gyro_raw(bus))
+        values.append(gyro_raw(bus))
         time.sleep(0.005)
-    return sum(vals)/len(vals)
+    return sum(values) / len(values)
 
 
 class Heading:
@@ -171,51 +179,97 @@ class Heading:
         self.last = time.monotonic()
 
     def read(self):
-        rate = gyro_rate(self.bus, self.offset)
         now = time.monotonic()
-        self.angle += self.sign * rate * max(0, now-self.last)
+        rate = gyro_rate(self.bus, self.offset)
+        self.angle += self.sign * rate * max(0.0, now - self.last)
         self.last = now
         return self.angle
 
 
 def pivot(bus, offset, direction, angle_target=TURN_ANGLE):
-    """Return (success, polarity if measured using a LEFT turn)."""
-    left = direction == 'L'
-    if direction not in ('L','R'):
-        raise ValueError('Direction must be L or R')
-    send(-TURN_PWM_SLOW if left else TURN_PWM_FAST,
-         TURN_PWM_FAST if left else -TURN_PWM_SLOW)
-    start = prev = time.monotonic()
+    """Gyro-controlled pivot. Return success and LEFT-turn gyro polarity."""
+    if direction not in ("L", "R"):
+        raise ValueError("Turn direction must be L or R")
+
+    left = direction == "L"
+    motors.set_speeds(
+        -TURN_PWM_SLOW if left else TURN_PWM_FAST,
+        TURN_PWM_FAST if left else -TURN_PWM_SLOW,
+    )
+
+    start = previous = time.monotonic()
     angle = signed = 0.0
+
     try:
         while angle < angle_target:
-            rate = gyro_rate(bus, offset)
             now = time.monotonic()
-            dt = max(0, now-prev)
-            prev = now
-            angle += abs(rate)*dt
-            signed += rate*dt
-            if now-start >= GYRO_TIMEOUT:
-                print('Turn timeout')
+            rate = gyro_rate(bus, offset)
+            dt = max(0.0, now - previous)
+            previous = now
+
+            angle += abs(rate) * dt
+            signed += rate * dt
+
+            if now - start >= GYRO_TIMEOUT:
+                print("\nTurn timeout.")
                 return False, None
+
             time.sleep(0.005)
-        polarity = (1 if signed > 0 else -1) if left and abs(signed)>20 else None
-        return True, polarity
+
+        sign = (
+            (1 if signed > 0 else -1)
+            if left and abs(signed) > 20
+            else None
+        )
+        return True, sign
+
     finally:
         stop()
         time.sleep(0.2)
 
 
-def follow_for(calibration, vision, seconds, speed):
-    start = time.monotonic()
+def reacquire_line(calibration):
+    """Use differential2 driving after EVERY turn, including edge-only line."""
+    deadline = time.monotonic() + REACQUIRE_TIMEOUT
+    stable = 0
+
     try:
-        while time.monotonic()-start < seconds:
-            vals, _ = vision.sample(calibration)
-            pos = vision.position
-            if pos is None:
-                print('Line lost during timed forward movement')
+        while time.monotonic() < deadline:
+            state = line_tracker.update(calibration)
+            position = state["position"]
+
+            if position is None:
+                stop()
+                stable = 0
+            else:
+                differential_drive(state)
+                if abs(position - TARGET_POSITION) <= REACQUIRE_TOLERANCE:
+                    stable += 1
+                    if stable >= REACQUIRE_CONFIRM:
+                        return True
+                else:
+                    stable = 0
+
+            time.sleep(LOOP_DELAY)
+
+        print("\nDifferential2: could not re-center after turn.")
+        return False
+
+    finally:
+        stop()
+
+
+def follow_for(calibration, seconds):
+    """Timed forward movement: unchanged differential2 line-following."""
+    deadline = time.monotonic() + seconds
+    try:
+        while time.monotonic() < deadline:
+            state = line_tracker.update(calibration)
+            if state["position"] is None:
+                stop()
+                print("\nLine missing during timed forward movement.")
                 return False
-            differential_forward(pos, speed)
+            differential_drive(state)
             time.sleep(LOOP_DELAY)
         return True
     finally:
@@ -223,267 +277,326 @@ def follow_for(calibration, vision, seconds, speed):
         time.sleep(0.15)
 
 
-def button_approach(calibration, vision, sensor):
+def button_approach(calibration, detector, sensor):
+    """Follow line to 10 cm from the button and pause instead of pressing."""
     start = time.monotonic()
-    clear = 0
-    left_junction = False
-    close = 0
+    cleared_count = 0
+    left_initial_junction = False
+    close_count = 0
+    missing_since = None
+
     try:
-        while time.monotonic()-start < BUTTON_MAX_TIME:
-            vals,bits = vision.sample(calibration)
-            pos = vision.position
-            left,right = edges(bits)
-            clear = clear+1 if not (left or right) else 0
-            if clear >= JUNCTION_CLEAR:
-                left_junction = True
-            if not left_junction and time.monotonic()-start > BUTTON_CLEAR_TIMEOUT:
-                print('Button branch: never cleared initial junction')
+        while time.monotonic() - start < BUTTON_MAX_TIME:
+            state = line_tracker.update(calibration)
+            left, right, _ = detector.read(state)
+
+            if not left and not right:
+                cleared_count += 1
+            else:
+                cleared_count = 0
+
+            if cleared_count >= JUNCTION_CLEAR:
+                left_initial_junction = True
+
+            if (
+                not left_initial_junction
+                and time.monotonic() - start > BUTTON_CLEAR_TIMEOUT
+            ):
+                print("\nB: initial junction did not clear.")
                 return False
-            dist = sensor.read_distance_mm()/10.0
-            close = close+1 if left_junction and 0 < dist <= BUTTON_DISTANCE_CM else 0
-            if close >= BUTTON_CONFIRM:
+
+            distance_cm = sensor.read_distance_mm() / 10.0
+            if (
+                left_initial_junction
+                and 0 < distance_cm <= BUTTON_DISTANCE_CM
+            ):
+                close_count += 1
+            else:
+                close_count = 0
+
+            if close_count >= BUTTON_CONFIRM:
                 stop()
-                print(f'Button object at {dist:.1f} cm. Wait 1 second.')
+                print(f"\nB: button at {distance_cm:.1f} cm, pause 1 second.")
                 time.sleep(BUTTON_WAIT)
                 return True
-            if pos is None:
-                print('Button approach: line lost')
-                return False
-            differential_forward(pos, APPROACH_SPEED)
+
+            if state["position"] is None:
+                stop()
+                if missing_since is None:
+                    missing_since = time.monotonic()
+                elif time.monotonic() - missing_since >= 0.5:
+                    print("\nB: line lost on approach.")
+                    return False
+            else:
+                missing_since = None
+                differential_drive(state)
+
             time.sleep(LOOP_DELAY)
-        print('Button approach timeout')
+
+        print("\nB: button approach timeout.")
         return False
+
     finally:
         stop()
 
 
-def button_return(calibration, vision, bus, offset, left_sign):
+def button_return(calibration, detector, bus, offset, left_sign):
+    """Reverse on the differential2 sensor position, with gyro protection."""
     heading = Heading(bus, offset, left_sign)
     start = time.monotonic()
-    recovery_since = None
-    candidate_since = None
     last_line = start
-    cleared = 0
-    confirmed = 0
+    cleared_count = 0
+    candidate_since = None
+    recovery_since = None
+
     try:
-        while time.monotonic()-start < RETURN_MAX_TIME:
-            vals,bits = vision.sample(calibration)
-            pos = vision.position
-            l,r = edges(bits)
+        while time.monotonic() - start < RETURN_MAX_TIME:
+            state = line_tracker.update(calibration)
+            left, right, _ = detector.read(state)
             now = time.monotonic()
             angle = heading.read()
-            if not l and not r:
-                cleared += 1
-            if cleared >= JUNCTION_CLEAR and l and r:
-                confirmed += 1
-            else:
-                confirmed = 0
-            # Detect junction before line-loss check. One double-edge sample
-            # is accepted to avoid overshoot at 150 PWM.
-            if confirmed >= 1:
-                print('\nReturn junction: BOTH S1 and S8 black')
+
+            if not left and not right:
+                cleared_count += 1
+
+            # Preserve the original B return-junction rule.
+            if cleared_count >= JUNCTION_CLEAR and left and right:
+                print("\nB: return junction found (both outer sensors).")
                 return True
+
             if abs(angle) >= RETURN_MAX_ANGLE:
-                print('\nReturn gyro limit exceeded')
+                print("\nB: reverse gyro angle limit reached.")
                 return False
-            if l != r:
-                candidate_since = now if candidate_since is None else candidate_since
-            elif not l and not r:
+
+            if left != right:
+                if candidate_since is None:
+                    candidate_since = now
+            elif not left and not right:
                 candidate_since = None
+
             if abs(angle) >= RETURN_RECOVERY_ANGLE:
-                recovery_since = now if recovery_since is None else recovery_since
+                if recovery_since is None:
+                    recovery_since = now
             elif abs(angle) <= RETURN_RECOVERY_SAFE:
                 recovery_since = None
-            if recovery_since is not None and now-recovery_since > RETURN_RECOVERY_TIMEOUT:
-                print('\nReturn heading recovery timeout')
+
+            if (
+                recovery_since is not None
+                and now - recovery_since >= RETURN_RECOVERY_TIMEOUT
+            ):
+                print("\nB: reverse heading recovery timeout.")
                 return False
-            if pos is not None:
+
+            if state["position"] is not None:
                 last_line = now
-                err = pos-DIFF_TARGET
-                line_corr = RETURN_LINE_KP * err * RETURN_SIGN
-                gyro_corr = RETURN_GYRO_KP * angle * RETURN_GYRO_SIGN
-                corr = clamp(line_corr+gyro_corr, -RETURN_MAX_DELTA, RETURN_MAX_DELTA)
-                speed = RETURN_SLOW_SPEED if (candidate_since is not None or recovery_since is not None) else RETURN_SPEED
-                send(clamp(-speed+corr,-255,-15),clamp(-speed-corr,-255,-15))
+                speed = (
+                    RETURN_SLOW_SPEED
+                    if candidate_since is not None or recovery_since is not None
+                    else RETURN_SPEED
+                )
+                differential_reverse(
+                    state, speed, RETURN_GYRO_KP * angle
+                )
             else:
                 stop()
-                # Do not continue driving blind; check for a double-edge signal
-                # for a short time before final line-lost failure.
-                if now-last_line > RETURN_LINE_LOST:
-                    print('\nReturn: LINE LOST before confirmed junction')
+                if now - last_line >= RETURN_LINE_LOST:
+                    print("\nB: line lost during reverse.")
                     return False
-            if candidate_since is not None and now-candidate_since > CANDIDATE_TIMEOUT:
-                candidate_since = None
-            print(f'\rBACK pos={pos if pos is not None else "---"} angle={angle:+.1f} '
-                  f'S1={int(l)} S8={int(r)}',end='',flush=True)
+
+            print(
+                f'\rB BACK pos={state["position"]} angle={angle:+.1f} '
+                f'S1={int(left)} S8={int(right)}',
+                end="", flush=True,
+            )
             time.sleep(LOOP_DELAY)
-        print('\nReturn timeout')
+
+        print("\nB: reverse timeout.")
         return False
+
     finally:
         stop()
 
 
-def button_task(calibration, vision, sensor, bus, offset):
-    print('B: left turn')
-    ok, left_sign = pivot(bus, offset, 'L')
-    if not ok or left_sign is None or not reacquire_line(calibration, vision):
-        print('B: left turn/gyro verification failed')
+def button_task(calibration, detector, sensor, bus, offset):
+    print("\nB: turn LEFT.")
+    ok, left_sign = pivot(bus, offset, "L")
+    if not ok or left_sign is None:
+        print("\nB: initial turn/gyro check failed.")
         return False
-    if not button_approach(calibration, vision, sensor):
+
+    if not reacquire_line(calibration):
         return False
-    if not button_return(calibration, vision, bus, offset, left_sign):
+
+    if not button_approach(calibration, detector, sensor):
         return False
-    print('B: forward adjustment for 0.3 seconds')
-    if not follow_for(calibration, vision, RETURN_FORWARD_TIME, RETURN_FORWARD_SPEED):
+
+    if not button_return(calibration, detector, bus, offset, left_sign):
         return False
-    print('B: right turn')
-    ok, _ = pivot(bus, offset, 'R', angle_target=90.0)
-    return ok and reacquire_line(calibration, vision)
+
+    print("\nB: move forward for 0.3 seconds.")
+    if not follow_for(calibration, RETURN_FORWARD_TIME):
+        return False
+
+    print("\nB: turn RIGHT by 90 degrees.")
+    ok, _ = pivot(
+        bus, offset, "R", angle_target=BUTTON_FINAL_RIGHT_ANGLE
+    )
+    return ok and reacquire_line(calibration)
 
 
-def ask_command(count, bits):
+def ask_command(count, left, right):
     stop()
-    print(f'\nJUNCTION #{count}: S1={int(bits[0])} S8={int(bits[7])}')
-    print('Robot STOPPED. Commands: L=left, R=right, S=straight, B=button, Q=quit')
+    print(f"\nJUNCTION #{count}: S1={int(left)}, S8={int(right)}")
+    print("STOPPED. L=left, R=right, S=straight, B=button, Q=quit")
     while True:
-        cmd = input('Command [L/R/S/B/Q]: ').strip().upper()
-        if cmd in ('L','R','S','B','Q'):
+        cmd = input("Command [L/R/S/B/Q]: ").strip().upper()
+        if cmd in ("L", "R", "S", "B", "Q"):
             return cmd
-        print('Enter L, R, S, B, or Q.')
+        print("Enter L, R, S, B or Q.")
 
 
 def main():
-    bus = board = sensor = None
-    tracker_on = motors_on = False
-    count = 0
+    board = bus = sensor = None
+    motors_on = tracker_on = False
+
     try:
-        bus = smbus.SMBus(I2C_BUS)
-        gyro_setup(bus)
+        # SAME connection and initialization sequence as differential2.py.
         board = telemetrix.Telemetrix(com_port=SERIAL_PORT)
+
         motors.initialize(board)
         motors_on = True
-        stop()
         line_tracker.initialize(board)
         tracker_on = True
+
         calibration = line_tracker.load_calibration()
         if calibration is None:
-            print('Calibration missing. Run python calibrate.py first.')
+            print("No calibration found; run python calibrate.py.")
             return
-        vision = Vision()
-        sensor = VL53L0XSensor()
-        sensor.initialize()
-        print(f'VL53L0X initially {sensor.read_distance_mm()/10:.1f} cm')
-        gyro_offset = gyro_calibrate(bus)
-        time.sleep(0.5)
-        print('Checking sensor readiness before motors start...')
-        ready_frames = 0
-        ready_deadline = time.monotonic() + 4.0
-        while time.monotonic() < ready_deadline:
-            v, _ = vision.sample(calibration)
-            if vision.position is not None:
-                ready_frames += 1
-                if ready_frames >= 5:
-                    break
-            else:
-                ready_frames = 0
-            time.sleep(LOOP_DELAY)
-        if ready_frames < 5:
-            print('START CANCELLED: no stable line. Motors remain stopped.')
-            return
-        print(f'RUNNING {__file__} / {BUILD_ID}')
-        print('First 2 s: differential2 ONLY, with junction detection temporarily bypassed.')
-        startup_deadline = time.monotonic() + STARTUP_DIFF_ONLY_SECONDS
+
+        detector = JunctionDetector()
+        print(
+            "Differential2 ready: target 0.08, PWM 100. "
+            "Follow line immediately; ask commands at junctions."
+        )
+
+        junction_count = 0
+        candidate_count = 0
+        clear_count = 0
         latched = False
-        clear_count = junction_count = 0
-        candidate_since = None
         ignore_until = 0.0
-        last_line = time.monotonic()
+
         while True:
-            vals,bits = vision.sample(calibration)
-            pos = vision.position
-            left,right = edges(bits)
+            # EXACT same reading as the working standalone differential2.py.
+            state = line_tracker.update(calibration)
+            position = state["position"]
+            left, right, candidate = detector.read(state)
             now = time.monotonic()
-            if now < startup_deadline:
-                if pos is None:
-                    stop()
-                    print('\rDIFF_ONLY: LINE LOST / MOTORS STOPPED', end='', flush=True)
-                else:
-                    left_pwm, right_pwm = differential_forward(pos, DIFF_BASE)
-                    print(f'\rDIFF_ONLY pos={pos:+.3f} L={left_pwm:+d} R={right_pwm:+d}',
-                          end='', flush=True)
-                time.sleep(LOOP_DELAY)
-                continue
-            clear_count = clear_count+1 if not(left or right) else 0
+
+            if not left and not right:
+                clear_count += 1
+            else:
+                clear_count = 0
+
             if clear_count >= JUNCTION_CLEAR:
                 latched = False
-            # Junction check stays independent from the eight-sensor centering controller.
-            candidate = (left or right) and pos is not None
-            if not latched and now >= ignore_until:
-                if candidate:
-                    candidate_since = now if candidate_since is None else candidate_since
-                    junction_count += 1
-                else:
-                    candidate_since = None
-                    junction_count = 0
-                if junction_count >= JUNCTION_CONFIRM:
-                    stop()
-                    latched = True
-                    junction_count = 0
-                    count += 1
-                    cmd = ask_command(count, bits)
-                    if cmd == 'Q':
-                        break
-                    if cmd == 'B':
-                        ok = button_task(calibration, vision, sensor, bus, gyro_offset)
-                    elif cmd in ('L','R'):
-                        ok, _ = pivot(bus, gyro_offset, cmd)
-                        ok = ok and reacquire_line(calibration, vision)
-                    else:
-                        ok = follow_for(calibration, vision, 0.5, 125)
-                    if not ok:
-                        print('Maneuver failed; stopping.')
-                        break
-                    # Ensure old crossing is cleared; remain latched until then.
-                    ignore_until = time.monotonic()+JUNCTION_COOLDOWN
-                    candidate_since = None
-                    last_line = time.monotonic()
-                    continue
-            if pos is None:
-                stop()
-                if now-last_line >= LINE_LOST_TIMEOUT:
-                    print('\nMain line lost. Robot stopped.')
-                    break
+
+            if (
+                not latched
+                and now >= ignore_until
+                and candidate
+            ):
+                candidate_count += 1
             else:
-                last_line = now
-                slow = candidate and not latched and now >= ignore_until
-                differential_forward(pos, SLOW_SPEED if slow else DIFF_BASE)
-            if candidate_since is not None and now-candidate_since > CANDIDATE_TIMEOUT:
-                candidate_since = None
-            print(f'\rpos={pos if pos is not None else "---"} S1={int(left)} S8={int(right)} next=ASK',
-                  end='',flush=True)
+                candidate_count = 0
+
+            if candidate_count >= JUNCTION_CONFIRM:
+                stop()
+                latched = True
+                candidate_count = 0
+                junction_count += 1
+
+                cmd = ask_command(junction_count, left, right)
+                if cmd == "Q":
+                    break
+
+                if cmd in ("L", "R", "B"):
+                    # Gyro and distance sensor are NOT initialized at startup.
+                    # They cannot interfere with initial line following.
+                    if bus is None:
+                        bus = smbus.SMBus(I2C_BUS)
+                        gyro_setup(bus)
+                    offset = gyro_calibrate(bus)
+
+                    if cmd == "B":
+                        if sensor is None:
+                            sensor = VL53L0XSensor()
+                            sensor.initialize()
+                        ok = button_task(
+                            calibration, detector, sensor, bus, offset
+                        )
+                    else:
+                        ok, _ = pivot(bus, offset, cmd)
+                        ok = ok and reacquire_line(calibration)
+                else:
+                    ok = follow_for(calibration, 0.5)
+
+                if not ok:
+                    print("\nManeuver failed. Robot stopped.")
+                    break
+
+                ignore_until = time.monotonic() + JUNCTION_COOLDOWN
+                continue
+
+            # Only the tested differential2.py decides how to follow the line.
+            if position is None:
+                stop()
+                print(
+                    '\rNO LINE: stopped; waiting for line sensors. '
+                    f'raw={state["raw"]}',
+                    end="", flush=True,
+                )
+            else:
+                differential_drive(state)
+                print(
+                    f"\rLINE pos={position:+.3f} "
+                    f"S1={int(left)} S8={int(right)}",
+                    end="", flush=True,
+                )
+
             time.sleep(LOOP_DELAY)
+
     except KeyboardInterrupt:
-        print('\nInterrupted; robot stopped.')
+        print("\nInterrupted by user.")
     except Exception as exc:
-        print(f'\nERROR: {exc}')
+        print(f"\nERROR: {exc}")
     finally:
         if motors_on:
-            try: stop()
-            except Exception: pass
+            try:
+                stop()
+            except Exception:
+                pass
         if sensor is not None:
-            try: sensor.close()
-            except Exception: pass
+            try:
+                sensor.close()
+            except Exception:
+                pass
         if tracker_on:
-            try: line_tracker.shutdown()
-            except Exception: pass
+            try:
+                line_tracker.shutdown()
+            except Exception:
+                pass
         if board is not None:
-            try: board.shutdown()
-            except Exception: pass
+            try:
+                board.shutdown()
+            except Exception:
+                pass
         if bus is not None:
-            try: bus.close()
-            except Exception: pass
-        print('\nRobot stopped.')
+            try:
+                bus.close()
+            except Exception:
+                pass
+        print("\nRobot stopped.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
