@@ -11,11 +11,16 @@ import motors
 from sensors.vl53l0x_sensor import VL53L0XSensor
 
 
-# The tested differential2.py parameters. Change speed only after testing.
+# Maximum-PWM line-following TEST. Set BASE_SPEED=100, MAX_SPEED=170
+# to revert to the previously tested and reliable travel speed.
 SERIAL_PORT = "/dev/serial0"
-BASE_SPEED = 100
-MAX_SPEED = 170
+BASE_SPEED = 255
+MAX_SPEED = 255
 MIN_SPEED = -80
+# Keep short maneuvers, return-to-line and the 10 cm button approach
+# at their proven slower speeds to avoid overshooting.
+MANEUVER_SPEED = 100
+MANEUVER_MAX_SPEED = 170
 KP = 30.0
 TARGET_POSITION = 0.08
 LOOP_DELAY = 0.04
@@ -79,8 +84,8 @@ def stop():
     motors.motor_stop()
 
 
-def differential_drive(state, speed=BASE_SPEED):
-    """Exact differential2.py forward algorithm, using all eight sensors."""
+def differential_drive(state, speed=BASE_SPEED, max_speed=MAX_SPEED):
+    """The differential2 P-controller, optionally with a maneuver speed cap."""
     if state is None or state["position"] is None:
         stop()
         return False
@@ -89,8 +94,8 @@ def differential_drive(state, speed=BASE_SPEED):
     error = position - TARGET_POSITION
     correction = KP * error
 
-    left_speed = clamp(speed + correction, MIN_SPEED, MAX_SPEED)
-    right_speed = clamp(speed - correction, MIN_SPEED, MAX_SPEED)
+    left_speed = clamp(speed + correction, MIN_SPEED, max_speed)
+    right_speed = clamp(speed - correction, MIN_SPEED, max_speed)
 
     motors.set_speeds(round(left_speed), round(right_speed))
     return True
@@ -250,7 +255,9 @@ def reacquire_line(calibration):
                 stop()
                 stable = 0
             else:
-                differential_drive(state)
+                differential_drive(
+                    state, speed=MANEUVER_SPEED, max_speed=MANEUVER_MAX_SPEED
+                )
                 if abs(position - TARGET_POSITION) <= REACQUIRE_TOLERANCE:
                     stable += 1
                     if stable >= REACQUIRE_CONFIRM:
@@ -277,7 +284,9 @@ def follow_for(calibration, seconds):
                 stop()
                 print("\nLine missing during timed forward movement.")
                 return False
-            differential_drive(state)
+            differential_drive(
+                state, speed=MANEUVER_SPEED, max_speed=MANEUVER_MAX_SPEED
+            )
             time.sleep(LOOP_DELAY)
         return True
     finally:
@@ -336,7 +345,10 @@ def button_approach(calibration, detector, sensor):
                     return False
             else:
                 missing_since = None
-                differential_drive(state)
+                differential_drive(
+                    state, speed=MANEUVER_SPEED,
+                    max_speed=MANEUVER_MAX_SPEED
+                )
 
             time.sleep(LOOP_DELAY)
 
@@ -488,7 +500,9 @@ def parking_task():
         import led
         import robot_pin_config as pins
 
-        rgb = led.RGBLED(pins.LED_RED, pins.LED_GREEN, pins.LED_BLUE)
+        # Physical red/blue LED channels are swapped on this robot:
+        # previous RED command lit BLUE. Swap only here, not global pins.
+        rgb = led.RGBLED(pins.LED_BLUE, pins.LED_GREEN, pins.LED_RED)
         start = time.monotonic()
         red_end = start + PARK_RED_SECONDS
         park_end = start + PARK_SECONDS
@@ -595,7 +609,8 @@ def main():
 
         detector = JunctionDetector()
         print(
-            "Differential2 ready: target 0.08, PWM 100. "
+            f"Differential2 ready: target {TARGET_POSITION}, "
+            f"MAXIMUM PWM {BASE_SPEED} (test mode). "
             "Follow line immediately; ask commands at junctions."
         )
 
