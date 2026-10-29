@@ -22,6 +22,14 @@ KP = 30.0
 TARGET_POSITION = 0.08
 LOOP_DELAY = 0.04
 
+# Startup safety: never drive until the stationary robot is properly
+# positioned over a straight section of line for a full second.
+START_CENTER_TOLERANCE = 0.45
+START_CENTER_BLACK_MIN = 0.30
+START_OUTER_BLACK_MAX = 0.70
+START_STABLE_SECONDS = 1.0
+START_REPORT_INTERVAL = 1.0
+
 # Junction recognition is separate from line tracking.
 BLACK_ON = 0.85
 BLACK_OFF = 0.65
@@ -585,6 +593,78 @@ def load_route():
     return route
 
 
+def startup_alignment_status(state):
+    """Check starting line position, not physical heading of the robot.
+
+    Eight sensors arranged in one row can locate the line sideways but
+    cannot tell if the whole robot is pointing at an angle to the track.
+    """
+    position = state["position"]
+    if position is None:
+        return False, "Line not detected. Place robot over the black line."
+
+    values = state["normalized"]
+    center_black = max(values[2:6])
+    if center_black < START_CENTER_BLACK_MIN:
+        return False, "Center sensors do not see a clear line."
+
+    if max(values[0], values[7]) > START_OUTER_BLACK_MAX:
+        return False, "Outer sensor sees black; start on a straight section."
+
+    offset = position - TARGET_POSITION
+    if abs(offset) > START_CENTER_TOLERANCE:
+        side = "right" if offset > 0 else "left"
+        return (
+            False,
+            f"Line is {side} of center (position={position:+.3f}, "
+            f"target={TARGET_POSITION:+.3f}). Reposition robot by hand.",
+        )
+
+    return True, f"Centered: position={position:+.3f}, offset={offset:+.3f}."
+
+
+def wait_for_start_alignment(calibration):
+    """Keep motors off until centered sensor readings stay good for 1 sec.
+
+    This does not change the line-following controller or junction logic.
+    No driving or automatic turning occurs during the startup check.
+    Ctrl+C can always stop this waiting stage.
+    """
+    stop()
+    print(
+        "\nSTART CHECK: place robot on the starting STRAIGHT line, "
+        "pointing forward."
+    )
+    print(
+        "Motors OFF until the line is centered for "
+        f"{START_STABLE_SECONDS:g} second(s)."
+    )
+    stable_since = None
+    last_report = 0.0
+
+    while True:
+        state = line_tracker.update(calibration)
+        aligned, reason = startup_alignment_status(state)
+        now = time.monotonic()
+
+        if aligned:
+            if stable_since is None:
+                stable_since = now
+            if now - stable_since >= START_STABLE_SECONDS:
+                stop()
+                print(f"START READY: {reason} Starting route.\n")
+                return True
+        else:
+            stable_since = None
+
+        if now - last_report >= START_REPORT_INTERVAL:
+            print(f"START WAIT: {reason}")
+            last_report = now
+
+        # Motors remain stopped, even if the position fluctuates.
+        time.sleep(LOOP_DELAY)
+
+
 def main():
     board = bus = sensor = None
     motors_on = tracker_on = False
@@ -641,6 +721,10 @@ def main():
             return
         print(f"All eight ADC channels ready: {startup_state['raw']}")
         print(f"Initial line position: {startup_state['position']}")
+
+        # Detect a bad starting pose BEFORE the first motor command.
+        # Do not consume a ROUTE entry or attempt an automatic turn.
+        wait_for_start_alignment(calibration)
 
         detector = JunctionDetector()
         print(
