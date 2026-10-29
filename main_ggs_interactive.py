@@ -10,25 +10,16 @@ from sensors.vl53l0x_sensor import VL53L0XSensor
 SERIAL_PORT = '/dev/serial0'
 LOOP_DELAY = 0.04
 DIFF_KP = 30.0
-DIFF_TARGET = 0.5
-DIFF_BASE = 100
+DIFF_TARGET = 0.08
+DIFF_BASE = 115
 DIFF_MIN = -80
-DIFF_MAX = 170
+DIFF_MAX = 185
 REACQUIRE_TIME = 1.2
-REACQUIRE_SPEED = 75
+REACQUIRE_SPEED = 90
 BLACK_ON = 0.85
 BLACK_OFF = 0.65
 LINE_MIN = 0.20
-CENTER = 3.5
-CENTRAL = (2, 3, 4, 5)  # S3-S6
-WEIGHT_INDICES = (1, 2, 3, 4, 5, 6)  # S2-S7
-
-FORWARD_SPEED = 155
-FORWARD_KP = 30.0
-FORWARD_KD = 0.45  # derivative per second, so start low
-FORWARD_MAX_DELTA = 85
-FORWARD_SIGN = 1  # keep same convention as previously working forward steering
-APPROACH_SPEED = 120
+APPROACH_SPEED = 125
 SLOW_SPEED = 95
 
 CANDIDATE_TIMEOUT = 0.35
@@ -51,9 +42,9 @@ BUTTON_WAIT = 1.0
 BUTTON_MAX_TIME = 12.0
 BUTTON_CONFIRM = 3
 BUTTON_CLEAR_TIMEOUT = 3.0
-RETURN_SPEED = 150
+RETURN_SPEED = 155
 RETURN_SLOW_SPEED = 95
-RETURN_LINE_KP = 35.0
+RETURN_LINE_KP = 30.0
 RETURN_GYRO_KP = 2.0
 RETURN_MAX_DELTA = 85
 RETURN_SIGN = 1
@@ -65,7 +56,7 @@ RETURN_RECOVERY_ANGLE = 12.0
 RETURN_RECOVERY_SAFE = 6.0
 RETURN_RECOVERY_TIMEOUT = 1.5
 RETURN_FORWARD_TIME = 0.3
-RETURN_FORWARD_SPEED = 110
+RETURN_FORWARD_SPEED = 115
 
 
 def clamp(n, lo, hi):
@@ -84,9 +75,12 @@ def stop():
 class Vision:
     def __init__(self):
         self.dark = [False] * 8
+        self.position = None
 
     def sample(self, calibration):
-        vals = line_tracker.update(calibration)['normalized']
+        state = line_tracker.update(calibration)
+        vals = state['normalized']
+        self.position = differential_position(state)
         if len(vals) != 8:
             raise ValueError('Expected 8 sensor values')
         for i, v in enumerate(vals):
@@ -97,20 +91,9 @@ class Vision:
         return vals, tuple(self.dark)
 
 
-def position(vals):
-    weights = [clamp(float(vals[i]), 0, 1) for i in WEIGHT_INDICES]
-    total = sum(weights)
-    if total < LINE_MIN:
-        return None
-    return sum((i+1)*value for i, value in enumerate(weights))/total
-
-
-def differential_position(vals):
-    # Same 8-channel weights and target as differential.py.
-    total = sum(vals)
-    if total < LINE_MIN:
-        return None
-    return sum(v*w for v,w in zip(vals, (-3.5,-2.5,-1.5,-0.5,0.5,1.5,2.5,3.5))) / total
+def differential_position(state):
+    """Reuse exact eight-sensor position from line_tracker.update(), as differential2.py does."""
+    return state['position']
 
 
 def differential_forward(pos, speed=DIFF_BASE):
@@ -128,7 +111,7 @@ def reacquire_line(calibration, vision):
     try:
         while time.monotonic() < deadline:
             vals, _ = vision.sample(calibration)
-            pos = differential_position(vals)
+            pos = vision.position
             if pos is None:
                 stop()
                 stable = 0
@@ -142,10 +125,6 @@ def reacquire_line(calibration, vision):
         return False
     finally:
         stop()
-
-
-def sees_center(vals):
-    return any(vals[i] >= LINE_MIN for i in CENTRAL)
 
 
 def edges(bits):
@@ -227,7 +206,7 @@ def follow_for(calibration, vision, seconds, speed):
     try:
         while time.monotonic()-start < seconds:
             vals, _ = vision.sample(calibration)
-            pos = differential_position(vals)
+            pos = vision.position
             if pos is None:
                 print('Line lost during timed forward movement')
                 return False
@@ -239,17 +218,6 @@ def follow_for(calibration, vision, seconds, speed):
         time.sleep(0.15)
 
 
-def after_turn_line(calibration, vision):
-    end = time.monotonic()+0.5
-    while time.monotonic() < end:
-        vals, _ = vision.sample(calibration)
-        if differential_position(vals) is not None:
-            return True
-        time.sleep(0.01)
-    print('After turn: line not found. Stopping.')
-    return False
-
-
 def button_approach(calibration, vision, sensor):
     start = time.monotonic()
     clear = 0
@@ -258,7 +226,7 @@ def button_approach(calibration, vision, sensor):
     try:
         while time.monotonic()-start < BUTTON_MAX_TIME:
             vals,bits = vision.sample(calibration)
-            pos = differential_position(vals)
+            pos = vision.position
             left,right = edges(bits)
             clear = clear+1 if not (left or right) else 0
             if clear >= JUNCTION_CLEAR:
@@ -295,7 +263,7 @@ def button_return(calibration, vision, bus, offset, left_sign):
     try:
         while time.monotonic()-start < RETURN_MAX_TIME:
             vals,bits = vision.sample(calibration)
-            pos = differential_position(vals)
+            pos = vision.position
             l,r = edges(bits)
             now = time.monotonic()
             angle = heading.read()
@@ -407,7 +375,7 @@ def main():
         ready_deadline = time.monotonic() + 4.0
         while time.monotonic() < ready_deadline:
             v, _ = vision.sample(calibration)
-            if differential_position(v) is not None:
+            if vision.position is not None:
                 ready_frames += 1
                 if ready_frames >= 5:
                     break
@@ -417,7 +385,7 @@ def main():
         if ready_frames < 5:
             print('START CANCELLED: no stable line. Motors remain stopped.')
             return
-        print('Robot ready. Automatically follow line until a junction; then WAIT for terminal input.')
+        print('Robot ready: differential2 controller with target 0.08; prompts at junctions.')
         latched = False
         clear_count = junction_count = 0
         candidate_since = None
@@ -425,14 +393,13 @@ def main():
         last_line = time.monotonic()
         while True:
             vals,bits = vision.sample(calibration)
-            pos = differential_position(vals)
+            pos = vision.position
             left,right = edges(bits)
             now = time.monotonic()
             clear_count = clear_count+1 if not(left or right) else 0
             if clear_count >= JUNCTION_CLEAR:
                 latched = False
-            # Candidate status is only valid when an actual side signal is present
-            # and center sensors see the ordinary line.
+            # Junction check stays independent from the eight-sensor centering controller.
             candidate = (left or right) and pos is not None
             if not latched and now >= ignore_until:
                 if candidate:
