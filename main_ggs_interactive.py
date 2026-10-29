@@ -13,12 +13,6 @@ from sensors.vl53l0x_sensor import VL53L0XSensor
 
 # Previously tested differential2 line-following speeds.
 SERIAL_PORT = "/dev/serial0"
-# Use the previously reliable four-second Telemetrix controller reboot wait.
-ARDUINO_WAIT_SECONDS = 4
-# The following startup pauses are only a buffer. The real ADC readiness
-# checks below must still succeed before motors can move.
-POST_CONNECT_WAIT_SECONDS = 0.5
-POST_SENSOR_INIT_WAIT_SECONDS = 0.2
 BASE_SPEED = 100
 MAX_SPEED = 170
 MIN_SPEED = -80
@@ -33,7 +27,7 @@ LOOP_DELAY = 0.04
 START_CENTER_TOLERANCE = 0.45
 START_CENTER_BLACK_MIN = 0.30
 START_OUTER_BLACK_MAX = 0.70
-START_STABLE_SECONDS = 0.5
+START_STABLE_SECONDS = 1.0
 START_REPORT_INTERVAL = 1.0
 
 # Junction recognition is separate from line tracking.
@@ -680,23 +674,18 @@ def main():
         route = load_route()
         print(f"Automatic ROUTE loaded: {route}")
         # SAME connection and initialization sequence as differential2.py.
-        board = telemetrix.Telemetrix(
-            com_port=SERIAL_PORT,
-            arduino_wait=ARDUINO_WAIT_SECONDS,
-        )
+        board = telemetrix.Telemetrix(com_port=SERIAL_PORT)
 
-        # Brief communication settling pause; actual sensor readiness
-        # is verified below rather than assumed from a fixed wait.
-        time.sleep(POST_CONNECT_WAIT_SECONDS)
+        # Original proven delay before starting the STM32 ADC subscriptions.
+        time.sleep(2.0)
 
         motors.initialize(board)
         motors_on = True
         line_tracker.initialize(board)
         tracker_on = True
 
-        # Allow subscriptions to start; wait for all eight real readings
-        # with the existing timeout and stability test below.
-        time.sleep(POST_SENSOR_INIT_WAIT_SECONDS)
+        # Original proven delay before inspecting the asynchronous ADC values.
+        time.sleep(1.0)
 
         calibration = line_tracker.load_calibration()
         if calibration is None:
