@@ -43,6 +43,10 @@ TURN_PWM_FAST = 255
 TURN_PWM_SLOW = 90
 
 BUTTON_DISTANCE_CM = 10.0
+# Tested gripper-tip coordinates (millimetres, arm_web coordinate system).
+BUTTON_X_MM = 230.0
+BUTTON_Y_MM = 0.0
+BUTTON_Z_MM = 0.0
 PARK_SECONDS = 5.0  # stop, then make the ordinary R turn
 BUTTON_MAX_TIME = 12.0
 BUTTON_CONFIRM = 3
@@ -448,35 +452,18 @@ def button_task(calibration, detector, sensor, bus, offset, board):
 
 
 def button_arm_action(board):
-    """Ask for XYZ at the button; move arm to XYZ and back home."""
-    import math
+    """Move arm to the tested button XYZ, then return home before reversing."""
     from button_arm import move_to_xyz_and_home
 
     stop()
-    print("\nB: stopped at button. Enter tip XYZ in MILLIMETRES.")
-    print("X = forward, Y = right, Z = up (from arm base).")
-    print("Enter Q to cancel; robot stays stopped.")
-
-    xyz = []
-    for axis in ("X", "Y", "Z"):
-        while True:
-            value_text = input(f"{axis} (mm): ").strip()
-            if value_text.upper() == "Q":
-                print("B: cancelled; robot remains stopped.")
-                return False
-            try:
-                value = float(value_text.replace(",", "."))
-                if not math.isfinite(value):
-                    raise ValueError("non-finite coordinate")
-            except ValueError:
-                print("Enter a finite number of millimetres, or Q.")
-                continue
-            xyz.append(value)
-            break
-
-    print(f"B: arm target X={xyz[0]:g} Y={xyz[1]:g} Z={xyz[2]:g} mm")
+    print(
+        f"\nB: moving arm automatically to X={BUTTON_X_MM:g}, "
+        f"Y={BUTTON_Y_MM:g}, Z={BUTTON_Z_MM:g} mm."
+    )
     try:
-        ok = move_to_xyz_and_home(board, *xyz)
+        ok = move_to_xyz_and_home(
+            board, BUTTON_X_MM, BUTTON_Y_MM, BUTTON_Z_MM
+        )
         if ok:
             print("B: arm returned to home. Reversing to junction.")
         return ok
