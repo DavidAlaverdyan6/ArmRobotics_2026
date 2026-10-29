@@ -13,6 +13,12 @@ from sensors.vl53l0x_sensor import VL53L0XSensor
 
 # Previously tested differential2 line-following speeds.
 SERIAL_PORT = "/dev/serial0"
+# Let Telemetrix reboot the controller for three seconds (default is four).
+ARDUINO_WAIT_SECONDS = 3
+# The following startup pauses are only a buffer. The real ADC readiness
+# checks below must still succeed before motors can move.
+POST_CONNECT_WAIT_SECONDS = 0.5
+POST_SENSOR_INIT_WAIT_SECONDS = 0.2
 BASE_SPEED = 100
 MAX_SPEED = 170
 MIN_SPEED = -80
@@ -27,7 +33,7 @@ LOOP_DELAY = 0.04
 START_CENTER_TOLERANCE = 0.45
 START_CENTER_BLACK_MIN = 0.30
 START_OUTER_BLACK_MAX = 0.70
-START_STABLE_SECONDS = 1.0
+START_STABLE_SECONDS = 0.5
 START_REPORT_INTERVAL = 1.0
 
 # Junction recognition is separate from line tracking.
@@ -48,6 +54,8 @@ MPU_ADDR = 0x68
 GYRO_Z_REG = 0x47
 GYRO_SCALE = 131.0
 GYRO_TIMEOUT = 5.0
+GYRO_CALIBRATION_SAMPLES = 200
+PIVOT_SETTLE_SECONDS = 0.1
 TURN_ANGLE = 80.0
 TURN_PWM_FAST = 255
 TURN_PWM_SLOW = 90
@@ -205,7 +213,7 @@ def gyro_calibrate(bus):
     stop()
     print("\nGyroscope calibration: keep the robot still.")
     values = []
-    for _ in range(300):
+    for _ in range(GYRO_CALIBRATION_SAMPLES):
         values.append(gyro_raw(bus))
         time.sleep(0.005)
     return sum(values) / len(values)
@@ -266,7 +274,7 @@ def pivot(bus, offset, direction, angle_target=TURN_ANGLE):
 
     finally:
         stop()
-        time.sleep(0.2)
+        time.sleep(PIVOT_SETTLE_SECONDS)
 
 
 def reacquire_line(calibration):
@@ -673,18 +681,23 @@ def main():
         route = load_route()
         print(f"Automatic ROUTE loaded: {route}")
         # SAME connection and initialization sequence as differential2.py.
-        board = telemetrix.Telemetrix(com_port=SERIAL_PORT)
+        board = telemetrix.Telemetrix(
+            com_port=SERIAL_PORT,
+            arduino_wait=ARDUINO_WAIT_SECONDS,
+        )
 
-        # Match the proven timing in show_line_position.py before ADC setup.
-        time.sleep(2.0)
+        # Brief communication settling pause; actual sensor readiness
+        # is verified below rather than assumed from a fixed wait.
+        time.sleep(POST_CONNECT_WAIT_SECONDS)
 
         motors.initialize(board)
         motors_on = True
         line_tracker.initialize(board)
         tracker_on = True
 
-        # Let all asynchronous analog input subscriptions begin reporting.
-        time.sleep(1.0)
+        # Allow subscriptions to start; wait for all eight real readings
+        # with the existing timeout and stability test below.
+        time.sleep(POST_SENSOR_INIT_WAIT_SECONDS)
 
         calibration = line_tracker.load_calibration()
         if calibration is None:
