@@ -8,7 +8,14 @@ import motors
 from sensors.vl53l0x_sensor import VL53L0XSensor
 
 SERIAL_PORT = '/dev/serial0'
-LOOP_DELAY = 0.02
+LOOP_DELAY = 0.04
+DIFF_KP = 30.0
+DIFF_TARGET = 0.5
+DIFF_BASE = 100
+DIFF_MIN = -80
+DIFF_MAX = 170
+REACQUIRE_TIME = 1.2
+REACQUIRE_SPEED = 75
 BLACK_ON = 0.85
 BLACK_OFF = 0.65
 LINE_MIN = 0.20
@@ -98,6 +105,45 @@ def position(vals):
     return sum((i+1)*value for i, value in enumerate(weights))/total
 
 
+def differential_position(vals):
+    # Same 8-channel weights and target as differential.py.
+    total = sum(vals)
+    if total < LINE_MIN:
+        return None
+    return sum(v*w for v,w in zip(vals, (-3.5,-2.5,-1.5,-0.5,0.5,1.5,2.5,3.5))) / total
+
+
+def differential_forward(pos, speed=DIFF_BASE):
+    error = pos - DIFF_TARGET
+    correction = DIFF_KP * error
+    send(clamp(speed+correction, DIFF_MIN, DIFF_MAX),
+         clamp(speed-correction, DIFF_MIN, DIFF_MAX))
+
+
+def reacquire_line(calibration, vision):
+    # Active differential centering immediately after a turn.
+    # It may recover even when only an outermost sensor sees black.
+    deadline = time.monotonic() + REACQUIRE_TIME
+    stable = 0
+    try:
+        while time.monotonic() < deadline:
+            vals, _ = vision.sample(calibration)
+            pos = differential_position(vals)
+            if pos is None:
+                stop()
+                stable = 0
+            else:
+                differential_forward(pos, REACQUIRE_SPEED)
+                stable = stable+1 if abs(pos-DIFF_TARGET) < 0.65 else 0
+                if stable >= 4:
+                    return True
+            time.sleep(LOOP_DELAY)
+        print('Differential: could not center on line after turn')
+        return False
+    finally:
+        stop()
+
+
 def sees_center(vals):
     return any(vals[i] >= LINE_MIN for i in CENTRAL)
 
@@ -148,7 +194,7 @@ class Heading:
         return self.angle
 
 
-def pivot(bus, offset, direction):
+def pivot(bus, offset, direction, angle_target=TURN_ANGLE):
     """Return (success, polarity if measured using a LEFT turn)."""
     left = direction == 'L'
     if direction not in ('L','R'):
@@ -158,7 +204,7 @@ def pivot(bus, offset, direction):
     start = prev = time.monotonic()
     angle = signed = 0.0
     try:
-        while angle < TURN_ANGLE:
+        while angle < angle_target:
             rate = gyro_rate(bus, offset)
             now = time.monotonic()
             dt = max(0, now-prev)
@@ -195,7 +241,7 @@ class PD:
                      -self.max_delta, self.max_delta)
 
 
-def forward_pd(pos, speed, pd):
+def differential_forward(pos, speed):
     c = pd.correction(pos)
     # If line is towards S7, left wheel should be faster.
     send(speed+c, speed-c)
@@ -207,8 +253,8 @@ def follow_for(calibration, vision, seconds, speed):
     try:
         while time.monotonic()-start < seconds:
             vals, _ = vision.sample(calibration)
-            pos = position(vals)
-            if pos is None or not sees_center(vals):
+            pos = differential_position(vals)
+            if pos is None:
                 print('Line lost during timed forward movement')
                 return False
             forward_pd(pos, speed, pd)
@@ -223,7 +269,7 @@ def after_turn_line(calibration, vision):
     end = time.monotonic()+0.5
     while time.monotonic() < end:
         vals, _ = vision.sample(calibration)
-        if position(vals) is not None and sees_center(vals):
+        if differential_position(vals) is not None:
             return True
         time.sleep(0.01)
     print('After turn: line not found. Stopping.')
@@ -254,10 +300,10 @@ def button_approach(calibration, vision, sensor):
                 print(f'Button object at {dist:.1f} cm. Wait 1 second.')
                 time.sleep(BUTTON_WAIT)
                 return True
-            if pos is None or not sees_center(vals):
+            if pos is None:
                 print('Button approach: line lost')
                 return False
-            forward_pd(pos, APPROACH_SPEED, pd)
+            differential_forward(pos, APPROACH_SPEED)
             time.sleep(LOOP_DELAY)
         print('Button approach timeout')
         return False
@@ -305,9 +351,9 @@ def button_return(calibration, vision, bus, offset, left_sign):
             if recovery_since is not None and now-recovery_since > RETURN_RECOVERY_TIMEOUT:
                 print('\nReturn heading recovery timeout')
                 return False
-            if pos is not None and sees_center(vals):
+            if pos is not None:
                 last_line = now
-                err = pos-CENTER
+                err = pos-DIFF_TARGET
                 line_corr = RETURN_LINE_KP * err * RETURN_SIGN
                 gyro_corr = RETURN_GYRO_KP * angle * RETURN_GYRO_SIGN
                 corr = clamp(line_corr+gyro_corr, -RETURN_MAX_DELTA, RETURN_MAX_DELTA)
@@ -334,7 +380,7 @@ def button_return(calibration, vision, bus, offset, left_sign):
 def button_task(calibration, vision, sensor, bus, offset):
     print('B: left turn')
     ok, left_sign = pivot(bus, offset, 'L')
-    if not ok or left_sign is None or not after_turn_line(calibration, vision):
+    if not ok or left_sign is None or not reacquire_line(calibration, vision):
         print('B: left turn/gyro verification failed')
         return False
     if not button_approach(calibration, vision, sensor):
@@ -345,8 +391,8 @@ def button_task(calibration, vision, sensor, bus, offset):
     if not follow_for(calibration, vision, RETURN_FORWARD_TIME, RETURN_FORWARD_SPEED):
         return False
     print('B: right turn')
-    ok, _ = pivot(bus, offset, 'R')
-    return ok and after_turn_line(calibration, vision)
+    ok, _ = pivot(bus, offset, 'R', angle_target=90.0)
+    return ok and reacquire_line(calibration, vision)
 
 
 def ask_command(count, bits):
@@ -400,7 +446,7 @@ def main():
                 latched = False
             # Candidate status is only valid when an actual side signal is present
             # and center sensors see the ordinary line.
-            candidate = (left or right) and sees_center(vals)
+            candidate = (left or right) and pos is not None
             if not latched and now >= ignore_until:
                 if candidate:
                     candidate_since = now if candidate_since is None else candidate_since
@@ -420,7 +466,7 @@ def main():
                         ok = button_task(calibration, vision, sensor, bus, gyro_offset)
                     elif cmd in ('L','R'):
                         ok, _ = pivot(bus, gyro_offset, cmd)
-                        ok = ok and after_turn_line(calibration, vision)
+                        ok = ok and reacquire_line(calibration, vision)
                     else:
                         ok = follow_for(calibration, vision, 0.5, 125)
                     if not ok:
@@ -440,7 +486,7 @@ def main():
             else:
                 last_line = now
                 slow = candidate and not latched and now >= ignore_until
-                forward_pd(pos, SLOW_SPEED if slow else FORWARD_SPEED, pd)
+                differential_forward(pos, SLOW_SPEED if slow else DIFF_BASE)
             if candidate_since is not None and now-candidate_since > CANDIDATE_TIMEOUT:
                 candidate_since = None
             print(f'\rpos={pos if pos is not None else "---"} S1={int(left)} S8={int(right)} next=ASK',
