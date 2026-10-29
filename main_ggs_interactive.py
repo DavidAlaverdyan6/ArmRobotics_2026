@@ -77,12 +77,21 @@ BUTTON_FINAL_RIGHT_ANGLE = 90.0
 # Example: ROUTE = ["L", "S", "B", "R", "P", "Q"]
 # The commented entries below are placeholders: edit them before launching.
 ROUTE = [
-    # "L",
-    # "S",
-    # "B",
-    # "R",
-    # "P",
-    # "Q",
+    "B",
+    "L",
+    "R",
+    "S",
+    "R",
+    "L",
+    "P",
+    "R",
+    "S",
+    "S",
+    "R",
+    "L",
+    "L",
+    "R",
+    "Q",
 ]
 ALLOWED_ROUTE_COMMANDS = {"L", "R", "S", "B", "P", "Q"}
 
