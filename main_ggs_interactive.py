@@ -43,11 +43,15 @@ TURN_PWM_FAST = 255
 TURN_PWM_SLOW = 90
 
 BUTTON_DISTANCE_CM = 10.0
-# Tested gripper-tip coordinates (millimetres, arm_web coordinate system).
-BUTTON_X_MM = 230.0
+# Button tip target (mm, arm_web coordinate system). Arm moves in two stages.
+BUTTON_X_MM = 250.0
 BUTTON_Y_MM = 0.0
-BUTTON_Z_MM = 0.0
-PARK_SECONDS = 5.0  # stop, then make the ordinary R turn
+BUTTON_Z_MM = -20.0
+
+# Parking: 9 s red blink, then 2 s solid green; total 11 s before R.
+PARK_SECONDS = 11.0
+PARK_RED_SECONDS = 9.0
+PARK_BLINK_HALF_PERIOD = 0.5
 BUTTON_MAX_TIME = 12.0
 BUTTON_CONFIRM = 3
 BUTTON_CLEAR_TIMEOUT = 3.0
@@ -476,13 +480,50 @@ def button_arm_action(board):
 
 
 def parking_task():
-    """Stationary 5-second wait. No lamp is controlled."""
+    """Stop for 11 s: blink RED for 9 s, GREEN for 2 s, then turn R."""
     stop()
-    print(f"\nP: stopping for {PARK_SECONDS:g} seconds.")
+    rgb = None
     try:
-        time.sleep(PARK_SECONDS)
+        # The existing led.RGBLED handles the robot's active-low RGB pins.
+        import led
+        import robot_pin_config as pins
+
+        rgb = led.RGBLED(pins.LED_RED, pins.LED_GREEN, pins.LED_BLUE)
+        start = time.monotonic()
+        red_end = start + PARK_RED_SECONDS
+        park_end = start + PARK_SECONDS
+
+        print("\nP: robot stopped. Red blinking for 9 seconds.")
+        while time.monotonic() < red_end:
+            rgb.red()
+            time.sleep(
+                max(0.0, min(PARK_BLINK_HALF_PERIOD,
+                             red_end - time.monotonic()))
+            )
+            rgb.off()
+            time.sleep(
+                max(0.0, min(PARK_BLINK_HALF_PERIOD,
+                             red_end - time.monotonic()))
+            )
+
+        print("\nP: green ON for remaining 2 seconds.")
+        rgb.green()
+        time.sleep(max(0.0, park_end - time.monotonic()))
+        print("\nP: parking complete; turning RIGHT.")
         return True
+
+    except Exception as exc:
+        print(f"\nP: RGB parking error: {exc}")
+        print("P: not turning until the light problem is resolved.")
+        return False
+
     finally:
+        if rgb is not None:
+            try:
+                rgb.off()
+                rgb.close()
+            except Exception:
+                pass
         stop()
 
 
