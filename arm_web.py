@@ -346,7 +346,8 @@ async function postJSON(path, data) {
 }
 
 function setBusy(busy) {
-    document.getElementById("move").disabled = busy;
+    // Never allow Cartesian movement after a failed XYZ/pitch validation.
+    document.getElementById("move").disabled = busy || !validTarget;
     document.getElementById("zero").disabled = busy;
     document.getElementById("autoMove").disabled = busy;
     document.getElementById("autoCurrent").disabled = busy;
@@ -458,9 +459,11 @@ async function validateTarget() {
         document.getElementById("ikStatus").textContent = "Reachable target in model.";
     } catch (error) {
         if (serial !== validationSerial) return;
-        restoreValidTarget();
+        // Keep the requested pitch/mode visible instead of silently
+        // returning to free mode after an unsuccessful angle check.
+        validTarget = null;
         document.getElementById("ikStatus").textContent =
-            "Unreachable position. Reverted: " + error.message;
+            "Unreachable XYZ / tool angle (movement disabled): " + error.message;
     } finally {
         if (serial === validationSerial) {
             validating = false;
