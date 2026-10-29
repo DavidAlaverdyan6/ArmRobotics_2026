@@ -11,7 +11,7 @@ import time
 BUTTON_HOLD_SECONDS = 0.3
 
 # Home is about (134, 0, 113) mm in arm_ik's current model. At X=134,
-# Z=-20 is not reachable in that model. X=160 permits lowering to Z=-20
+# Z=-40 is not reachable in that model. X=160 permits lowering to Z=-40
 # with only a small initial X displacement before the long X extension.
 LOWERING_X_MM = 160.0
 
