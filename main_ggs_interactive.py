@@ -11,15 +11,15 @@ SERIAL_PORT = '/dev/serial0'
 LOOP_DELAY = 0.04
 DIFF_KP = 30.0
 DIFF_TARGET = 0.08
-DIFF_BASE = 115
+DIFF_BASE = 100
 DIFF_MIN = -80
-DIFF_MAX = 185
+DIFF_MAX = 170
 REACQUIRE_TIME = 1.2
-REACQUIRE_SPEED = 90
+REACQUIRE_SPEED = 75
 BLACK_ON = 0.85
 BLACK_OFF = 0.65
 LINE_MIN = 0.20
-APPROACH_SPEED = 125
+APPROACH_SPEED = 120
 SLOW_SPEED = 95
 
 CANDIDATE_TIMEOUT = 0.35
@@ -27,6 +27,8 @@ JUNCTION_CONFIRM = 2
 JUNCTION_CLEAR = 4
 JUNCTION_COOLDOWN = 0.55
 LINE_LOST_TIMEOUT = 0.35
+STARTUP_DIFF_ONLY_SECONDS = 2.0  # test on a clear straight segment
+BUILD_ID = 'diff2-exact-start-v1'
 
 I2C_BUS = 1
 MPU_ADDR = 0x68
@@ -56,7 +58,7 @@ RETURN_RECOVERY_ANGLE = 12.0
 RETURN_RECOVERY_SAFE = 6.0
 RETURN_RECOVERY_TIMEOUT = 1.5
 RETURN_FORWARD_TIME = 0.3
-RETURN_FORWARD_SPEED = 115
+RETURN_FORWARD_SPEED = 110
 
 
 def clamp(n, lo, hi):
@@ -97,10 +99,13 @@ def differential_position(state):
 
 
 def differential_forward(pos, speed=DIFF_BASE):
+    # The same proportional controller and limits as differential2.py.
     error = pos - DIFF_TARGET
     correction = DIFF_KP * error
-    send(clamp(speed+correction, DIFF_MIN, DIFF_MAX),
-         clamp(speed-correction, DIFF_MIN, DIFF_MAX))
+    left = clamp(speed + correction, DIFF_MIN, DIFF_MAX)
+    right = clamp(speed - correction, DIFF_MIN, DIFF_MAX)
+    send(left, right)
+    return round(left), round(right)
 
 
 def reacquire_line(calibration, vision):
@@ -355,15 +360,15 @@ def main():
         bus = smbus.SMBus(I2C_BUS)
         gyro_setup(bus)
         board = telemetrix.Telemetrix(com_port=SERIAL_PORT)
+        motors.initialize(board)
+        motors_on = True
+        stop()
         line_tracker.initialize(board)
         tracker_on = True
         calibration = line_tracker.load_calibration()
         if calibration is None:
             print('Calibration missing. Run python calibrate.py first.')
             return
-        motors.initialize(board)
-        motors_on = True
-        stop()
         vision = Vision()
         sensor = VL53L0XSensor()
         sensor.initialize()
@@ -385,7 +390,9 @@ def main():
         if ready_frames < 5:
             print('START CANCELLED: no stable line. Motors remain stopped.')
             return
-        print('Robot ready: differential2 controller with target 0.08; prompts at junctions.')
+        print(f'RUNNING {__file__} / {BUILD_ID}')
+        print('First 2 s: differential2 ONLY, with junction detection temporarily bypassed.')
+        startup_deadline = time.monotonic() + STARTUP_DIFF_ONLY_SECONDS
         latched = False
         clear_count = junction_count = 0
         candidate_since = None
@@ -396,6 +403,16 @@ def main():
             pos = vision.position
             left,right = edges(bits)
             now = time.monotonic()
+            if now < startup_deadline:
+                if pos is None:
+                    stop()
+                    print('\rDIFF_ONLY: LINE LOST / MOTORS STOPPED', end='', flush=True)
+                else:
+                    left_pwm, right_pwm = differential_forward(pos, DIFF_BASE)
+                    print(f'\rDIFF_ONLY pos={pos:+.3f} L={left_pwm:+d} R={right_pwm:+d}',
+                          end='', flush=True)
+                time.sleep(LOOP_DELAY)
+                continue
             clear_count = clear_count+1 if not(left or right) else 0
             if clear_count >= JUNCTION_CLEAR:
                 latched = False
