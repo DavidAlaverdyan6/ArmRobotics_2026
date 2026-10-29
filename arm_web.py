@@ -122,7 +122,9 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
     <h1>ArmRobotics 2026</h1>
     <p class="muted">
         Cartesian XYZ is the closed-gripper tip in millimeters relative to the base model origin.
-        Move to target interpolates XYZ and tool pitch. Joint calibration is approximate.
+        The Cartesian slider changes the tool angle; automatic XYZ normally chooses its own angle.
+        Use Orientation lock below to hold a selected angle while moving in XYZ.
+        Joint calibration is approximate.
     </p>
 </header>
 
@@ -176,6 +178,35 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 </section>
 
 <section class="panel">
+    <h2>Tool orientation lock — both XYZ modes</h2>
+    <label style="display:block;margin-bottom:12px">
+        <input id="lockPitch" type="checkbox">
+        <strong>Maintain tool angle while moving in XYZ</strong>
+    </label>
+    <div class="control">
+        <label for="lockedPitchAngle">
+            <span>Tool angle relative to horizontal</span><strong id="lockedPitchValue">+90°</strong>
+        </label>
+        <input id="lockedPitchAngle" type="number" min="-180" max="180" step="1" value="90"
+               style="width:100%;background:#11151c;border:1px solid #53637a;color:#e8edf5;padding:10px;border-radius:7px">
+    </div>
+    <div class="buttons">
+        <button class="secondary" type="button" data-tool-pitch="0">Horizontal 0°</button>
+        <button class="secondary" type="button" data-tool-pitch="90">Vertical up +90°</button>
+        <button class="secondary" type="button" data-tool-pitch="-90">Vertical down −90°</button>
+    </div>
+    <p class="muted">
+        0° = gripper horizontal; +90° = pointing up; −90° = pointing down.
+        This is the tool direction in space, NOT the angle written to the wrist servo.
+        When enabled, the arm first changes to the selected orientation at its current
+        XYZ, then maintains it along the entire XYZ path, adjusting the wrist automatically.
+        If the starting pose or the path is physically unreachable, movement is rejected.
+        Manual servo sliders are not orientation-locked.
+    </p>
+    <p id="lockStatus" class="status">Free orientation: previous XYZ behavior is preserved.</p>
+</section>
+
+<section class="panel">
     <h2>Manual joint control</h2>
     <p class="muted">
         Manual controls move joints directly. They do not follow a Cartesian path.
@@ -199,7 +230,8 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
         <span style="--dot:#62a5ff">Base / shoulder</span>
         <span style="--dot:#65d6a6">Link 1</span>
         <span style="--dot:#ffbf69">Link 2</span>
-        <span style="--dot:#b79cff">Wrist / tool</span>\n        <span style="--dot:#ff6b6b">End point</span>
+        <span style="--dot:#b79cff">Wrist / tool</span>
+        <span style="--dot:#ff6b6b">End point</span>
     </div>
     <p id="modelStatus" class="status">Waiting for angle data…</p>
 </section>
@@ -218,6 +250,45 @@ const angles = {
 
 let debounce = null;
 let requestId = 0;
+
+function readOrientationSettings() {
+    const enabled = document.getElementById("lockPitch").checked;
+    const field = document.getElementById("lockedPitchAngle");
+    const pitch = Number(field.value);
+    if (enabled && (field.value.trim() === "" || !Number.isFinite(pitch) ||
+                    pitch < -180 || pitch > 180)) {
+        throw new Error("Enter a fixed tool angle between -180° and +180°.");
+    }
+    return enabled ? {lock_pitch: true, tool_pitch: pitch} : {lock_pitch: false};
+}
+
+function refreshOrientationDisplay() {
+    const locked = document.getElementById("lockPitch").checked;
+    const field = document.getElementById("lockedPitchAngle");
+    const angle = Number(field.value);
+    document.getElementById("lockedPitchValue").textContent =
+        (angle > 0 ? "+" : "") + field.value + "°";
+    document.getElementById("lockStatus").textContent = locked
+        ? "Orientation lock ON: " + angle + "° in world coordinates (subject to IK limits)."
+        : "Free orientation: previous XYZ behavior is preserved.";
+}
+
+document.getElementById("lockPitch").addEventListener("change", () => {
+    refreshOrientationDisplay();
+    scheduleValidation();
+});
+document.getElementById("lockedPitchAngle").addEventListener("input", () => {
+    refreshOrientationDisplay();
+    if (document.getElementById("lockPitch").checked) scheduleValidation();
+});
+document.querySelectorAll("[data-tool-pitch]").forEach(button => {
+    button.addEventListener("click", () => {
+        document.getElementById("lockedPitchAngle").value = button.dataset.toolPitch;
+        refreshOrientationDisplay();
+        if (document.getElementById("lockPitch").checked) scheduleValidation();
+    });
+});
+refreshOrientationDisplay();
 
 async function postJSON(path, data) {
     const response = await fetch(path, {
@@ -299,13 +370,14 @@ let validationTimer = null;
 let validating = false;
 
 function readTarget() {
-    return {
+    const target = {
         x: Number(document.getElementById("x").value),
         y: Number(document.getElementById("y").value),
         z: Number(document.getElementById("z").value),
         tool_pitch: Number(document.getElementById("pitch").value),
         elbow_up: document.getElementById("elbowUp").checked
     };
+    return {...target, ...readOrientationSettings()};
 }
 
 function displayTarget() {
@@ -327,11 +399,11 @@ function restoreValidTarget() {
 
 async function validateTarget() {
     const serial = ++validationSerial;
-    const target = readTarget();
     validating = true;
     setBusy(true);
     document.getElementById("ikStatus").textContent = "Checking reachability...";
     try {
+        const target = readTarget();
         await postJSON("/api/ik/check", target);
         if (serial !== validationSerial) return;
         validTarget = target;
@@ -393,14 +465,6 @@ document.getElementById("zero").addEventListener("click", async () => {
 
 document.getElementById("move").addEventListener("click", async () => {
     const status = document.getElementById("ikStatus");
-    const target = {
-        x: Number(document.getElementById("x").value),
-        y: Number(document.getElementById("y").value),
-        z: Number(document.getElementById("z").value),
-        tool_pitch: Number(document.getElementById("pitch").value),
-        elbow_up: document.getElementById("elbowUp").checked
-    };
-
     if (validating || !validTarget) {
         status.textContent = "Wait for coordinate validation or load current XYZ.";
         return;
@@ -409,7 +473,7 @@ document.getElementById("move").addEventListener("click", async () => {
     status.textContent = "Planning and checking the path...";
 
     try {
-        const result = await postJSON("/api/ik", target);
+        const result = await postJSON("/api/ik", readTarget());
 
         for (const name of ["base", "shoulder", "elbow", "wrist"]) {
             angles[name] = result.angles[name];
@@ -456,7 +520,7 @@ document.getElementById("autoMove").addEventListener("click", async () => {
     status.textContent = "Searching for reachable arm pose...";
     try {
         const result = await postJSON("/api/auto", {
-            x: xyz[0], y: xyz[1], z: xyz[2]
+            x: xyz[0], y: xyz[1], z: xyz[2], ...readOrientationSettings()
         });
         for (const name of ["base", "shoulder", "elbow", "wrist"]) {
             angles[name] = result.angles[name];
@@ -575,7 +639,12 @@ function renderArmModel(a) {
         "Base " + a.base + "° · Shoulder " + a.shoulder +
         "° · Elbow " + a.elbow + "° · Endpoint relative to base: X " +
         points[3].x.toFixed(1) + " mm, Y " + points[3].y.toFixed(1) +
-        " mm, Z " + points[3].z.toFixed(1) + " mm.";
+        " mm, Z " + points[3].z.toFixed(1) +
+        " mm · Tool pitch " +
+        ((Math.atan2(points[3].z - points[2].z,
+                     Math.hypot(points[3].x - points[2].x,
+                                points[3].y - points[2].y))) * 180 / Math.PI).toFixed(1) +
+        "° (model).";
 }
 
 async function refreshModel() {
@@ -616,7 +685,119 @@ def get_current_angles():
     }
 
 
+def get_current_tool_pitch():
+    """Absolute tool pitch in degrees; 0 horizontal, +90 up, -90 down."""
+    angles = get_current_angles()
+    q2 = (
+        170.0 + (angles["shoulder"] - 180.0)
+        - 120.0 - (angles["elbow"] - 180.0)
+    )
+    return q2 - 50.0 + (angles["wrist"] - 20.0) * (90.0 / 124.0)
+
+
+def plan_locked_pitch_path(target):
+    """Plan a fixed-world-angle XYZ move, with all IK prechecked before motion.
+
+    Stage 1: change tool pitch at the current XYZ, keeping the tip in place.
+    Stage 2: move tip on a Cartesian XYZ line with the target pitch fixed.
+
+    The arm cannot hold an arbitrary pitch at every XYZ: fail safely rather
+    than silently choosing a different pitch. Neither this planner nor the
+    normal planner checks collisions, nor is there servo position feedback.
+    """
+    x, y, z = (float(target[k]) for k in ("x", "y", "z"))
+    pitch = float(target["tool_pitch"])
+    if not all(math.isfinite(v) for v in (x, y, z, pitch)):
+        raise IKError("XYZ and fixed tool pitch must be finite.")
+    if not -180.0 <= pitch <= 180.0:
+        raise IKError("Fixed tool pitch must be between -180 and +180 degrees.")
+
+    x0, y0, z0 = get_current_xyz()
+    pitch0 = get_current_tool_pitch()
+    current = get_current_angles()
+    branches = (
+        [bool(target["elbow_up"])]
+        if "elbow_up" in target
+        else [False, True]
+    )
+
+    # Interpolating just the pitch at current XYZ prevents the gripper from
+    # immediately jumping to a different direction before the XYZ movement.
+    pitch_steps = max(1, math.ceil(abs(pitch - pitch0) / 2.0))
+    travel_mm = math.sqrt((x - x0)**2 + (y - y0)**2 + (z - z0)**2)
+    xyz_steps = max(MOVE_STEPS, math.ceil(travel_mm / 6.0))
+    feasible = []
+    problems = []
+
+    for elbow_up in branches:
+        path = []
+        try:
+            # First reorient at the stationary tip position. Omit this stage
+            # if the arm is already pointing at the selected angle.
+            if abs(pitch - pitch0) > 0.2:
+                for i in range(1, pitch_steps + 1):
+                    t = i / pitch_steps
+                    p = pitch0 + (pitch - pitch0) * t
+                    q = inverse_kinematics(
+                        x0, y0, z0, tool_pitch=p, elbow_up=elbow_up
+                    )
+                    path.append({
+                        name: getattr(q, name) for name in IK_JOINTS
+                    })
+
+            # Then move the tip while holding the tool in the same direction.
+            for i in range(1, xyz_steps + 1):
+                t = i / xyz_steps
+                q = inverse_kinematics(
+                    x0 + (x - x0) * t,
+                    y0 + (y - y0) * t,
+                    z0 + (z - z0) * t,
+                    tool_pitch=pitch,
+                    elbow_up=elbow_up,
+                )
+                path.append({
+                    name: getattr(q, name) for name in IK_JOINTS
+                })
+
+            # Ensure no angle-space discontinuity would cause a large jerk.
+            previous = current
+            max_delta = 0.0
+            for pose in path:
+                delta = max(
+                    abs(float(pose[n]) - float(previous[n]))
+                    for n in IK_JOINTS
+                )
+                max_delta = max(max_delta, delta)
+                previous = pose
+            if max_delta > 12.0:
+                raise IKError(
+                    "Locked-pitch path has a servo jump of "
+                    f"{max_delta:.1f}°. Reposition the arm first."
+                )
+
+            score = sum(
+                (float(path[0][n]) - float(current[n]))**2
+                for n in IK_JOINTS
+            )
+            feasible.append((score, path))
+        except IKError as error:
+            problems.append(str(error))
+
+    if not feasible:
+        problem = problems[0] if problems else "No feasible path."
+        raise IKError(
+            f"Cannot maintain tool pitch {pitch:+g}° for this XYZ path: "
+            f"{problem} Try a different angle (0° is horizontal), "
+            "or disable Orientation lock."
+        )
+
+    return min(feasible, key=lambda item: item[0])[1]
+
+
 def plan_cartesian_path(target):
+    if target.get("lock_pitch", False):
+        return plan_locked_pitch_path(target)
+
     start_x, start_y, start_z = get_current_xyz()
 
     target_x = float(target["x"])
@@ -655,11 +836,15 @@ def plan_cartesian_path(target):
 
 
 def plan_auto_path(target):
-    """Find a reachable tool pitch and interpolate servo angles to the pose.
+    """Find a free tool pitch, or respect a requested fixed pitch in XYZ mode.
 
-    This deliberately does not guarantee straight-line Cartesian travel.
-    It cannot detect collisions or mechanical interference.
+    The free planner deliberately does not guarantee straight-line travel.
+    Both modes require mechanical clearance checks by the operator.
     """
+    if target.get("lock_pitch", False):
+        path = plan_locked_pitch_path(target)
+        return path, float(target["tool_pitch"])
+
     x, y, z = (float(target[k]) for k in ("x", "y", "z"))
     if not all(math.isfinite(v) for v in (x, y, z)):
         raise IKError("XYZ must be finite.")
@@ -762,6 +947,7 @@ class Handler(BaseHTTPRequestHandler):
                         "connected": True,
                         "angles": get_current_angles(),
                         "xyz": get_current_xyz(),
+                        "tool_pitch": get_current_tool_pitch(),
                     })
             return
 
