@@ -147,7 +147,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
     </div>
 
     <div class="control">
-        <label for="pitch"><span>Tool pitch</span><strong id="pitchValue">0</strong></label>
+        <label for="pitch"><span>Tool pitch at destination (without lock)</span><strong id="pitchValue">0</strong></label>
         <input id="pitch" type="range" min="-90" max="90" value="0" step="1">
     </div>
 
@@ -166,7 +166,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 <section class="panel">
     <h2>Automatic XYZ destination</h2>
-    <p class="muted">Enter the closed-gripper tip position in mm. The arm chooses the wrist angle and a joint-space route. The tip may follow a curved path.</p>
+    <p class="muted">Enter gripper-tip XYZ in mm. By default the arm chooses its own tool angle and a curved joint-space route. With Orientation lock enabled, the selected fixed angle is used instead, and the XYZ route is prechecked.</p>
     <div class="control"><label for="autoX">X (mm)</label><input id="autoX" type="number" min="-415" max="415" step="1" value="0"></div>
     <div class="control"><label for="autoY">Y (mm)</label><input id="autoY" type="number" min="-415" max="415" step="1" value="0"></div>
     <div class="control"><label for="autoZ">Z (mm)</label><input id="autoZ" type="number" min="-415" max="415" step="1" value="0"></div>
