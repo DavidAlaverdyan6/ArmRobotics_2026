@@ -13,6 +13,10 @@ BUTTON_HOLD_SECONDS = 0.3
 BUTTON_START_X_MM = 250.0
 BUTTON_START_Z_MM = 100.0
 BUTTON_TOOL_PITCH = 0.0
+# On the button press, lower Z early instead of driving X forward first.
+# Wrist compensation keeps the tool horizontal throughout the joint-space path.
+BUTTON_SHOULDER_PROGRESS_POWER = 0.65
+BUTTON_ELBOW_PROGRESS_POWER = 1.8
 
 
 def _execute_plan(arm, path, delay):
@@ -49,12 +53,83 @@ def _return_home(arm, home, max_step_deg, delay):
     arm.write(gripper=home["gripper"])
 
 
-def plan_button_paths(arm_web, x, y, z):
-    """Preflight every segment with horizontal tool pitch before moving.
 
-    Move directly between the two poses by simultaneous joint interpolation.
-    The tip follows a curve, not a straight XYZ line. Since tool pitch is
-    affine in these servo angles, equal endpoint pitches stay equal throughout.
+def _plan_early_z_press_path(arm_web, target):
+    """Lower the tip earlier on the direct staging-to-button transition.
+
+    Use unequal smooth progress for shoulder and elbow. This makes Z descend
+    sooner while X advances more gradually, without introducing a separate
+    stop/waypoint. Compensate at the wrist to keep the existing tool pitch.
+    All servo poses and the maximum angular step are checked before moving.
+    """
+    from arm_ik import WRIST_DEGREES_PER_SERVO
+
+    current = arm_web.get_current_angles()
+    # Let the tested arm_web IK choose a feasible final pose, as before.
+    final = arm_web.plan_target_pitch_path(target)[-1]
+    joints = arm_web.IK_JOINTS
+    max_step = arm_web.AUTO_MAX_STEP_DEG
+    steps = max(
+        arm_web.MOVE_STEPS,
+        math.ceil(max(abs(final[n] - current[n]) for n in joints) / max_step),
+    )
+
+    while steps <= 320:
+        path = []
+        previous = current
+        within_step_limit = True
+        for index in range(1, steps + 1):
+            t = index / steps
+            smooth = t * t * (3.0 - 2.0 * t)
+            shoulder_t = smooth ** BUTTON_SHOULDER_PROGRESS_POWER
+            elbow_t = smooth ** BUTTON_ELBOW_PROGRESS_POWER
+
+            shoulder = current["shoulder"] + (
+                final["shoulder"] - current["shoulder"]
+            ) * shoulder_t
+            elbow = current["elbow"] + (
+                final["elbow"] - current["elbow"]
+            ) * elbow_t
+            # tool_pitch = shoulder - elbow + calibrated wrist contribution.
+            wrist = current["wrist"] + (
+                (elbow - current["elbow"]) -
+                (shoulder - current["shoulder"])
+            ) / WRIST_DEGREES_PER_SERVO
+            pose = {
+                "base": current["base"] + (
+                    final["base"] - current["base"]
+                ) * smooth,
+                "shoulder": shoulder,
+                "elbow": elbow,
+                "wrist": wrist,
+            }
+            if index == steps:
+                pose = dict(final)
+
+            if any(not 0.0 <= pose[n] <= 180.0 for n in joints):
+                raise arm_web.IKError(
+                    "Button press would exceed a servo limit; arm not moved."
+                )
+            if max(abs(pose[n] - previous[n]) for n in joints) > max_step:
+                within_step_limit = False
+                break
+            path.append({n: round(pose[n], 2) for n in joints})
+            previous = pose
+
+        if within_step_limit:
+            return path
+        steps *= 2
+
+    raise arm_web.IKError(
+        "Cannot plan the early-Z button press within safe servo step limits."
+    )
+
+
+def plan_button_paths(arm_web, x, y, z):
+    """Preflight staging and direct early-Z button press at horizontal pitch.
+
+    The second stage is continuous joint-space motion (not a straight XYZ
+    line). The wrist is compensated to keep the tip horizontal.
     """
     targets = [
         (BUTTON_START_X_MM, 0.0, BUTTON_START_Z_MM),
@@ -65,11 +140,11 @@ def plan_button_paths(arm_web, x, y, z):
     paths = []
     try:
         for index, (tx, ty, tz) in enumerate(targets):
-            planner = (arm_web.plan_locked_pitch_path if index == 0
-                       else arm_web.plan_target_pitch_path)
-            path = planner({
+            target = {
                 "x": tx, "y": ty, "z": tz, "tool_pitch": BUTTON_TOOL_PITCH,
-            })
+            }
+            path = (arm_web.plan_locked_pitch_path(target) if index == 0
+                    else _plan_early_z_press_path(arm_web, target))
             paths.append(path)
             for name, angle in path[-1].items():
                 getattr(arm, name).angle = float(angle)
@@ -80,7 +155,7 @@ def plan_button_paths(arm_web, x, y, z):
 
 
 def move_to_xyz_and_home(board, x, y, z):
-    """Horizontal tool: staging point, simultaneous forward/down move, then home."""
+    """Horizontal tool: staging, early-Z continuous press, then home."""
     x, y, z = map(float, (x, y, z))
     if not all(math.isfinite(v) for v in (x, y, z)):
         raise ValueError("XYZ coordinates must be finite.")
@@ -95,7 +170,7 @@ def move_to_xyz_and_home(board, x, y, z):
     time.sleep(0.6)
     paths = plan_button_paths(arm_web, x, y, z)
 
-    print("ARM: horizontal tool, (250, 0, 100) directly to target, moving forward and down.")
+    print("ARM: horizontal tool; from (250, 0, 100) Z descends early while X advances.")
     for path in paths:
         _execute_plan(arm, path, arm_web.STEP_DELAY)
     print(f"ARM: button target ({x:g}, {y:g}, {z:g}) commanded. Holding...")
