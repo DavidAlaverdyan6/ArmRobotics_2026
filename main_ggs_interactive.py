@@ -92,7 +92,7 @@ FIRE_FINAL_RIGHT_ANGLE = 90.0
 # Example: ROUTE = ["L", "S", "B", "R", "C", "F", "Q"]
 # The commented entries below are placeholders: edit them before launching.
 ROUTE = [
-    "F",
+    "B",
     "L",
     "R",
     "S",
