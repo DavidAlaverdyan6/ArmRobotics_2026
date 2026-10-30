@@ -3,7 +3,7 @@
 
 from pins import (
     PA0, PA1, PA2, PA3, PA4, PA5, PA6, PA7, PA8,
-    PB3, PB4, PB5, PB6, PB7, PB8, PB9, PB12, PB13, PB14, PB15,
+    PA12, PB0, PB5, PB6, PB7, PB8, PB9, PB12, PB13, PB14, PB15,
     PC13, PC15,
 )
 
@@ -43,7 +43,8 @@ servo_gripper = PA8
 SERVOS = (servopan, servotilt, servo3, servo4, servo_gripper)
 
 # ── Other hardware ──
-fire_sensor = PC15
+fire_sensor = PB0
+pump = PA12
 
 LED_RED = 17
 LED_GREEN = 27

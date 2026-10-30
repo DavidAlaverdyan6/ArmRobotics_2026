@@ -10,7 +10,7 @@ from pins import (
     PA4,
     PA5,
     PA6,
-    PA7
+    PB0
 )
 
 
@@ -19,7 +19,7 @@ from pins import (
 # ============================================================
 
 SENSOR_PINS = [
-    PA7,
+    PB0,
     PA6,
     PA5,
     PA4,

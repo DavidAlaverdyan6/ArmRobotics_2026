@@ -13,8 +13,8 @@ from sensors.vl53l0x_sensor import VL53L0XSensor
 
 # Previously tested differential2 line-following speeds.
 SERIAL_PORT = "/dev/serial0"
-BASE_SPEED = 100
-MAX_SPEED = 170
+BASE_SPEED = 110
+MAX_SPEED = 180
 MIN_SPEED = -80
 MANEUVER_SPEED = 100
 MANEUVER_MAX_SPEED = 170
@@ -94,12 +94,13 @@ ROUTE = [
     "R",
     "L",
     "P",
-    "R",
     "S",
     "R",
-    "L",
+    "S",
     "L",
     "R",
+    "R",
+    "L",
     "Q",
 ]
 ALLOWED_ROUTE_COMMANDS = {"L", "R", "S", "B", "P", "Q"}
