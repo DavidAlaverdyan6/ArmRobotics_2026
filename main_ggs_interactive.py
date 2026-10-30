@@ -85,11 +85,10 @@ BUTTON_FINAL_RIGHT_ANGLE = 90.0
 FIRE_APPROACH_SPEED = 70
 FIRE_APPROACH_MAX_SPEED = 100
 FIRE_APPROACH_TIMEOUT = 12.0
-FIRE_WRIST_ANGLE = 40.0
 FIRE_FINAL_RIGHT_ANGLE = 90.0
 
 # Automatic route: one entry for each detected junction, in order.
-# L=left, R=right, S=straight, B=press button, C=charging, F=firefighter (P is a legacy alias), Q=stop.
+# L=left, R=right, S=straight, B=press button, C=charging, F=firefighter, Q=stop.
 # Example: ROUTE = ["L", "S", "B", "R", "C", "F", "Q"]
 # The commented entries below are placeholders: edit them before launching.
 ROUTE = [
@@ -109,7 +108,7 @@ ROUTE = [
     "L",
     "Q",
 ]
-ALLOWED_ROUTE_COMMANDS = {"L", "R", "S", "B", "C", "F", "P", "Q"}
+ALLOWED_ROUTE_COMMANDS = {"L", "R", "S", "B", "C", "F", "Q"}
 
 
 def clamp(value, low, high):
@@ -528,35 +527,47 @@ def button_arm_action(board):
 
 
 def firefighter_task(calibration, detector, bus, offset, board):
-    """Left branch, flame approach, 5 s water, reverse, then right turn."""
-    from firefighter import Firefighter
+    """Left turn, stationary arm pose, confirmed flame, at most two sprays."""
+    from firefighter import Firefighter, firefighting_pose
     from roboarm import RoboArm
-    from arm_web import START_ANGLES
+    from arm_web import START_ANGLES, AUTO_MAX_STEP_DEG, STEP_DELAY
+    from button_arm import _return_home
 
     fire = Firefighter(board)
     stop()
     try:
+        pose = {**START_ANGLES, **firefighting_pose()}
         fire.initialize()
-        arm = RoboArm(board)
-        arm.write(**{**START_ANGLES, "wrist": FIRE_WRIST_ANGLE})
-        time.sleep(0.6)
-        # Check reporting before moving. No zero-filled sensor placeholders.
-        fire.detected()
-
+        fire.wait_for_sample()
         print("\nF: turn LEFT.")
         ok, left_sign = pivot(bus, offset, "L")
         if not ok or left_sign is None:
             return False
 
-        # Approach directly at the slow F speed, checking the flame on every
-        # iteration (a separate moving reacquire could overshoot the candle).
+        # No forward movement until arm positioning completes.
+        stop()
+        arm = RoboArm(board)
+        arm.write(**START_ANGLES)
+        time.sleep(0.6)
+        _return_home(arm, pose, AUTO_MAX_STEP_DEG, STEP_DELAY)
+        time.sleep(0.3)
+
         deadline = time.monotonic() + FIRE_APPROACH_TIMEOUT
         while time.monotonic() < deadline:
             if fire.detected():
                 stop()
-                print("\nF: flame detected. Water ON for 5 seconds.")
-                fire.spray()
-                break
+                if fire.confirm_flame():
+                    print("\nF: flame confirmed for 1 second. Water ON.")
+                    fire.spray()
+                    # Discard reports taken during spraying. Keep the input
+                    # subscribed: there is no sensor power-control pin.
+                    fire.wait_for_sample(after=time.monotonic())
+                    if fire.confirm_flame():
+                        print("\nF: flame remains. Second and final 5 s spray.")
+                        fire.spray()
+                    break
+                # A transient signal must not trigger the pump.
+                continue
             state = line_tracker.update(calibration)
             if not differential_drive(
                 state, speed=FIRE_APPROACH_SPEED,
@@ -569,7 +580,8 @@ def firefighter_task(calibration, detector, bus, offset, board):
             print("\nF: flame approach timeout.")
             return False
 
-        # Reuse the tested button reverse behavior and gyro limits.
+        stop()
+        _return_home(arm, START_ANGLES, AUTO_MAX_STEP_DEG, STEP_DELAY)
         if not button_return(calibration, detector, bus, offset, left_sign):
             return False
         if not follow_for(calibration, RETURN_FORWARD_TIME):
@@ -650,7 +662,7 @@ def load_route():
         if cmd not in ALLOWED_ROUTE_COMMANDS:
             raise ValueError(
                 f"Invalid ROUTE entry #{index}: {command!r}. "
-                "Allowed: L, R, S, B, C, F, P (legacy C), Q."
+                "Allowed: L, R, S, B, C, F, Q."
             )
         if cmd == "Q" and index != len(ROUTE):
             raise ValueError("Q must be the last ROUTE entry.")
@@ -848,7 +860,7 @@ def main():
                     print("ROUTE: stop command.")
                     break
 
-                if cmd in ("L", "R", "B", "C", "P", "F"):
+                if cmd in ("L", "R", "B", "C", "F"):
                     # Gyro stays unloaded until a maneuver requires it.
                     if bus is None:
                         bus = smbus.SMBus(I2C_BUS)
@@ -866,7 +878,7 @@ def main():
                         ok = firefighter_task(
                             calibration, detector, bus, offset, board
                         )
-                    elif cmd in ("C", "P"):
+                    elif cmd == "C":
                         ok = charging_task()
                         if ok:
                             # Same 80-degree R turn and differential reacquire.
