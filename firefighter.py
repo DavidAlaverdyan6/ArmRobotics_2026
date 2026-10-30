@@ -4,10 +4,10 @@ import time
 
 import robot_pin_config as pins
 
-# STM32 firmware uses 12-bit ADC readings. Verify these two settings with
-# the actual flame sensor: its output type/polarity is not documented in repo.
+# STM32 firmware uses 12-bit ADC readings. Hardware observation:
+# 0 means no flame; readings of 2000-2500 indicate flame (active-high).
 FIRE_THRESHOLD = 2000
-FIRE_ACTIVE_LOW = True
+FIRE_ACTIVE_LOW = False
 SENSOR_MAX_AGE = 0.5
 WATER_SECONDS = 5.0
 FLAME_CONFIRM_SECONDS = 1.0
