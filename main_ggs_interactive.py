@@ -54,11 +54,11 @@ TURN_ANGLE = 80.0
 TURN_PWM_FAST = 255
 TURN_PWM_SLOW = 90
 
-BUTTON_DISTANCE_CM = 40.0
+BUTTON_DISTANCE_CM = 45.0
 # Button tip target (mm, arm_web coordinate system). Arm moves in two stages.
 BUTTON_X_MM = 350.0
 BUTTON_Y_MM = 0.0
-BUTTON_Z_MM = -100.0
+BUTTON_Z_MM = -80.0
 
 # Charging: 9 s red blink, then 2 s solid green; total 11 s before R.
 CHARGE_SECONDS = 11.0
@@ -85,7 +85,7 @@ BUTTON_FINAL_RIGHT_ANGLE = 90.0
 FIRE_APPROACH_SPEED = 70
 FIRE_APPROACH_MAX_SPEED = 100
 FIRE_APPROACH_TIMEOUT = 12.0
-FIRE_FINAL_RIGHT_ANGLE = 90.0
+FIRE_FINAL_RIGHT_ANGLE = 85.0
 
 # Automatic route: one entry for each detected junction, in order.
 # L=left, R=right, S=straight, B=press button, C=charging, F=firefighter, Q=stop.
@@ -330,7 +330,7 @@ def follow_for(calibration, seconds):
 
 
 def button_approach(calibration, detector, sensor):
-    """Follow line to 40 cm from the button, then stop for the arm task."""
+    """Follow line to 45 cm from the button, then stop for the arm task."""
     start = time.monotonic()
     cleared_count = 0
     left_initial_junction = False
