@@ -11,36 +11,18 @@ FIRE_ACTIVE_LOW = False
 SENSOR_MAX_AGE = 0.5
 WATER_SECONDS = 5.0
 FLAME_CONFIRM_SECONDS = 1.0
-SENSOR_WAIT_TIMEOUT = 2.0
+SENSOR_WAIT_REPORT_SECONDS = 2.0
 POLL_SECONDS = 0.02
 
 
-# Gripper-tip target in the robot's arm_web coordinate system (mm).
-FIRE_TARGET_X_MM = 300.0
-FIRE_TARGET_Y_MM = 0.0
-FIRE_TARGET_Z_MM = 130.0
-FIRE_TOOL_PITCH_DEG = -15.0
-
-
 def firefighting_pose():
-    """Solve the F position with the tip pointing 15 degrees below horizontal.
-
-    The tool direction is fixed at the target and while the robot approaches
-    the flame. The movement from home to this pose is joint-interpolated;
-    it does not keep a constant tool pitch during that transition.
-    """
-    from arm_ik import inverse_kinematics
-
-    solution = inverse_kinematics(
-        FIRE_TARGET_X_MM,
-        FIRE_TARGET_Y_MM,
-        FIRE_TARGET_Z_MM,
-        tool_pitch=FIRE_TOOL_PITCH_DEG,
-        elbow_up=False,
-    )
+    """Servo angles for the F task, including the closed gripper."""
     return {
-        name: getattr(solution, name)
-        for name in ("base", "shoulder", "elbow", "wrist")
+        "base": 90,
+        "shoulder": 90,
+        "elbow": 160,
+        "wrist": 70,
+        "gripper": 180,
     }
 
 
@@ -69,7 +51,7 @@ class Firefighter:
     def detected(self):
         sample = self.sample
         if sample is None or time.monotonic() - sample[1] > SENSOR_MAX_AGE:
-            raise RuntimeError("F: flame sensor has no fresh reading")
+            return None
         value = sample[0]
         return value <= FIRE_THRESHOLD if FIRE_ACTIVE_LOW else value >= FIRE_THRESHOLD
 
@@ -77,21 +59,26 @@ class Firefighter:
         self.board.digital_write(pins.pump, 0)
 
     def wait_for_sample(self, after=None):
-        deadline = time.monotonic() + SENSOR_WAIT_TIMEOUT
-        while time.monotonic() < deadline:
+        """Wait without a deadline; callers keep the drive stopped meanwhile."""
+        last_report = time.monotonic()
+        while True:
             sample = self.sample
+            now = time.monotonic()
             if (sample is not None
                     and (after is None or sample[1] > after)
-                    and time.monotonic() - sample[1] <= SENSOR_MAX_AGE):
+                    and now - sample[1] <= SENSOR_MAX_AGE):
                 return
+            if now - last_report >= SENSOR_WAIT_REPORT_SECONDS:
+                print("F: waiting for a fresh flame sensor reading; motors stopped.")
+                last_report = now
             time.sleep(POLL_SECONDS)
-        raise RuntimeError("F: timed out waiting for a new flame reading")
 
     def confirm_flame(self):
         """Require one uninterrupted second of flame while the base is stopped."""
         start = time.monotonic()
         while True:
-            if not self.detected():
+            # Missing or stale reports cannot count toward confirmation.
+            if self.detected() is not True:
                 return False
             if time.monotonic() - start >= FLAME_CONFIRM_SECONDS:
                 return True

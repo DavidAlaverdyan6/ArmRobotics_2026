@@ -56,3 +56,17 @@ class RoboArm:
 
     def open_gripper(self):
         self.gripper.write(0)
+
+
+_shared_board = None
+_shared_arm = None
+
+
+def get_shared_arm(board):
+    """Attach servos once per Telemetrix board and retain commanded angles."""
+    global _shared_board, _shared_arm
+    if _shared_arm is not None and _shared_board is board:
+        return _shared_arm, False
+    _shared_arm = RoboArm(board)
+    _shared_board = board
+    return _shared_arm, True

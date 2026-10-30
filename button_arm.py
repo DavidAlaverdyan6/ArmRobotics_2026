@@ -161,12 +161,17 @@ def move_to_xyz_and_home(board, x, y, z):
         raise ValueError("XYZ coordinates must be finite.")
 
     import arm_web
-    from roboarm import RoboArm
+    from roboarm import get_shared_arm
 
-    arm = RoboArm(board)
+    arm, newly_attached = get_shared_arm(board)
     home = dict(arm_web.START_ANGLES)
+    home["gripper"] = 180
     arm_web.arm = arm
-    arm.write(**home)
+    if newly_attached:
+        arm.write(**home)
+    else:
+        _return_home(arm, home, arm_web.AUTO_MAX_STEP_DEG,
+                     arm_web.STEP_DELAY)
     time.sleep(0.6)
     paths = plan_button_paths(arm_web, x, y, z)
 

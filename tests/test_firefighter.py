@@ -28,8 +28,7 @@ def load_navigation():
 class FireTests(unittest.TestCase):
     def test_samples_and_staleness(self):
         fire = hardware.Firefighter(Mock())
-        with self.assertRaises(RuntimeError):
-            fire.detected()
+        self.assertIsNone(fire.detected())
         with patch.object(hardware.time, 'monotonic', return_value=10):
             for value, expected in ((0, False), (1999, False),
                                     (2000, True), (2500, True), (4095, True)):
@@ -38,8 +37,7 @@ class FireTests(unittest.TestCase):
             with patch.object(hardware, 'FIRE_ACTIVE_LOW', True):
                 self.assertFalse(fire.detected())
         with patch.object(hardware.time, 'monotonic', return_value=11):
-            with self.assertRaises(RuntimeError):
-                fire.detected()
+            self.assertIsNone(fire.detected())
 
     def test_water_duration_and_interrupt(self):
         for error in (None, KeyboardInterrupt()):
@@ -56,13 +54,18 @@ class FireTests(unittest.TestCase):
                              [(hardware.pins.pump, 1), (hardware.pins.pump, 0)])
 
     def test_task_order_and_failure(self):
-        for line_ok, still_burning in ((True, False), (True, True), (False, False)):
+        for line_ok, still_burning, arm_reused in (
+            (True, False, False),
+            (True, True, True),
+            (False, False, True),
+        ):
             nav = load_navigation()
             events = []
             fire = Mock()
             fire.detected.side_effect = [False, True]
             fire.confirm_flame.side_effect = [True, still_burning]
             fire.spray.side_effect = lambda: events.append('water')
+            fire.wait_for_sample.side_effect = lambda *args, **kwargs: events.append('sample')
             arm = Mock()
             home = {'base': 90, 'shoulder': 180, 'elbow': 180,
                     'wrist': 40, 'gripper': 180}
@@ -77,7 +80,8 @@ class FireTests(unittest.TestCase):
             move = Mock(side_effect=lambda arm, pose, *a: events.append(
                 'home' if pose == home else 'pose'))
             with patch.dict(sys.modules, {
-                'roboarm': types.SimpleNamespace(RoboArm=Mock(return_value=arm)),
+                'roboarm': types.SimpleNamespace(
+                    get_shared_arm=Mock(return_value=(arm, not arm_reused))),
                 'arm_web': types.SimpleNamespace(START_ANGLES=home,
                     AUTO_MAX_STEP_DEG=2, STEP_DELAY=0.03),
                 'button_arm': types.SimpleNamespace(_return_home=move),
@@ -87,6 +91,12 @@ class FireTests(unittest.TestCase):
             fire.off.assert_called_once()
             self.assertLess(events.index('L'), events.index('pose'))
             self.assertLess(events.index('pose'), events.index('drive'))
+            self.assertIn('sample', events[events.index('pose') + 1:events.index('drive')])
+            if arm_reused:
+                self.assertLess(events.index('home'), events.index('pose'))
+                arm.write.assert_not_called()
+            else:
+                arm.write.assert_called_once_with(**home)
             if line_ok:
                 self.assertEqual(fire.spray.call_count, 2 if still_burning else 1)
                 self.assertLess(events.index('home'), events.index('reverse'))
@@ -112,21 +122,25 @@ class FireTests(unittest.TestCase):
             self.assertGreater(fire.sample[1], now)
             with patch.object(fire, 'detected', side_effect=[True, True, False]):
                 self.assertFalse(fire.confirm_flame())
-            with patch.object(hardware.time, 'sleep', side_effect=lambda dt: clock.__setitem__(0, clock[0]+dt)):
-                with self.assertRaises(RuntimeError):
-                    fire.wait_for_sample(after=clock[0])
+            with patch.object(fire, 'detected', return_value=None):
+                self.assertFalse(fire.confirm_flame())
+            start = clock[0]
+            def delayed_sample(dt):
+                clock[0] += dt
+                if clock[0] >= start + 3.0:
+                    fire.sample = (0, clock[0])
+            with patch.object(hardware.time, 'sleep', side_effect=delayed_sample):
+                fire.wait_for_sample(after=start)
+            self.assertGreaterEqual(clock[0] - start, 3.0)
 
-    def test_photo_pose(self):
-        from arm_ik import forward_kinematics
-        pose = hardware.firefighting_pose()
-        self.assertEqual(pose['base'], 90)
-        self.assertEqual(pose['shoulder'], 100)
-        self.assertEqual(pose['elbow'], 140)
-        self.assertAlmostEqual(pose['wrist'], 40.67, places=2)
-        x,y,z = forward_kinematics(**pose)
-        self.assertAlmostEqual(x, 277, delta=1)
-        self.assertAlmostEqual(z, 67, delta=1)
-        self.assertAlmostEqual(y, 0)
+    def test_firefighting_pose(self):
+        self.assertEqual(hardware.firefighting_pose(), {
+            'base': 90,
+            'shoulder': 90,
+            'elbow': 160,
+            'wrist': 70,
+            'gripper': 180,
+        })
 
     def test_route_commands(self):
         nav = load_navigation()

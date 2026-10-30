@@ -8,6 +8,17 @@ from arm_ik import forward_kinematics
 
 
 class ButtonPathTests(unittest.TestCase):
+    def test_shared_arm_attaches_servos_only_once(self):
+        from roboarm import get_shared_arm
+
+        board = Mock()
+        first, newly_attached = get_shared_arm(board)
+        second, attached_again = get_shared_arm(board)
+        self.assertTrue(newly_attached)
+        self.assertFalse(attached_again)
+        self.assertIs(first, second)
+        self.assertEqual(board.set_pin_mode_servo.call_count, 5)
+
     def test_horizontal_path_and_preflight(self):
         with patch.dict(sys.modules, {'telemetrix': types.SimpleNamespace(telemetrix=Mock())}):
             import arm_web as web
