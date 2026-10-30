@@ -60,10 +60,10 @@ BUTTON_X_MM = 250.0
 BUTTON_Y_MM = 0.0
 BUTTON_Z_MM = -40.0
 
-# Parking: 9 s red blink, then 2 s solid green; total 11 s before R.
-PARK_SECONDS = 11.0
-PARK_RED_SECONDS = 9.0
-PARK_BLINK_HALF_PERIOD = 0.5
+# Charging: 9 s red blink, then 2 s solid green; total 11 s before R.
+CHARGE_SECONDS = 11.0
+CHARGE_RED_SECONDS = 9.0
+CHARGE_BLINK_HALF_PERIOD = 0.5
 BUTTON_MAX_TIME = 12.0
 BUTTON_CONFIRM = 3
 BUTTON_CLEAR_TIMEOUT = 3.0
@@ -82,9 +82,15 @@ RETURN_RECOVERY_TIMEOUT = 1.5
 RETURN_FORWARD_TIME = 0.3
 BUTTON_FINAL_RIGHT_ANGLE = 90.0
 
+FIRE_APPROACH_SPEED = 70
+FIRE_APPROACH_MAX_SPEED = 100
+FIRE_APPROACH_TIMEOUT = 12.0
+FIRE_WRIST_ANGLE = 40.0
+FIRE_FINAL_RIGHT_ANGLE = 90.0
+
 # Automatic route: one entry for each detected junction, in order.
-# L=left, R=right, S=straight, B=press button, P=parking, Q=stop.
-# Example: ROUTE = ["L", "S", "B", "R", "P", "Q"]
+# L=left, R=right, S=straight, B=press button, C=charging, F=firefighter (P is a legacy alias), Q=stop.
+# Example: ROUTE = ["L", "S", "B", "R", "C", "F", "Q"]
 # The commented entries below are placeholders: edit them before launching.
 ROUTE = [
     "B",
@@ -103,7 +109,7 @@ ROUTE = [
     "L",
     "Q",
 ]
-ALLOWED_ROUTE_COMMANDS = {"L", "R", "S", "B", "P", "Q"}
+ALLOWED_ROUTE_COMMANDS = {"L", "R", "S", "B", "C", "F", "P", "Q"}
 
 
 def clamp(value, low, high):
@@ -521,7 +527,64 @@ def button_arm_action(board):
         stop()
 
 
-def parking_task():
+def firefighter_task(calibration, detector, bus, offset, board):
+    """Left branch, flame approach, 5 s water, reverse, then right turn."""
+    from firefighter import Firefighter
+    from roboarm import RoboArm
+    from arm_web import START_ANGLES
+
+    fire = Firefighter(board)
+    stop()
+    try:
+        fire.initialize()
+        arm = RoboArm(board)
+        arm.write(**{**START_ANGLES, "wrist": FIRE_WRIST_ANGLE})
+        time.sleep(0.6)
+        # Check reporting before moving. No zero-filled sensor placeholders.
+        fire.detected()
+
+        print("\nF: turn LEFT.")
+        ok, left_sign = pivot(bus, offset, "L")
+        if not ok or left_sign is None:
+            return False
+
+        # Approach directly at the slow F speed, checking the flame on every
+        # iteration (a separate moving reacquire could overshoot the candle).
+        deadline = time.monotonic() + FIRE_APPROACH_TIMEOUT
+        while time.monotonic() < deadline:
+            if fire.detected():
+                stop()
+                print("\nF: flame detected. Water ON for 5 seconds.")
+                fire.spray()
+                break
+            state = line_tracker.update(calibration)
+            if not differential_drive(
+                state, speed=FIRE_APPROACH_SPEED,
+                max_speed=FIRE_APPROACH_MAX_SPEED,
+            ):
+                print("\nF: line lost on approach.")
+                return False
+            time.sleep(LOOP_DELAY)
+        else:
+            print("\nF: flame approach timeout.")
+            return False
+
+        # Reuse the tested button reverse behavior and gyro limits.
+        if not button_return(calibration, detector, bus, offset, left_sign):
+            return False
+        if not follow_for(calibration, RETURN_FORWARD_TIME):
+            return False
+        print("\nF: turn RIGHT by 90 degrees.")
+        ok, _ = pivot(bus, offset, "R", angle_target=FIRE_FINAL_RIGHT_ANGLE)
+        return ok and reacquire_line(calibration)
+    finally:
+        try:
+            stop()
+        finally:
+            fire.off()
+
+
+def charging_task():
     """Stop for 11 s: blink RED for 9 s, GREEN for 2 s, then turn R."""
     stop()
     rgb = None
@@ -534,31 +597,31 @@ def parking_task():
         # previous RED command lit BLUE. Swap only here, not global pins.
         rgb = led.RGBLED(pins.LED_BLUE, pins.LED_GREEN, pins.LED_RED)
         start = time.monotonic()
-        red_end = start + PARK_RED_SECONDS
-        park_end = start + PARK_SECONDS
+        red_end = start + CHARGE_RED_SECONDS
+        park_end = start + CHARGE_SECONDS
 
-        print("\nP: robot stopped. Red blinking for 9 seconds.")
+        print("\nC: robot stopped. Red blinking for 9 seconds.")
         while time.monotonic() < red_end:
             rgb.red()
             time.sleep(
-                max(0.0, min(PARK_BLINK_HALF_PERIOD,
+                max(0.0, min(CHARGE_BLINK_HALF_PERIOD,
                              red_end - time.monotonic()))
             )
             rgb.off()
             time.sleep(
-                max(0.0, min(PARK_BLINK_HALF_PERIOD,
+                max(0.0, min(CHARGE_BLINK_HALF_PERIOD,
                              red_end - time.monotonic()))
             )
 
-        print("\nP: green ON for remaining 2 seconds.")
+        print("\nC: green ON for remaining 2 seconds.")
         rgb.green()
         time.sleep(max(0.0, park_end - time.monotonic()))
-        print("\nP: parking complete; turning RIGHT.")
+        print("\nC: charging complete; turning RIGHT.")
         return True
 
     except Exception as exc:
-        print(f"\nP: RGB parking error: {exc}")
-        print("P: not turning until the light problem is resolved.")
+        print(f"\nC: RGB charging error: {exc}")
+        print("C: not turning until the light problem is resolved.")
         return False
 
     finally:
@@ -587,7 +650,7 @@ def load_route():
         if cmd not in ALLOWED_ROUTE_COMMANDS:
             raise ValueError(
                 f"Invalid ROUTE entry #{index}: {command!r}. "
-                "Allowed: L, R, S, B, P, Q."
+                "Allowed: L, R, S, B, C, F, P (legacy C), Q."
             )
         if cmd == "Q" and index != len(ROUTE):
             raise ValueError("Q must be the last ROUTE entry.")
@@ -785,7 +848,7 @@ def main():
                     print("ROUTE: stop command.")
                     break
 
-                if cmd in ("L", "R", "B", "P"):
+                if cmd in ("L", "R", "B", "C", "P", "F"):
                     # Gyro stays unloaded until a maneuver requires it.
                     if bus is None:
                         bus = smbus.SMBus(I2C_BUS)
@@ -799,8 +862,12 @@ def main():
                         ok = button_task(
                             calibration, detector, sensor, bus, offset, board
                         )
-                    elif cmd == "P":
-                        ok = parking_task()
+                    elif cmd == "F":
+                        ok = firefighter_task(
+                            calibration, detector, bus, offset, board
+                        )
+                    elif cmd in ("C", "P"):
+                        ok = charging_task()
                         if ok:
                             # Same 80-degree R turn and differential reacquire.
                             ok, _ = pivot(bus, offset, "R")
@@ -875,4 +942,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
