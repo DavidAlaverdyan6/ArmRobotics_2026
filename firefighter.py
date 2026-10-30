@@ -15,23 +15,32 @@ SENSOR_WAIT_TIMEOUT = 2.0
 POLL_SECONDS = 0.02
 
 
-def firefighting_pose():
-    """Photo pose: upper link +90°, forearm +10°, tool -25° to horizontal.
+# Gripper-tip target in the robot's arm_web coordinate system (mm).
+FIRE_TARGET_X_MM = 300.0
+FIRE_TARGET_Y_MM = 0.0
+FIRE_TARGET_Z_MM = 130.0
+FIRE_TOOL_PITCH_DEG = -15.0
 
-    These are physical link orientations, not raw servo commands. The user
-    chose this pose over unreachable tip XYZ=(250, 0, 200), pitch=-45°.
+
+def firefighting_pose():
+    """Solve the F position with the tip pointing 15 degrees below horizontal.
+
+    The tool direction is fixed at the target and while the robot approaches
+    the flame. The movement from home to this pose is joint-interpolated;
+    it does not keep a constant tool pitch during that transition.
     """
-    from arm_ik import (HOME_BASE, HOME_SHOULDER, HOME_ELBOW, HOME_WRIST,
-                        HOME_SHOULDER_PITCH, HOME_ELBOW_BEND, HOME_TOOL_PITCH,
-                        WRIST_DEGREES_PER_SERVO, checked_angle)
-    q1, q2, pitch = 90.0, 10.0, -25.0
+    from arm_ik import inverse_kinematics
+
+    solution = inverse_kinematics(
+        FIRE_TARGET_X_MM,
+        FIRE_TARGET_Y_MM,
+        FIRE_TARGET_Z_MM,
+        tool_pitch=FIRE_TOOL_PITCH_DEG,
+        elbow_up=False,
+    )
     return {
-        "base": HOME_BASE,
-        "shoulder": checked_angle("Shoulder", HOME_SHOULDER + q1 - HOME_SHOULDER_PITCH),
-        "elbow": checked_angle("Elbow", HOME_ELBOW - (q2 - q1 - HOME_ELBOW_BEND)),
-        "wrist": checked_angle("Wrist", HOME_WRIST + (
-            pitch - q2 - HOME_TOOL_PITCH + HOME_SHOULDER_PITCH + HOME_ELBOW_BEND
-        ) / WRIST_DEGREES_PER_SERVO),
+        name: getattr(solution, name)
+        for name in ("base", "shoulder", "elbow", "wrist")
     }
 
 
