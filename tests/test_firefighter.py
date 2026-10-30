@@ -31,11 +31,11 @@ class FireTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             fire.detected()
         with patch.object(hardware.time, 'monotonic', return_value=10):
-            fire._callback([3, hardware.pins.fire_sensor, 3500])
-            self.assertFalse(fire.detected())
-            fire._callback([3, hardware.pins.fire_sensor, 0])
-            self.assertTrue(fire.detected())
-            with patch.object(hardware, 'FIRE_ACTIVE_LOW', False):
+            for value, expected in ((0, False), (1999, False),
+                                    (2000, True), (2500, True), (4095, True)):
+                fire._callback([3, hardware.pins.fire_sensor, value])
+                self.assertEqual(fire.detected(), expected, value)
+            with patch.object(hardware, 'FIRE_ACTIVE_LOW', True):
                 self.assertFalse(fire.detected())
         with patch.object(hardware.time, 'monotonic', return_value=11):
             with self.assertRaises(RuntimeError):
@@ -101,10 +101,10 @@ class FireTests(unittest.TestCase):
         clock = [0.0]
         def sleep(dt):
             clock[0] += dt
-            fire.sample = (1000, clock[0])
+            fire.sample = (2500, clock[0])
         with patch.object(hardware.time, 'monotonic', side_effect=lambda: clock[0]), \
              patch.object(hardware.time, 'sleep', side_effect=sleep):
-            fire.sample = (1000, 0.0)
+            fire.sample = (2500, 0.0)
             self.assertTrue(fire.confirm_flame())
             self.assertGreaterEqual(clock[0], 1.0)
             now = clock[0]
