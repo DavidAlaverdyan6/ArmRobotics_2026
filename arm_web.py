@@ -254,7 +254,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 const names = ["base", "shoulder", "elbow", "wrist", "gripper"];
 
 const angles = {
-    base: 95,
+    base: 90,
     shoulder: 180,
     elbow: 180,
     wrist: 40,
@@ -606,7 +606,7 @@ const HOME_WRIST_PITCH_DEG = 0;
 const WRIST_SCALE = 90 / 124;
 
 function armPoints(a) {
-    const yaw = (a.base - 95) * Math.PI / 180;
+    const yaw = (a.base - 90) * Math.PI / 180;
     const shoulder = (HOME_SHOULDER_DEG + (a.shoulder - 180)) * Math.PI / 180;
     const elbow = shoulder + (HOME_ELBOW_BEND_DEG - (a.elbow - 180)) * Math.PI / 180;
     const wrist = elbow + (HOME_WRIST_PITCH_DEG - (HOME_SHOULDER_DEG + HOME_ELBOW_BEND_DEG) + (a.wrist - 20) * WRIST_SCALE) * Math.PI / 180;
