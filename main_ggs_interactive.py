@@ -54,11 +54,11 @@ TURN_ANGLE = 80.0
 TURN_PWM_FAST = 255
 TURN_PWM_SLOW = 90
 
-BUTTON_DISTANCE_CM = 26.0
+BUTTON_DISTANCE_CM = 30.0
 # Button tip target (mm, arm_web coordinate system). Arm moves in two stages.
 BUTTON_X_MM = 350.0
 BUTTON_Y_MM = 0.0
-BUTTON_Z_MM = -40.0
+BUTTON_Z_MM = -60.0
 
 # Charging: 9 s red blink, then 2 s solid green; total 11 s before R.
 CHARGE_SECONDS = 11.0
@@ -330,7 +330,7 @@ def follow_for(calibration, seconds):
 
 
 def button_approach(calibration, detector, sensor):
-    """Follow line to 26 cm from the button, then stop for the arm task."""
+    """Follow line to 30 cm from the button, then stop for the arm task."""
     start = time.monotonic()
     cleared_count = 0
     left_initial_junction = False
