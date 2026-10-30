@@ -122,10 +122,10 @@ class FireTests(unittest.TestCase):
         self.assertEqual(pose['base'], 90)
         self.assertEqual(pose['shoulder'], 100)
         self.assertEqual(pose['elbow'], 140)
-        self.assertAlmostEqual(pose['wrist'], 13.11, places=2)
+        self.assertAlmostEqual(pose['wrist'], 40.67, places=2)
         x,y,z = forward_kinematics(**pose)
-        self.assertAlmostEqual(x, 242, delta=1)
-        self.assertAlmostEqual(z, 17, delta=1)
+        self.assertAlmostEqual(x, 277, delta=1)
+        self.assertAlmostEqual(z, 67, delta=1)
         self.assertAlmostEqual(y, 0)
 
     def test_route_commands(self):

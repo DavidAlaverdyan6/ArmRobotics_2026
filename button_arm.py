@@ -10,10 +10,9 @@ import time
 
 BUTTON_HOLD_SECONDS = 0.3
 
-# Home is about (134, 0, 113) mm in arm_ik's current model. At X=134,
-# Z=-40 is not reachable in that model. X=160 permits lowering to Z=-40
-# with only a small initial X displacement before the long X extension.
-LOWERING_X_MM = 160.0
+BUTTON_START_X_MM = 250.0
+BUTTON_START_Z_MM = 100.0
+BUTTON_TOOL_PITCH = 0.0
 
 
 def _execute_plan(arm, path, delay):
@@ -50,22 +49,39 @@ def _return_home(arm, home, max_step_deg, delay):
     arm.write(gripper=home["gripper"])
 
 
-def move_to_xyz_and_home(board, x, y, z):
-    """Lower to Z first, then advance along X at constant Z and return home.
+def plan_button_paths(arm_web, x, y, z):
+    """Preflight every segment with horizontal tool pitch before moving.
 
-    Movement phase 1: lower toward (160, y, z).
-    Movement phase 2: move the tip along X to (x, y, z), holding Z fixed.
-    No servo or contact feedback is available; the completed state means
-    all servo commands were issued, not that contact was physically measured.
+    Extend at Z=100 before descending: a direct diagonal from (250,0,100)
+    to (350,0,-40) exceeds the elbow servo limit in the current model.
     """
+    targets = [
+        (BUTTON_START_X_MM, 0.0, BUTTON_START_Z_MM),
+        (x, y, BUTTON_START_Z_MM),
+        (x, y, z),
+    ]
+    arm = arm_web.arm
+    saved = {n: getattr(arm, n).angle for n in arm_web.IK_JOINTS}
+    paths = []
+    try:
+        for tx, ty, tz in targets:
+            path = arm_web.plan_locked_pitch_path({
+                "x": tx, "y": ty, "z": tz, "tool_pitch": BUTTON_TOOL_PITCH,
+            })
+            paths.append(path)
+            for name, angle in path[-1].items():
+                getattr(arm, name).angle = float(angle)
+        return paths
+    finally:
+        for name, angle in saved.items():
+            getattr(arm, name).angle = angle
+
+
+def move_to_xyz_and_home(board, x, y, z):
+    """Horizontal tool: staging point, forward extension, descent, then home."""
     x, y, z = map(float, (x, y, z))
     if not all(math.isfinite(v) for v in (x, y, z)):
         raise ValueError("XYZ coordinates must be finite.")
-
-    if x <= LOWERING_X_MM:
-        raise ValueError(
-            f"Target X must exceed first-stage X={LOWERING_X_MM:g} mm."
-        )
 
     import arm_web
     from roboarm import RoboArm
@@ -75,58 +91,19 @@ def move_to_xyz_and_home(board, x, y, z):
     arm_web.arm = arm
     arm.write(**home)
     time.sleep(0.6)
+    paths = plan_button_paths(arm_web, x, y, z)
 
-    first_target = {"x": LOWERING_X_MM, "y": y, "z": z}
-    final_target = {"x": x, "y": y, "z": z}
+    print("ARM: horizontal tool, via (250, 0, 100) and forward at Z=100.")
+    for path in paths:
+        _execute_plan(arm, path, arm_web.STEP_DELAY)
+    print(f"ARM: button target ({x:g}, {y:g}, {z:g}) commanded. Holding...")
+    time.sleep(BUTTON_HOLD_SECONDS)
 
-    # Preflight both segments before moving the arm away from its home pose.
-    descent_path, descent_pitch = arm_web.plan_auto_path(first_target)
-
-    # The Cartesian planner uses arm_web.arm's recorded current angles.
-    # Temporarily preview phase 1's end angles without sending servo commands.
-    joints = ("base", "shoulder", "elbow", "wrist")
-    saved_angles = {
-        name: getattr(arm, name).angle for name in joints
-    }
-    try:
-        for name, angle in descent_path[-1].items():
-            getattr(arm, name).angle = float(angle)
-
-        # Keeping tool pitch constant makes this a genuine X-only motion
-        # in the IK model, with Y and Z fixed at the lowered coordinates.
-        extension_path = arm_web.plan_cartesian_path({
-            **final_target,
-            "tool_pitch": float(descent_pitch),
-        })
-    finally:
-        for name, angle in saved_angles.items():
-            getattr(arm, name).angle = angle
-
-    print(
-        f"ARM phase 1: lower to X={LOWERING_X_MM:g}, Y={y:g}, "
-        f"Z={z:g} mm (pitch {descent_pitch:.1f} degrees)."
-    )
-    print(
-        f"ARM phase 2: extend X from {LOWERING_X_MM:g} to {x:g} mm "
-        f"while keeping Y={y:g}, Z={z:g} mm."
-    )
-
-    try:
-        _execute_plan(arm, descent_path, arm_web.STEP_DELAY)
-        _execute_plan(arm, extension_path, arm_web.STEP_DELAY)
-        print("ARM: button target commanded. Holding...")
-        time.sleep(BUTTON_HOLD_SECONDS)
-
-        print("ARM: returning to home...")
-        _return_home(
-            arm,
-            home,
-            arm_web.AUTO_MAX_STEP_DEG,
-            arm_web.STEP_DELAY,
-        )
-        print("ARM: home commanded.")
-        return True
-
-    except Exception:
-        # Stop the mobile base rather than reversing with an extended arm.
-        raise
+    # Retrace the horizontal-tool descent/extension before folding home.
+    # Include preceding endpoints so short segments are fully retraced.
+    for index in (2, 1):
+        _execute_plan(arm, list(reversed(paths[index])) + [paths[index-1][-1]],
+                      arm_web.STEP_DELAY)
+    _return_home(arm, home, arm_web.AUTO_MAX_STEP_DEG, arm_web.STEP_DELAY)
+    print("ARM: home commanded.")
+    return True

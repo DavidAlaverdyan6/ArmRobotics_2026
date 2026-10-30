@@ -16,7 +16,7 @@ POLL_SECONDS = 0.02
 
 
 def firefighting_pose():
-    """Photo pose: upper link +90°, forearm +10°, tool -45° to horizontal.
+    """Photo pose: upper link +90°, forearm +10°, tool -25° to horizontal.
 
     These are physical link orientations, not raw servo commands. The user
     chose this pose over unreachable tip XYZ=(250, 0, 200), pitch=-45°.
@@ -24,7 +24,7 @@ def firefighting_pose():
     from arm_ik import (HOME_BASE, HOME_SHOULDER, HOME_ELBOW, HOME_WRIST,
                         HOME_SHOULDER_PITCH, HOME_ELBOW_BEND, HOME_TOOL_PITCH,
                         WRIST_DEGREES_PER_SERVO, checked_angle)
-    q1, q2, pitch = 90.0, 10.0, -45.0
+    q1, q2, pitch = 90.0, 10.0, -25.0
     return {
         "base": HOME_BASE,
         "shoulder": checked_angle("Shoulder", HOME_SHOULDER + q1 - HOME_SHOULDER_PITCH),
