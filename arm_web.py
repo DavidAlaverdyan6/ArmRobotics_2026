@@ -27,7 +27,7 @@ START_ANGLES = {
     "base": HOME_BASE,
     "shoulder": HOME_SHOULDER,
     "elbow": HOME_ELBOW,
-    "wrist": HOME_WRIST,
+    "wrist": 40.0,
     "gripper": HOME_GRIPPER,
 }
 
@@ -257,7 +257,7 @@ const angles = {
     base: 95,
     shoulder: 180,
     elbow: 180,
-    wrist: 20,
+    wrist: 40,
     gripper: 180
 };
 
