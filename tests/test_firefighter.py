@@ -79,7 +79,7 @@ class FireTests(unittest.TestCase):
             }), patch.object(hardware, 'Firefighter', return_value=fire), \
                  patch.object(nav.time, 'sleep'):
                 self.assertEqual(nav.firefighter_task(None, None, None, 0, Mock()), line_ok)
-            arm.write.assert_called_once_with(**{**home, 'wrist': 0})
+            arm.write.assert_called_once_with(**{**home, 'wrist': 40})
             fire.off.assert_called_once()
             if line_ok:
                 self.assertEqual(events, ['stop', 'L', 'stop', 'water', 'reverse',
