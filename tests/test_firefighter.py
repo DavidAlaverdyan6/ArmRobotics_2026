@@ -63,7 +63,7 @@ class FireTests(unittest.TestCase):
             fire.detected.side_effect = [False, False, True]
             fire.spray.side_effect = lambda: events.append('water')
             arm = Mock()
-            home = {'base': 95, 'shoulder': 180, 'elbow': 180,
+            home = {'base': 90, 'shoulder': 180, 'elbow': 180,
                     'wrist': 40, 'gripper': 180}
             nav.stop = lambda: events.append('stop')
             nav.pivot = lambda bus, offset, direction, **kw: (
