@@ -44,7 +44,7 @@ SERVOS = (servopan, servotilt, servo3, servo4, servo_gripper)
 
 # ── Other hardware ──
 fire_sensor = PB0
-pump = PA12
+pump = PB5
 
 LED_RED = 17
 LED_GREEN = 27

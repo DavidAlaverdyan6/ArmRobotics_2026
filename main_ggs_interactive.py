@@ -53,20 +53,18 @@ GYRO_CALIBRATION_SAMPLE_DELAY = 0.001
 PIVOT_SETTLE_SECONDS = 0.1
 TURN_ANGLE = 80.0
 TURN_PWM_FAST = 255
-TURN_PWM_SLOW = 90
+TURN_PWM_SLOW = 110
 
-BUTTON_DISTANCE_CM = 21.5
-BUTTON_DISTANCE_TOLERANCE_CM = 0.5
-BUTTON_SLOWDOWN_CM = 28.0
-BUTTON_MIN_CLEARANCE_CM = 18.0
-BUTTON_CENTER_TOLERANCE = 0.25
+BUTTON_DISTANCE_CM = 21.0
+BUTTON_DISTANCE_TOLERANCE_CM = 1.0
+BUTTON_CENTER_TOLERANCE = 0.6
 BUTTON_ADJUST_SPEED = 70
 BUTTON_ADJUST_SECONDS = 0.08
 BUTTON_SETTLE_SECONDS = 0.20
 # Button tip target (mm, arm_web coordinate system). Arm moves in two stages.
 BUTTON_X_MM = 350.0
 BUTTON_Y_MM = 0.0
-BUTTON_Z_MM = -40.0
+BUTTON_Z_MM = -80.0
 
 # Charging: 9 s red blink, then 2 s solid green; total 11 s before R.
 CHARGE_SECONDS = 11.0
@@ -74,7 +72,6 @@ CHARGE_RED_SECONDS = 9.0
 CHARGE_BLINK_HALF_PERIOD = 0.5
 BUTTON_MAX_TIME = 18.0
 BUTTON_CONFIRM = 3
-BUTTON_CLEAR_TIMEOUT = 3.0
 
 RETURN_SPEED = 150
 RETURN_SLOW_SPEED = 95
@@ -88,12 +85,12 @@ RETURN_RECOVERY_SAFE = 6.0
 RETURN_RECOVERY_TIMEOUT = 1.5
 
 RETURN_FORWARD_TIME = 0.3
-BUTTON_FINAL_RIGHT_ANGLE = 80.0
+BUTTON_FINAL_RIGHT_ANGLE = TURN_ANGLE
 
 FIRE_APPROACH_SPEED = 70
 FIRE_APPROACH_MAX_SPEED = 100
 FIRE_APPROACH_TIMEOUT = 12.0
-FIRE_FINAL_RIGHT_ANGLE = 80.0
+FIRE_FINAL_RIGHT_ANGLE = TURN_ANGLE
 
 # Automatic route: one entry for each detected junction, in order.
 # L=left, R=right, S=straight, B=press button, C=charging, F=firefighter, Q=stop.
@@ -244,20 +241,19 @@ class Heading:
 
 
 def pivot(bus, offset, direction, angle_target=TURN_ANGLE):
-    """Gyro-controlled pivot. Return success and LEFT-turn gyro polarity."""
+    """Gyro-controlled pivot; return success and LEFT-turn gyro polarity."""
     if direction not in ("L", "R"):
         raise ValueError("Turn direction must be L or R")
 
     left = direction == "L"
-    motors.set_speeds(
-        -TURN_PWM_SLOW if left else TURN_PWM_FAST,
-        TURN_PWM_FAST if left else -TURN_PWM_SLOW,
-    )
-
-    start = previous = time.monotonic()
-    angle = signed = 0.0
-
     try:
+        motors.set_speeds(
+            -TURN_PWM_SLOW if left else TURN_PWM_FAST,
+            TURN_PWM_FAST if left else -TURN_PWM_SLOW,
+        )
+        start = previous = time.monotonic()
+        angle = signed = 0.0
+
         while angle < angle_target:
             now = time.monotonic()
             rate = gyro_rate(bus, offset)
@@ -345,7 +341,8 @@ def button_position_ready(state, distance_cm):
         return False
     values = state["normalized"]
     return (
-        abs(distance_cm - BUTTON_DISTANCE_CM) <= BUTTON_DISTANCE_TOLERANCE_CM
+        BUTTON_DISTANCE_CM - BUTTON_DISTANCE_TOLERANCE_CM
+        <= distance_cm <= BUTTON_DISTANCE_CM + BUTTON_DISTANCE_TOLERANCE_CM
         and abs(position - TARGET_POSITION) <= BUTTON_CENTER_TOLERANCE
         and max(values[2:6]) >= START_CENTER_BLACK_MIN
         and max(values[0], values[7]) <= START_OUTER_BLACK_MAX
@@ -353,33 +350,14 @@ def button_position_ready(state, distance_cm):
 
 
 def button_approach(calibration, detector, sensor):
-    """Stop at 21.5 cm, then verify distance and line before moving the arm."""
+    """Stop at the target distance and verify the line before moving the arm."""
     start = time.monotonic()
-    cleared_count = 0
-    left_initial_junction = False
     ready_count = 0
     missing_since = None
 
     try:
         while time.monotonic() - start < BUTTON_MAX_TIME:
             state = line_tracker.update(calibration)
-            left, right, _ = detector.read(state)
-
-            if not left and not right:
-                cleared_count += 1
-            else:
-                cleared_count = 0
-
-            if cleared_count >= JUNCTION_CLEAR:
-                left_initial_junction = True
-
-            if (
-                not left_initial_junction
-                and time.monotonic() - start > BUTTON_CLEAR_TIMEOUT
-            ):
-                print("\nB: initial junction did not clear.")
-                return False
-
             distance_cm = sensor.read_distance_mm() / 10.0
             if distance_cm <= 0:
                 stop()
@@ -398,33 +376,20 @@ def button_approach(calibration, detector, sensor):
                 continue
             missing_since = None
 
-            if not left_initial_junction:
-                # The range sensor may already see the button immediately
-                # after the turn. Clear the junction before fine positioning.
-                if distance_cm < BUTTON_MIN_CLEARANCE_CM:
-                    stop()
-                    print(
-                        f"\nB: only {distance_cm:.1f} cm before leaving "
-                        "junction; arm remains off."
-                    )
-                    return False
-                speed = (
-                    BUTTON_ADJUST_SPEED if distance_cm <= BUTTON_SLOWDOWN_CM
-                    else MANEUVER_SPEED
-                )
-                differential_drive(
-                    state, speed=speed,
-                    max_speed=MANEUVER_MAX_SPEED
-                )
-                time.sleep(LOOP_DELAY)
-                continue
-
-            if distance_cm > BUTTON_SLOWDOWN_CM:
+            distance_error = distance_cm - BUTTON_DISTANCE_CM
+            if not (
+                BUTTON_DISTANCE_CM - BUTTON_DISTANCE_TOLERANCE_CM
+                <= distance_cm <= BUTTON_DISTANCE_CM + BUTTON_DISTANCE_TOLERANCE_CM
+            ):
                 ready_count = 0
-                differential_drive(
-                    state, speed=MANEUVER_SPEED,
-                    max_speed=MANEUVER_MAX_SPEED
-                )
+                # Continuous line steering without the fine-mode settling pause.
+                if distance_error < 0:
+                    differential_reverse(state, BUTTON_ADJUST_SPEED)
+                else:
+                    differential_drive(
+                        state, speed=MANEUVER_SPEED,
+                        max_speed=MANEUVER_MAX_SPEED,
+                    )
                 time.sleep(LOOP_DELAY)
                 continue
 
@@ -456,6 +421,8 @@ def button_approach(calibration, detector, sensor):
             ready_count = 0
             if distance_cm < BUTTON_DISTANCE_CM - BUTTON_DISTANCE_TOLERANCE_CM:
                 differential_reverse(state, BUTTON_ADJUST_SPEED)
+                # Refresh line steering on every control tick while backing up.
+                time.sleep(LOOP_DELAY)
             else:
                 # Also use a short forward steering pulse when the distance is
                 # correct but the line is still off center.
@@ -463,10 +430,10 @@ def button_approach(calibration, detector, sensor):
                     state, speed=BUTTON_ADJUST_SPEED,
                     max_speed=BUTTON_ADJUST_SPEED + 40,
                 )
-            time.sleep(BUTTON_ADJUST_SECONDS)
+                time.sleep(BUTTON_ADJUST_SECONDS)
             stop()
 
-        print("\nB: could not verify 21.5 cm and centered line; arm remains off.")
+        print(f"\nB: could not verify {BUTTON_DISTANCE_CM:g} cm and centered line; arm remains off.")
         return False
 
     finally:
