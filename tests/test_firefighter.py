@@ -19,7 +19,7 @@ def load_navigation():
     with patch.dict(sys.modules, stubs):
         import importlib.util
         spec = importlib.util.spec_from_file_location('navigation_test',
-            Path(__file__).resolve().parents[1] / 'main_ggs_interactive.py')
+            Path(__file__).resolve().parents[1] / 'main.py')
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     return module
@@ -73,7 +73,7 @@ class FireTests(unittest.TestCase):
             nav.pivot = lambda bus, offset, direction, **kw: (
                 events.append(direction) or True, 1)
             nav.differential_drive = lambda *a, **kw: events.append('drive') or line_ok
-            nav.line_tracker.update = Mock(return_value={'position': 0})
+            nav.read_fresh = Mock(return_value={'position': 0})
             nav.button_return = lambda *a: events.append('reverse') or True
             nav.follow_for = lambda *a: events.append('forward') or True
             nav.reacquire_line = lambda *a: events.append('reacquire') or True

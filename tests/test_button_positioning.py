@@ -17,7 +17,7 @@ def load_navigation():
     with patch.dict(sys.modules, stubs):
         spec = importlib.util.spec_from_file_location(
             "button_position_navigation",
-            Path(__file__).resolve().parents[1] / "main_ggs_interactive.py",
+            Path(__file__).resolve().parents[1] / "main.py",
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -35,10 +35,11 @@ class ButtonPositionTests(unittest.TestCase):
     def test_distance_and_line_must_both_match(self):
         nav = self.nav
         self.assertTrue(nav.button_position_ready(self.centered, 21.5))
-        self.assertTrue(nav.button_position_ready(self.centered, 21.0))
+        self.assertFalse(nav.button_position_ready(self.centered, 21.0))
         self.assertTrue(nav.button_position_ready(self.centered, 22.0))
         self.assertFalse(nav.button_position_ready(self.centered, 20.9))
-        self.assertFalse(nav.button_position_ready(self.centered, 22.1))
+        self.assertTrue(nav.button_position_ready(self.centered, 22.1))
+        self.assertFalse(nav.button_position_ready(self.centered, 22.6))
         off_center = {**self.centered, "position": 0.6}
         self.assertFalse(nav.button_position_ready(off_center, 21.5))
 
@@ -48,7 +49,7 @@ class ButtonPositionTests(unittest.TestCase):
         nav.stop = Mock()
         nav.differential_drive = Mock(return_value=True)
         nav.differential_reverse = Mock(return_value=True)
-        nav.line_tracker.update = Mock(return_value=self.centered)
+        nav.read_fresh = Mock(return_value=self.centered)
         detector = Mock()
         detector.read.return_value = (False, False, False)
         sensor = Mock()
@@ -72,7 +73,7 @@ class ButtonPositionTests(unittest.TestCase):
         nav = self.nav
         nav.stop = Mock()
         nav.differential_drive = Mock()
-        nav.line_tracker.update = Mock(return_value=self.centered)
+        nav.read_fresh = Mock(return_value=self.centered)
         detector = Mock()
         detector.read.return_value = (False, False, False)
         sensor = Mock()
@@ -87,7 +88,7 @@ class ButtonPositionTests(unittest.TestCase):
         clock = [0.0]
         nav.stop = Mock()
         nav.differential_drive = Mock(return_value=True)
-        nav.line_tracker.update = Mock(return_value=self.centered)
+        nav.read_fresh = Mock(return_value=self.centered)
         detector = Mock()
         detector.read.side_effect = (
             [(True, False, False)] * 2 + [(False, False, False)] * 7
@@ -111,7 +112,7 @@ class ButtonPositionTests(unittest.TestCase):
         nav = self.nav
         nav.stop = Mock()
         nav.differential_drive = Mock()
-        nav.line_tracker.update = Mock(return_value=self.centered)
+        nav.read_fresh = Mock(return_value=self.centered)
         detector = Mock()
         detector.read.return_value = (True, False, False)
         sensor = Mock()

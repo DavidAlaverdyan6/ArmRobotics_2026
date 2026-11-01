@@ -12,6 +12,7 @@ SENSOR_MAX_AGE = 0.5
 WATER_SECONDS = 5.0
 FLAME_CONFIRM_SECONDS = 1.0
 SENSOR_WAIT_REPORT_SECONDS = 2.0
+SENSOR_WAIT_TIMEOUT_SECONDS = 4.0
 POLL_SECONDS = 0.02
 
 
@@ -59,8 +60,9 @@ class Firefighter:
         self.board.digital_write(pins.pump, 0)
 
     def wait_for_sample(self, after=None):
-        """Wait without a deadline; callers keep the drive stopped meanwhile."""
+        """Wait for a new report with a bounded deadline while stopped."""
         last_report = time.monotonic()
+        deadline = last_report + SENSOR_WAIT_TIMEOUT_SECONDS
         while True:
             sample = self.sample
             now = time.monotonic()
@@ -71,6 +73,8 @@ class Firefighter:
             if now - last_report >= SENSOR_WAIT_REPORT_SECONDS:
                 print("F: waiting for a fresh flame sensor reading; motors stopped.")
                 last_report = now
+            if now >= deadline:
+                raise TimeoutError("F: flame sensor report timeout")
             time.sleep(POLL_SECONDS)
 
     def confirm_flame(self):

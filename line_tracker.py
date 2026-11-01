@@ -4,6 +4,7 @@
 import json
 import os
 import time
+import threading
 
 import robot_pin_config as robot_pins
 
@@ -37,15 +38,26 @@ RIGHT_SENSORS = (6, 7)
 CALIBRATION_SAMPLES = 100
 
 sensor_values = [0] * SENSOR_COUNT
+sample_times = [None] * SENSOR_COUNT
+sample_ids = [0] * SENSOR_COUNT
+_sample_lock = threading.Lock()
 board = None
 
 
 def _make_callback(index):
+    pin = SENSOR_PINS[index]
+
     def callback(data):
         try:
-            sensor_values[index] = int(data[2])
+            value = int(data[2])
+            if int(data[1]) != pin or not 0 <= value <= 4095:
+                return
         except (IndexError, TypeError, ValueError):
-            pass
+            return
+        with _sample_lock:
+            sensor_values[index] = value
+            sample_times[index] = time.monotonic()
+            sample_ids[index] += 1
 
     return callback
 
@@ -58,11 +70,14 @@ def initialize(board_instance):
         raise ValueError("A connected Telemetrix board is required.")
 
     board = board_instance
+    with _sample_lock:
+        sensor_values[:] = [0] * SENSOR_COUNT
+        sample_times[:] = [None] * SENSOR_COUNT
+        sample_ids[:] = [0] * SENSOR_COUNT
 
     for index, pin in enumerate(SENSOR_PINS):
         board.set_pin_mode_analog_input(
             pin,
-            differential=0,
             callback=_make_callback(index),
         )
 
@@ -224,7 +239,9 @@ def update(calibration):
     if board is None:
         raise RuntimeError("Call initialize(board) before update().")
 
-    raw = sensor_values.copy()
+    with _sample_lock:
+        raw, times, ids = (sensor_values.copy(), sample_times.copy(),
+                           sample_ids.copy())
 
     normalized = [
         normalize_sensor(i, raw[i], calibration)
@@ -239,7 +256,17 @@ def update(calibration):
         "position": position,
         "line_detected": position is not None,
         "crossing": detect_crossing(normalized),
+        "sample_times": times,
+        "sample_ids": ids,
     }
+
+
+def all_channels_fresh(max_age=0.35):
+    now = time.monotonic()
+    with _sample_lock:
+        times = sample_times.copy()
+    return (all(t is not None and 0 <= now - t <= max_age for t in times)
+            and max(times) - min(times) <= 0.15)
 
 
 def shutdown():

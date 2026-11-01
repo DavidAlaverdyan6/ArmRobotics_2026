@@ -19,7 +19,7 @@ KP = 30.0
 
 # Your existing sensor weights are [-3, -2, -1, 0, 1, 2, 3, 4].
 # Tested centered-line position from show_line_position.py: about +0.08.
-TARGET_POSITION = 0.08
+TARGET_POSITION = 0.5
 
 LOOP_DELAY = 0.04
 
