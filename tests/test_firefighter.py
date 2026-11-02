@@ -13,8 +13,14 @@ def load_navigation():
     # Execute the navigation module with only its hardware imports stubbed.
     stubs = {name: types.ModuleType(name) for name in
              ('smbus', 'telemetrix', 'motors', 'line_tracker',
-              'sensors.vl53l0x_sensor')}
+              'sensors.vl53l0x_sensor', 'led', 'robot_pin_config')}
     stubs['telemetrix'].telemetrix = Mock()
+    stubs['line_tracker'].LineTrackingEngine = Mock(return_value=Mock())
+    stubs['line_tracker'].CENTER_POSITION = 0.0
+    stubs['led'].RGBLED = Mock(return_value=Mock())
+    stubs['robot_pin_config'].LED_RED = 17
+    stubs['robot_pin_config'].LED_GREEN = 27
+    stubs['robot_pin_config'].LED_BLUE = 22
     stubs['sensors.vl53l0x_sensor'].VL53L0XSensor = Mock()
     with patch.dict(sys.modules, stubs):
         import importlib.util
@@ -87,7 +93,9 @@ class FireTests(unittest.TestCase):
                 'button_arm': types.SimpleNamespace(_return_home=move),
             }), patch.object(hardware, 'Firefighter', return_value=fire), \
                  patch.object(nav.time, 'sleep'):
-                self.assertEqual(nav.firefighter_task(None, None, None, 0, Mock()), line_ok)
+                self.assertTrue(
+                    nav.firefighter_task(None, None, None, 0, Mock())
+                )
             fire.off.assert_called_once()
             self.assertLess(events.index('L'), events.index('pose'))
             self.assertLess(events.index('pose'), events.index('drive'))
@@ -97,14 +105,10 @@ class FireTests(unittest.TestCase):
                 arm.write.assert_not_called()
             else:
                 arm.write.assert_called_once_with(**home)
-            if line_ok:
-                self.assertEqual(fire.spray.call_count, 2 if still_burning else 1)
-                self.assertLess(events.index('home'), events.index('reverse'))
-                self.assertLess(events.index('reverse'), events.index('R'))
-                self.assertIn('after', fire.wait_for_sample.call_args.kwargs)
-            else:
-                fire.spray.assert_not_called()
-                self.assertNotIn('reverse', events)
+            self.assertEqual(fire.spray.call_count, 2 if still_burning else 1)
+            self.assertLess(events.index('home'), events.index('reverse'))
+            self.assertLess(events.index('reverse'), events.index('R'))
+            self.assertIn('after', fire.wait_for_sample.call_args.kwargs)
 
     def test_confirmation_and_fresh_post_spray_reading(self):
         fire = hardware.Firefighter(Mock())

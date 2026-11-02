@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Non-blocking 8-channel line tracker using a shared Telemetrix board."""
+"""ADC acquisition, line interpretation, and differential tracking engine."""
 
 import json
 import os
@@ -7,6 +7,7 @@ import time
 import threading
 
 import robot_pin_config as robot_pins
+import motors
 
 
 # Preserve the sensor order already used by the robot.
@@ -24,12 +25,18 @@ SENSOR_COUNT = 8
 #
 # Position is negative on the left, positive on the right.
 WEIGHTS = [-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5]
+# The symmetric half-step weights place the array center exactly between S4
+# and S5. Both sensors contribute equally there, producing position 0.0.
+CENTER_POSITION = (WEIGHTS[0] + WEIGHTS[-1]) / 2.0
 
 LINE_DETECTED_THRESHOLD = 0.15
 
-# A side group is considered black when it sees <= 10% white.
-CROSSING_WHITE_THRESHOLD = 0.10
-CROSSING_CENTER_BLACKNESS_MIN = 0.20
+# A real branch normally covers the extreme sensor and its inward neighbor.
+# This is less calibration-sensitive than demanding near-perfect black (0.95)
+# and rejects isolated dark spots on an uneven floor.
+CROSSING_EDGE_ON = 0.85
+CROSSING_SIDE_SUPPORT_MIN = 0.55
+CROSSING_CENTER_BLACKNESS_MIN = 0.45
 
 LEFT_SENSORS = (0, 1)
 CENTER_SENSORS = (3, 4)
@@ -38,9 +45,13 @@ RIGHT_SENSORS = (6, 7)
 CALIBRATION_SAMPLES = 100
 
 sensor_values = [0] * SENSOR_COUNT
+<<<<<<< HEAD
 sample_times = [None] * SENSOR_COUNT
 sample_ids = [0] * SENSOR_COUNT
 _sample_lock = threading.Lock()
+=======
+callback_received = [False] * SENSOR_COUNT
+>>>>>>> ead9c9e (Line tracking restored!)
 board = None
 
 
@@ -49,6 +60,7 @@ def _make_callback(index):
 
     def callback(data):
         try:
+<<<<<<< HEAD
             value = int(data[2])
             if int(data[1]) != pin or not 0 <= value <= 4095:
                 return
@@ -58,6 +70,14 @@ def _make_callback(index):
             sensor_values[index] = value
             sample_times[index] = time.monotonic()
             sample_ids[index] += 1
+=======
+            # ADC.py's working Telemetrix callback reads data[2] directly.
+            # Zero is a valid reading, so readiness is tracked separately.
+            sensor_values[index] = data[2]
+            callback_received[index] = True
+        except Exception as exc:
+            print(f"\nSensor {index + 1} callback error: {data} {exc}")
+>>>>>>> ead9c9e (Line tracking restored!)
 
     return callback
 
@@ -70,16 +90,40 @@ def initialize(board_instance):
         raise ValueError("A connected Telemetrix board is required.")
 
     board = board_instance
+<<<<<<< HEAD
     with _sample_lock:
         sensor_values[:] = [0] * SENSOR_COUNT
         sample_times[:] = [None] * SENSOR_COUNT
         sample_ids[:] = [0] * SENSOR_COUNT
+=======
+    sensor_values[:] = [0] * SENSOR_COUNT
+    callback_received[:] = [False] * SENSOR_COUNT
+>>>>>>> ead9c9e (Line tracking restored!)
 
     for index, pin in enumerate(SENSOR_PINS):
         board.set_pin_mode_analog_input(
             pin,
             callback=_make_callback(index),
         )
+
+
+def callback_status():
+    """Return which ADC channels have produced at least one callback."""
+    return callback_received.copy()
+
+
+def all_callbacks_ready():
+    return all(callback_received)
+
+
+def wait_for_callbacks(timeout=6.0, poll_interval=0.04):
+    """Wait until all eight ADC subscriptions have reported once."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if all_callbacks_ready():
+            return True
+        time.sleep(poll_interval)
+    return all_callbacks_ready()
 
 
 def load_calibration():
@@ -183,13 +227,113 @@ def calculate_position(values):
     ) / total
 
 
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+class LineTrackingEngine:
+    """Convert this tracker's calibrated position into differential PWM."""
+
+    def __init__(
+        self,
+        base_speed=110,
+        max_speed=180,
+        min_speed=-80,
+        kp=30.0,
+        target_position=CENTER_POSITION,
+        motor_driver=motors,
+        kd=2.0,
+    ):
+        self.base_speed = base_speed
+        self.max_speed = max_speed
+        self.min_speed = min_speed
+        self.kp = kp
+        self.target_position = target_position
+        self.motor_driver = motor_driver
+        self.kd = kd
+        self.reset_steering()
+
+    def reset_steering(self):
+        self.previous_error = None
+        self.previous_time = None
+        self.filtered_derivative = 0.0
+
+    def stop(self):
+        self.reset_steering()
+        self.motor_driver.motor_stop()
+
+    def correction(self, position):
+        return self.kp * (position - self.target_position)
+
+    def drive(self, state, speed=None, max_speed=None):
+        """Follow the line forward. Return False when no line is visible."""
+        if state is None or state.get("position") is None:
+            self.stop()
+            return False
+
+        speed = self.base_speed if speed is None else speed
+        max_speed = self.max_speed if max_speed is None else max_speed
+        correction = self.correction(state["position"])
+        error = state["position"] - self.target_position
+        now = time.monotonic()
+        if self.previous_time is not None:
+            dt = now - self.previous_time
+            if 0.005 <= dt <= 0.25:
+                # Positive D strengthens correction while moving outward and
+                # reduces it while approaching center, before overshooting.
+                alpha = dt / (0.06 + dt)
+                rate = (error - self.previous_error) / dt
+                self.filtered_derivative += alpha * (
+                    rate - self.filtered_derivative
+                )
+            else:
+                self.filtered_derivative = 0.0
+        correction += clamp(self.kd * self.filtered_derivative, -20, 20)
+        self.previous_error = error
+        self.previous_time = now
+        left = clamp(speed + correction, self.min_speed, max_speed)
+        right = clamp(speed - correction, self.min_speed, max_speed)
+        self.motor_driver.set_speeds(round(left), round(right))
+        return True
+
+    def drive_straight(self, speed=None, max_speed=None):
+        """Continue forward without a usable line position."""
+        self.reset_steering()
+        speed = self.base_speed if speed is None else speed
+        max_speed = self.max_speed if max_speed is None else max_speed
+        pwm = round(clamp(speed, self.min_speed, max_speed))
+        self.motor_driver.set_speeds(pwm, pwm)
+        return True
+
+    def reverse(self, state, speed, heading_correction=0.0, max_delta=85):
+        """Follow the same line in reverse with optional gyro correction."""
+        self.reset_steering()
+        if state is None or state.get("position") is None:
+            self.stop()
+            return False
+
+        correction = clamp(
+            self.correction(state["position"]) + heading_correction,
+            -max_delta,
+            max_delta,
+        )
+        left = clamp(-speed + correction, -255, -15)
+        right = clamp(-speed - correction, -255, -15)
+        self.motor_driver.set_speeds(round(left), round(right))
+        return True
+
+    def reverse_straight(self, speed, heading_correction=0.0, max_delta=85):
+        """Continue reversing from gyro heading when line position is absent."""
+        self.reset_steering()
+        correction = clamp(heading_correction, -max_delta, max_delta)
+        left = clamp(-speed + correction, -255, -15)
+        right = clamp(-speed - correction, -255, -15)
+        self.motor_driver.set_speeds(round(left), round(right))
+        return True
+
+
 def _group_mean(values, indexes):
     return sum(values[i] for i in indexes) / len(indexes)
-
-
-def _group_white_fraction(values, indexes):
-    """Normalized values are blackness, so white fraction is 1 - value."""
-    return sum(1.0 - values[i] for i in indexes) / len(indexes)
 
 
 def detect_crossing(values):
@@ -212,11 +356,14 @@ def detect_crossing(values):
     if center_blackness < CROSSING_CENTER_BLACKNESS_MIN:
         return None
 
-    left_white = _group_white_fraction(values, LEFT_SENSORS)
-    right_white = _group_white_fraction(values, RIGHT_SENSORS)
-
-    left_is_black = left_white <= CROSSING_WHITE_THRESHOLD
-    right_is_black = right_white <= CROSSING_WHITE_THRESHOLD
+    left_is_black = (
+        values[LEFT_SENSORS[0]] >= CROSSING_EDGE_ON
+        and values[LEFT_SENSORS[1]] >= CROSSING_SIDE_SUPPORT_MIN
+    )
+    right_is_black = (
+        values[RIGHT_SENSORS[-1]] >= CROSSING_EDGE_ON
+        and values[RIGHT_SENSORS[0]] >= CROSSING_SIDE_SUPPORT_MIN
+    )
 
     if left_is_black and right_is_black:
         return "BOTH"

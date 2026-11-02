@@ -11,8 +11,14 @@ from unittest.mock import Mock, patch
 def load_navigation():
     stubs = {name: types.ModuleType(name) for name in
              ("smbus", "telemetrix", "motors", "line_tracker",
-              "sensors.vl53l0x_sensor")}
+              "sensors.vl53l0x_sensor", "led", "robot_pin_config")}
     stubs["telemetrix"].telemetrix = Mock()
+    stubs["line_tracker"].LineTrackingEngine = Mock(return_value=Mock())
+    stubs["line_tracker"].CENTER_POSITION = 0.0
+    stubs["led"].RGBLED = Mock(return_value=Mock())
+    stubs["robot_pin_config"].LED_RED = 17
+    stubs["robot_pin_config"].LED_GREEN = 27
+    stubs["robot_pin_config"].LED_BLUE = 22
     stubs["sensors.vl53l0x_sensor"].VL53L0XSensor = Mock()
     with patch.dict(sys.modules, stubs):
         spec = importlib.util.spec_from_file_location(
@@ -42,6 +48,23 @@ class ButtonPositionTests(unittest.TestCase):
         self.assertFalse(nav.button_position_ready(self.centered, 22.6))
         off_center = {**self.centered, "position": 0.6}
         self.assertFalse(nav.button_position_ready(off_center, 21.5))
+
+    def test_junction_is_detected_without_centered_history(self):
+        nav = self.nav
+        detector = nav.JunctionDetector()
+        branch = {
+            "position": -1.4,
+            "normalized": [0.9, 0.7, 0, 0.8, 0.8, 0, 0, 0],
+        }
+        self.assertTrue(detector.read(branch)[2])
+
+    def test_isolated_outer_patch_is_rejected(self):
+        detector = self.nav.JunctionDetector()
+        patch_state = {
+            "position": -1.4,
+            "normalized": [0.9, 0.2, 0, 0.8, 0.8, 0, 0, 0],
+        }
+        self.assertFalse(detector.read(patch_state)[2])
 
     def test_too_close_reverses_then_confirms_while_stopped(self):
         nav = self.nav
