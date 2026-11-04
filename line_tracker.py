@@ -45,13 +45,10 @@ RIGHT_SENSORS = (6, 7)
 CALIBRATION_SAMPLES = 100
 
 sensor_values = [0] * SENSOR_COUNT
-<<<<<<< HEAD
 sample_times = [None] * SENSOR_COUNT
 sample_ids = [0] * SENSOR_COUNT
-_sample_lock = threading.Lock()
-=======
 callback_received = [False] * SENSOR_COUNT
->>>>>>> ead9c9e (Line tracking restored!)
+_sample_lock = threading.Lock()
 board = None
 
 
@@ -60,7 +57,6 @@ def _make_callback(index):
 
     def callback(data):
         try:
-<<<<<<< HEAD
             value = int(data[2])
             if int(data[1]) != pin or not 0 <= value <= 4095:
                 return
@@ -70,14 +66,7 @@ def _make_callback(index):
             sensor_values[index] = value
             sample_times[index] = time.monotonic()
             sample_ids[index] += 1
-=======
-            # ADC.py's working Telemetrix callback reads data[2] directly.
-            # Zero is a valid reading, so readiness is tracked separately.
-            sensor_values[index] = data[2]
             callback_received[index] = True
-        except Exception as exc:
-            print(f"\nSensor {index + 1} callback error: {data} {exc}")
->>>>>>> ead9c9e (Line tracking restored!)
 
     return callback
 
@@ -90,15 +79,11 @@ def initialize(board_instance):
         raise ValueError("A connected Telemetrix board is required.")
 
     board = board_instance
-<<<<<<< HEAD
     with _sample_lock:
         sensor_values[:] = [0] * SENSOR_COUNT
         sample_times[:] = [None] * SENSOR_COUNT
         sample_ids[:] = [0] * SENSOR_COUNT
-=======
-    sensor_values[:] = [0] * SENSOR_COUNT
-    callback_received[:] = [False] * SENSOR_COUNT
->>>>>>> ead9c9e (Line tracking restored!)
+        callback_received[:] = [False] * SENSOR_COUNT
 
     for index, pin in enumerate(SENSOR_PINS):
         board.set_pin_mode_analog_input(
@@ -109,11 +94,13 @@ def initialize(board_instance):
 
 def callback_status():
     """Return which ADC channels have produced at least one callback."""
-    return callback_received.copy()
+    with _sample_lock:
+        return callback_received.copy()
 
 
 def all_callbacks_ready():
-    return all(callback_received)
+    with _sample_lock:
+        return all(callback_received)
 
 
 def wait_for_callbacks(timeout=6.0, poll_interval=0.04):

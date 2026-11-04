@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """ArmRobotics: differential2 line following + junction commands + button task."""
 
+import math
 import time
 
 import smbus
@@ -20,15 +21,15 @@ rgb = led.RGBLED(
 
 # Previously tested differential2 line-following speeds.
 SERIAL_PORT = "/dev/serial0"
-BASE_SPEED = 110
-MAX_SPEED = 180
+BASE_SPEED = 180
+MAX_SPEED = 255
 MIN_SPEED = -80
 MANEUVER_SPEED = 100
 MANEUVER_MAX_SPEED = 170
 KP = 50.0
 KD = 2.0
 TARGET_POSITION = line_tracker.CENTER_POSITION
-LOOP_DELAY = 0.04
+LOOP_DELAY = 0.02
 
 # Line-strength limits reused by the button positioning task.
 START_CENTER_BLACK_MIN = 0.30
@@ -41,12 +42,20 @@ JUNCTION_SIDE_SUPPORT_ON = 0.55
 JUNCTION_SIDE_SUPPORT_OFF = 0.35
 JUNCTION_CENTER_MIN = 0.50
 JUNCTION_CONFIRM = 2
-JUNCTION_CLEAR = 4
+JUNCTION_CLEAR = 3
+POST_TURN_JUNCTION_IGNORE_SECONDS = 0.2
+POST_JUNCTION_ACCEL_SECONDS = 0.5
+STRAIGHT_MAX_SPEED = 255
+STRAIGHT_ACCEL_RATE = 180.0
+STRAIGHT_DECEL_RATE = 300.0
+STRAIGHT_CONFIRM_SECONDS = 0.25
+STRAIGHT_POSITION_TOLERANCE = 0.55
+STRAIGHT_DERROR_LIMIT = 12.0
 
 # After any gyro turn, differential2 centers the robot again.
-REACQUIRE_TIMEOUT = 2.0
-REACQUIRE_TOLERANCE = 0.65
-REACQUIRE_CONFIRM = 4
+REACQUIRE_TIMEOUT = 1.2
+REACQUIRE_TOLERANCE = 0.75
+REACQUIRE_CONFIRM = 2
 
 I2C_BUS = 1
 MPU_ADDR = 0x68
@@ -56,10 +65,24 @@ GYRO_TIMEOUT = 5.0
 GYRO_CALIBRATION_SAMPLES = 20
 GYRO_CALIBRATION_SETTLE_SECONDS = 0.08
 GYRO_CALIBRATION_SAMPLE_DELAY = 0.001
+GYRO_DIRECTION_SETTLE_SECONDS = 0.03
+GYRO_DIRECTION_MIN_RATE = 8.0
+GYRO_DIRECTION_CONFIRM_SAMPLES = 3
+GYRO_REVERSE_CONFIRM_SECONDS = 0.05
 PIVOT_SETTLE_SECONDS = 0.1
-TURN_ANGLE = 80.0
+TURN_ANGLE = 75.0
+TURN_90_ANGLE = 90.0
 TURN_PWM_FAST = 255
 TURN_PWM_SLOW = 90
+TURN_90_PWM_FAST = 190
+TURN_90_PWM_SLOW = 80
+# main_old's uncalibrated alignment PWM and 0.50 s travel.
+# Keep this independent of BASE_SPEED and MANEUVER_SPEED.
+TURN_90_FORWARD_SPEED = 80
+TURN_90_FORWARD_MAX_SPEED = 120
+TURN_90_FORWARD_TIME = 0.5
+TURN_TOLERANCE_DEG = 8.0
+TURN_CORRECTION_START_DEG = 4.0
 
 BUTTON_DISTANCE_CM = 21.5
 BUTTON_DISTANCE_TOLERANCE_CM = 0.5
@@ -105,34 +128,36 @@ FIRE_FINAL_RIGHT_ANGLE = 300.0
 # Example: ROUTE = ["L", "S", "B", "R", "C", "F", "Q"]
 # The commented entries below are placeholders: edit them before launching.
 ROUTE = [
-    # "B",
-    # "L",
-    # "R",
-    # "S",
-    # "R",
-    # "L",
-    # "C",
-    # "S",
-    # "R",
-    # "F",
-    # "L",
-    # "R",
-    # "R",
-    # "L",
-    # "Q",
+    "S", #
+    "L",
+    "R",
     "S",
+    "R",
+    "L",
+    "R90", #C
+    "S",
+    "R",
+    "S", #F
     "L",
     "R",
     "R",
-    "R",
-    "R",
-    "S",
-    "L",
-    "R",
+    "L90",
     "Q",
+    # "S",
+    # "L",
+    # "R",
+    # "R",
+    # "R",
+    # "R",
+    # "S",
+    # "L",
+    # "R",
+    # "Q",
 
 ]
-ALLOWED_ROUTE_COMMANDS = {"L", "R", "S", "B", "C", "F", "Q"}
+ALLOWED_ROUTE_COMMANDS = {
+    "L", "R", "L90", "R90", "S", "B", "C", "F", "Q"
+}
 
 
 line_follower = line_tracker.LineTrackingEngine(
@@ -152,6 +177,62 @@ def stop():
 def differential_drive(state, speed=BASE_SPEED, max_speed=MAX_SPEED):
     """Compatibility wrapper around the separate line-following engine."""
     return line_follower.drive(state, speed=speed, max_speed=max_speed)
+
+
+def post_junction_drive_limits(elapsed):
+    """Ramp both base PWM and the wheel PWM ceiling after a maneuver."""
+    fraction = max(0.0, min(1.0, elapsed / POST_JUNCTION_ACCEL_SECONDS))
+    start_speed = min(MANEUVER_SPEED, BASE_SPEED)
+    start_max = min(MANEUVER_MAX_SPEED, MAX_SPEED)
+    speed = start_speed + (BASE_SPEED - start_speed) * fraction
+    max_speed = start_max + (MAX_SPEED - start_max) * fraction
+    return speed, max_speed
+
+
+def update_straight_speed(state, left, right, candidate, controller, now):
+    """Raise speed only while the line is stably centered and branch-free."""
+    position = state.get("position") if state else None
+    previous_time = controller["previous_time"]
+    dt = 0.0 if previous_time is None else max(0.0, now - previous_time)
+    controller["previous_time"] = now
+
+    if position is None:
+        controller["current_speed"] = BASE_SPEED
+        controller["previous_error"] = None
+        controller["straight_since"] = None
+        return BASE_SPEED, MAX_SPEED
+
+    error = position - TARGET_POSITION
+    previous_error = controller["previous_error"]
+    derivative = 0.0
+    if previous_error is not None and dt > 0.0:
+        derivative = (error - previous_error) / dt
+    controller["previous_error"] = error
+
+    stable = (
+        not left and not right and not candidate
+        and abs(error) <= STRAIGHT_POSITION_TOLERANCE
+        and abs(derivative) <= STRAIGHT_DERROR_LIMIT
+    )
+    if stable:
+        if controller["straight_since"] is None:
+            controller["straight_since"] = now
+        if now - controller["straight_since"] >= STRAIGHT_CONFIRM_SECONDS:
+            controller["current_speed"] = min(
+                STRAIGHT_MAX_SPEED,
+                controller["current_speed"] + STRAIGHT_ACCEL_RATE * dt,
+            )
+    else:
+        controller["straight_since"] = None
+        controller["current_speed"] = max(
+            BASE_SPEED,
+            controller["current_speed"] - STRAIGHT_DECEL_RATE * dt,
+        )
+
+    return controller["current_speed"], min(
+        STRAIGHT_MAX_SPEED,
+        max(MANEUVER_MAX_SPEED, controller["current_speed"]),
+    )
 
 
 def differential_reverse(state, speed, heading_correction=0.0):
@@ -226,10 +307,9 @@ def gyro_setup(bus):
     time.sleep(0.2)
 
 
-def gyro_calibrate(bus):
+def gyro_calibrate(bus, settle_seconds=GYRO_CALIBRATION_SETTLE_SECONDS):
     stop()
-    print("\nGyroscope calibration: keep the robot still.")
-    time.sleep(GYRO_CALIBRATION_SETTLE_SECONDS)
+    time.sleep(settle_seconds)
     values = []
     for _ in range(GYRO_CALIBRATION_SAMPLES):
         values.append(gyro_raw(bus))
@@ -254,7 +334,7 @@ class Heading:
 
 
 def pivot(bus, offset, direction, angle_target=TURN_ANGLE):
-    """Gyro-controlled pivot. Return success and LEFT-turn gyro polarity."""
+    """Original L/R pivot, also used by the existing B/C/F tasks."""
     if direction not in ("L", "R"):
         raise ValueError("Turn direction must be L or R")
 
@@ -263,36 +343,141 @@ def pivot(bus, offset, direction, angle_target=TURN_ANGLE):
         -TURN_PWM_SLOW if left else TURN_PWM_FAST,
         TURN_PWM_FAST if left else -TURN_PWM_SLOW,
     )
-
     start = previous = time.monotonic()
     angle = signed = 0.0
-
     try:
         while angle < angle_target:
             now = time.monotonic()
             rate = gyro_rate(bus, offset)
             dt = max(0.0, now - previous)
             previous = now
-
             angle += abs(rate) * dt
             signed += rate * dt
-
             if now - start >= GYRO_TIMEOUT:
                 print("\nTurn timeout.")
                 return False, None
-
             time.sleep(0.005)
-
         sign = (
             (1 if signed > 0 else -1)
             if left and abs(signed) > 20
             else None
         )
         return True, sign
-
     finally:
         stop()
         time.sleep(PIVOT_SETTLE_SECONDS)
+
+
+def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE):
+    """Controlled pivot with the tested 90-degree correction logic."""
+    if direction not in ("L", "R"):
+        raise ValueError("Turn direction must be L or R")
+
+    stop()
+    left = direction == "L"
+    start = previous = time.monotonic()
+    angle = signed = 0.0
+    gyro_sign = None
+    candidate_sign = None
+    direction_samples = 0
+    reverse_since = None
+    last_rate = 0.0
+    lead = 5.6425 if left else 6.125
+
+    try:
+        while True:
+            now = time.monotonic()
+            rate = gyro_rate(bus, offset)
+            dt = max(0.0, min(now - previous, 0.1))
+            previous = now
+            if not math.isfinite(rate) or abs(rate) > 1000:
+                raise RuntimeError("GYRO_TURN: invalid angular rate")
+            # Ignore pre-drive/coasting samples. Learn polarity only from a
+            # consistent response after the pivot motors have started.
+            if gyro_sign is None:
+                if (now - start >= GYRO_DIRECTION_SETTLE_SECONDS
+                        and abs(rate) >= GYRO_DIRECTION_MIN_RATE):
+                    observed_sign = 1 if rate > 0 else -1
+                    direction_samples = (
+                        direction_samples + 1
+                        if observed_sign == candidate_sign else 1
+                    )
+                    candidate_sign = observed_sign
+                    if direction_samples >= GYRO_DIRECTION_CONFIRM_SAMPLES:
+                        gyro_sign = candidate_sign
+                else:
+                    direction_samples = 0
+                    candidate_sign = None
+            if gyro_sign is not None:
+                directed = rate * gyro_sign
+                if directed < -GYRO_DIRECTION_MIN_RATE:
+                    if reverse_since is None:
+                        reverse_since = now
+                    elif now - reverse_since >= GYRO_REVERSE_CONFIRM_SECONDS:
+                        raise RuntimeError("GYRO_TURN: gyro direction reversed")
+                else:
+                    reverse_since = None
+                angle = max(0.0, angle + directed * dt)
+                signed += rate * dt
+            last_rate = abs(rate)
+            stop_angle = angle_target - max(
+                lead, min(12.0, last_rate * 0.04)
+            )
+            if angle >= stop_angle:
+                break
+            if now - start >= GYRO_TIMEOUT or (now - start > 0.7 and angle < 2):
+                print(f"\nGYRO_TURN timeout/no motion at {angle:.1f} degrees")
+                return False, None
+            pwm = (
+                TURN_90_PWM_SLOW
+                if angle >= angle_target - 25
+                else TURN_90_PWM_FAST
+            )
+            motors.set_speeds(-pwm if left else pwm, pwm if left else -pwm)
+            time.sleep(0.005)
+
+        stop()
+        settle_until = time.monotonic() + 0.05
+        while time.monotonic() < settle_until:
+            now = time.monotonic()
+            signed += gyro_rate(bus, offset) * max(
+                0.0, min(now - previous, 0.1)
+            )
+            previous = now
+            time.sleep(0.005)
+
+        final_angle = abs(signed)
+        if (angle_target >= 45
+                and TURN_CORRECTION_START_DEG < angle_target - final_angle <= 20):
+            correction_deadline = time.monotonic() + 0.2
+            while time.monotonic() < correction_deadline:
+                now = time.monotonic()
+                signed += gyro_rate(bus, offset) * max(
+                    0.0, min(now - previous, 0.1)
+                )
+                previous = now
+                if abs(signed) >= angle_target - lead:
+                    break
+                motors.set_speeds(-70 if left else 70, 70 if left else -70)
+                time.sleep(0.005)
+            stop()
+            final_angle = abs(signed)
+
+        tolerance = min(TURN_TOLERANCE_DEG, angle_target * 0.2)
+        print(
+            f"\nGYRO_TURN {direction}: target={angle_target:.1f}, "
+            f"gyro={final_angle:.1f}, error={final_angle-angle_target:+.1f}"
+        )
+        sign = (
+            (1 if signed > 0 else -1)
+            if left and abs(signed) > 5
+            else None
+        )
+        return abs(final_angle - angle_target) <= tolerance, sign
+
+    finally:
+        stop()
+        time.sleep(0.02)
 
 
 def reacquire_line(calibration):
@@ -331,7 +516,8 @@ def reacquire_line(calibration):
         stop()
 
 
-def follow_for(calibration, seconds):
+def follow_for(calibration, seconds, *, speed=MANEUVER_SPEED,
+               max_speed=MANEUVER_MAX_SPEED):
     """Timed forward movement: unchanged differential2 line-following."""
     deadline = time.monotonic() + seconds
     try:
@@ -339,12 +525,12 @@ def follow_for(calibration, seconds):
             state = line_tracker.update(calibration)
             if state["position"] is None:
                 line_follower.drive_straight(
-                    speed=MANEUVER_SPEED,
-                    max_speed=MANEUVER_MAX_SPEED,
+                    speed=speed,
+                    max_speed=max_speed,
                 )
             else:
                 differential_drive(
-                    state, speed=MANEUVER_SPEED, max_speed=MANEUVER_MAX_SPEED
+                    state, speed=speed, max_speed=max_speed
                 )
             time.sleep(LOOP_DELAY)
         return True
@@ -798,7 +984,7 @@ def load_route():
         if cmd not in ALLOWED_ROUTE_COMMANDS:
             raise ValueError(
                 f"Invalid ROUTE entry #{index}: {command!r}. "
-                "Allowed: L, R, S, B, C, F, Q."
+                "Allowed: L, R, L90, R90, S, B, C, F, Q."
             )
         if cmd == "Q" and index != len(ROUTE):
             raise ValueError("Q must be the last ROUTE entry.")
@@ -808,6 +994,7 @@ def load_route():
 
 def main():
     board = bus = sensor = None
+    offset_90 = None
     motors_on = tracker_on = False
 
     try:
@@ -858,6 +1045,14 @@ def main():
         candidate_count = 0
         clear_count = 0
         latched = False
+        junction_ignore_until = 0.0
+        acceleration_started = None
+        straight_speed = {
+            "current_speed": BASE_SPEED,
+            "previous_error": None,
+            "previous_time": None,
+            "straight_since": None,
+        }
 
         while True:
             # EXACT same reading as the working standalone differential2.py.
@@ -873,7 +1068,8 @@ def main():
             if clear_count >= JUNCTION_CLEAR:
                 latched = False
 
-            if not latched and candidate:
+            if (time.monotonic() >= junction_ignore_until
+                    and not latched and candidate):
                 candidate_count += 1
             else:
                 candidate_count = 0
@@ -897,12 +1093,17 @@ def main():
                     print("ROUTE: stop command.")
                     break
 
-                if cmd in ("L", "R", "B", "C", "F"):
+                if cmd in ("L", "R", "L90", "R90", "B", "C", "F"):
                     # Gyro stays unloaded until a maneuver requires it.
                     if bus is None:
                         bus = smbus.SMBus(I2C_BUS)
                         gyro_setup(bus)
-                    offset = gyro_calibrate(bus)
+                    if cmd in ("L90", "R90"):
+                        if offset_90 is None:
+                            offset_90 = gyro_calibrate(bus, settle_seconds=0.05)
+                        offset = offset_90
+                    else:
+                        offset = gyro_calibrate(bus)
 
                     if cmd == "B":
                         if sensor is None:
@@ -921,6 +1122,20 @@ def main():
                             # Same 80-degree R turn and differential reacquire.
                             ok, _ = pivot(bus, offset, "R")
                             ok = ok and reacquire_line(calibration)
+                    elif cmd in ("L90", "R90"):
+                        ok = follow_for(
+                            calibration, TURN_90_FORWARD_TIME,
+                            speed=TURN_90_FORWARD_SPEED,
+                            max_speed=TURN_90_FORWARD_MAX_SPEED,
+                        )
+                        if ok:
+                            ok, _ = pivot_90(
+                                bus,
+                                offset,
+                                cmd[0],
+                                angle_target=TURN_90_ANGLE,
+                            )
+                        ok = ok and reacquire_line(calibration)
                     else:
                         ok, _ = pivot(bus, offset, cmd)
                         ok = ok and reacquire_line(calibration)
@@ -930,6 +1145,16 @@ def main():
                 if not ok:
                     print("\nManeuver failed. Robot stopped.")
                     break
+                acceleration_started = time.monotonic()
+                straight_speed["current_speed"] = MANEUVER_SPEED
+                straight_speed["previous_error"] = None
+                straight_speed["previous_time"] = None
+                straight_speed["straight_since"] = None
+                if cmd in ("L", "R", "L90", "R90", "B", "C", "F"):
+                    junction_ignore_until = (
+                        time.monotonic() + POST_TURN_JUNCTION_IGNORE_SECONDS
+                    )
+                    candidate_count = 0
                 if route_index >= len(route):
                     stop()
                     print("\nAll ROUTE commands completed. Robot stopped.")
@@ -940,13 +1165,30 @@ def main():
             # Only the tested differential2.py decides how to follow the line.
             if position is None:
                 stop()
+                if acceleration_started is not None:
+                    acceleration_started = time.monotonic()
                 print(
                     '\rNO LINE: paused; route resumes when line returns. '
                     f'raw={state["raw"]}',
                     end="", flush=True,
                 )
             else:
-                differential_drive(state)
+                if acceleration_started is None:
+                    speed, max_speed = update_straight_speed(
+                        state, left, right, candidate,
+                        straight_speed, time.monotonic(),
+                    )
+                    differential_drive(state, speed=speed, max_speed=max_speed)
+                else:
+                    elapsed = time.monotonic() - acceleration_started
+                    speed, max_speed = post_junction_drive_limits(elapsed)
+                    differential_drive(state, speed=speed, max_speed=max_speed)
+                    if elapsed >= POST_JUNCTION_ACCEL_SECONDS:
+                        acceleration_started = None
+                        straight_speed["current_speed"] = speed
+                        straight_speed["previous_error"] = None
+                        straight_speed["previous_time"] = None
+                        straight_speed["straight_since"] = None
                 print(
                     f"\rLINE pos={position:+.3f} "
                     f"S1={int(left)} S8={int(right)}",

@@ -10,9 +10,9 @@ import motors
 PORT = "/dev/serial0"
 
 # Adjust these to suit your robot.
-DRIVE_SPEED = 200
-TURN_SPEED = 130
-LOOP_DELAY = 0.02
+DRIVE_SPEED = 255
+TURN_SPEED = 180
+LOOP_DELAY = 0.05
 
 board = None
 
@@ -48,6 +48,7 @@ def controller(stdscr):
     current_key = None
 
     while True:
+        cycle_started = time.monotonic()
         height, width = stdscr.getmaxyx()
         stdscr.erase()
 
@@ -77,6 +78,13 @@ def controller(stdscr):
         stdscr.refresh()
 
         key = stdscr.getch()
+        # Consume queued key repeats so each tick uses the latest command.
+        # Stop/quit take priority over queued movement commands.
+        while key not in (ord("q"), ord(" "), -1):
+            next_key = stdscr.getch()
+            if next_key == -1:
+                break
+            key = next_key
 
         if key == ord("q"):
             break
@@ -86,15 +94,14 @@ def controller(stdscr):
             stop()
 
         elif key in (ord("w"), ord("a"), ord("s"), ord("d")):
-            if key != current_key:
-                current_key = key
-                drive(key)
+            current_key = key
+            drive(key)
 
         elif key == -1:
             current_key = None
             stop()
 
-        time.sleep(LOOP_DELAY)
+        time.sleep(max(0.0, LOOP_DELAY - (time.monotonic() - cycle_started)))
 
 
 def main():
