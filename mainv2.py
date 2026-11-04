@@ -9,14 +9,6 @@ from telemetrix import telemetrix
 import line_tracker
 import motors
 from sensors.vl53l0x_sensor import VL53L0XSensor
-import led
-import robot_pin_config as pins
-
-rgb = led.RGBLED(
-    pins.LED_RED,
-    pins.LED_GREEN,
-    pins.LED_BLUE,
-)
 
 # Previously tested differential2 line-following speeds.
 SERIAL_PORT = "/dev/serial0"
@@ -105,13 +97,13 @@ FIRE_FINAL_RIGHT_ANGLE = 300.0
 # Example: ROUTE = ["L", "S", "B", "R", "C", "F", "Q"]
 # The commented entries below are placeholders: edit them before launching.
 ROUTE = [
-    "S", #
+    "B", #
     "L",
     "R",
     "S",
     "R",
     "L",
-    "R",#C
+    "C",#C
     "S",
     "R",
     "S", #F

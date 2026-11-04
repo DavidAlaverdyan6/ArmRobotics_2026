@@ -10,14 +10,6 @@ from telemetrix import telemetrix
 import line_tracker
 import motors
 from sensors.vl53l0x_sensor import VL53L0XSensor
-import led
-import robot_pin_config as pins
-
-rgb = led.RGBLED(
-    pins.LED_RED,
-    pins.LED_GREEN,
-    pins.LED_BLUE,
-)
 
 # Previously tested differential2 line-following speeds.
 SERIAL_PORT = "/dev/serial0"
@@ -49,8 +41,8 @@ STRAIGHT_MAX_SPEED = 255
 STRAIGHT_ACCEL_RATE = 180.0
 STRAIGHT_DECEL_RATE = 300.0
 STRAIGHT_CONFIRM_SECONDS = 0.25
-STRAIGHT_POSITION_TOLERANCE = 0.55
-STRAIGHT_DERROR_LIMIT = 12.0
+STRAIGHT_POSITION_TOLERANCE = 0.35
+STRAIGHT_DERROR_LIMIT = 8.0
 
 # After any gyro turn, differential2 centers the robot again.
 REACQUIRE_TIMEOUT = 1.2
@@ -74,8 +66,6 @@ TURN_ANGLE = 75.0
 TURN_90_ANGLE = 90.0
 TURN_PWM_FAST = 255
 TURN_PWM_SLOW = 90
-TURN_90_PWM_FAST = 190
-TURN_90_PWM_SLOW = 80
 # main_old's uncalibrated alignment PWM and 0.50 s travel.
 # Keep this independent of BASE_SPEED and MANEUVER_SPEED.
 TURN_90_FORWARD_SPEED = 80
@@ -128,31 +118,21 @@ FIRE_FINAL_RIGHT_ANGLE = 300.0
 # Example: ROUTE = ["L", "S", "B", "R", "C", "F", "Q"]
 # The commented entries below are placeholders: edit them before launching.
 ROUTE = [
-    "S", #
+    "B", 
     "L",
     "R",
     "S",
     "R",
     "L",
-    "R90", #C
+    "C", 
     "S",
     "R",
-    "S", #F
+    "S", 
     "L",
     "R",
     "R",
     "L90",
     "Q",
-    # "S",
-    # "L",
-    # "R",
-    # "R",
-    # "R",
-    # "R",
-    # "S",
-    # "L",
-    # "R",
-    # "Q",
 
 ]
 ALLOWED_ROUTE_COMMANDS = {
@@ -428,11 +408,7 @@ def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE):
             if now - start >= GYRO_TIMEOUT or (now - start > 0.7 and angle < 2):
                 print(f"\nGYRO_TURN timeout/no motion at {angle:.1f} degrees")
                 return False, None
-            pwm = (
-                TURN_90_PWM_SLOW
-                if angle >= angle_target - 25
-                else TURN_90_PWM_FAST
-            )
+            pwm = TURN_PWM_SLOW if angle >= angle_target - 25 else TURN_PWM_FAST
             motors.set_speeds(-pwm if left else pwm, pwm if left else -pwm)
             time.sleep(0.005)
 
