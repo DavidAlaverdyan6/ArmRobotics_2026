@@ -8,6 +8,21 @@ from arm_ik import forward_kinematics
 
 
 class ButtonPathTests(unittest.TestCase):
+    def test_arm_web_and_camera_use_the_same_start_pose(self):
+        with patch.dict(sys.modules, {
+            'telemetrix': types.SimpleNamespace(telemetrix=Mock())
+        }):
+            import arm_web
+            from arm_camera_button import CFG
+        expected = (90, 170, 180, 0, 180)
+        self.assertEqual(
+            tuple(arm_web.START_ANGLES[name] for name in (
+                'base', 'shoulder', 'elbow', 'wrist', 'gripper'
+            )),
+            expected,
+        )
+        self.assertEqual(CFG.OBSERVATION_ANGLES, expected)
+
     def test_shared_arm_attaches_servos_only_once(self):
         from roboarm import get_shared_arm
 
@@ -26,10 +41,10 @@ class ButtonPathTests(unittest.TestCase):
         web.arm = RoboArm(Mock())
         web.arm.write(**web.START_ANGLES)
         saved = web.get_current_angles()
-        paths = button_arm.plan_button_paths(web, 350, 0, -40)
+        paths = button_arm.plan_button_paths(web, 350, 0, -50)
         self.assertEqual(web.get_current_angles(), saved)
         self.assertEqual(len(paths), 2)
-        for path, target in zip(paths, [(250,0,100),(350,0,-40)]):
+        for path, target in zip(paths, [(250,0,100),(350,0,-50)]):
             xyz = forward_kinematics(**path[-1])
             for actual, expected in zip(xyz, target):
                 self.assertAlmostEqual(actual, expected, delta=0.2)
@@ -48,5 +63,39 @@ class ButtonPathTests(unittest.TestCase):
         self.assertTrue(all(not (abs(px-350) < 0.5 and abs(pz-100) < 0.5)
                             for px, py, pz in points))
         with self.assertRaises(ValueError):
-            button_arm.plan_button_paths(web, 900, 0, -40)
+            button_arm.plan_button_paths(web, 900, 0, -50)
         self.assertEqual(web.get_current_angles(), saved)
+
+    def test_tested_minus_50_contact_is_reachable_from_new_start(self):
+        with patch.dict(sys.modules, {
+            'telemetrix': types.SimpleNamespace(telemetrix=Mock())
+        }):
+            import arm_web as web
+            from roboarm import RoboArm
+        web.arm = RoboArm(Mock())
+        web.arm.write(**web.START_ANGLES)
+        paths = button_arm.plan_button_paths(web, 350, 0, -50)
+        xyz = forward_kinematics(**paths[-1][-1])
+        for actual, expected in zip(xyz, (350, 0, -50)):
+            self.assertAlmostEqual(actual, expected, delta=0.2)
+
+    def test_press_cycle_returns_to_base_pose_after_observation(self):
+        with patch.dict(sys.modules, {
+            'telemetrix': types.SimpleNamespace(telemetrix=Mock())
+        }):
+            import arm_web as web
+            from roboarm import RoboArm
+        web.arm = RoboArm(Mock())
+        web.arm.write(**web.START_ANGLES)
+        web.arm.write(base=95, shoulder=165, elbow=178, wrist=2)
+        with patch.dict(sys.modules, {'arm_web': web}), \
+             patch.object(web.time, 'sleep'):
+                result = web.execute_button_cycle(
+                    {'x': 350, 'y': 0, 'z': -50},
+                    hold_seconds=0.2,
+                )
+        for joint in web.IK_JOINTS:
+            self.assertAlmostEqual(
+                result['returned_angles'][joint],
+                web.START_ANGLES[joint],
+            )

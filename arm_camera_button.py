@@ -11,14 +11,16 @@ import errno
 import json
 import logging
 import math
+import os
 import signal
+import sys
 import threading
 import time
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 try:
@@ -55,7 +57,7 @@ class Config:
     MIN_RED_AREA: int = 700
     CENTER_TOLERANCE_PX: float = 12.0
     MAX_XYZ_STEP_MM: float = 8.0
-    MOVEMENT_SETTLE_TIME: float = 0.35
+    MOVEMENT_SETTLE_TIME: float = 0.20
     MAX_APPROACH_TIME: float = 20.0
     MAX_PRESS_DEPTH_MM: Optional[float] = None  # NOT_CALIBRATED: must be measured.
     BUTTON_TARGET_SIZE_MM: Optional[float] = 60.0  # User-measured diameter.
@@ -74,11 +76,26 @@ class Config:
     CALIBRATION_MOVE_MM: float = 5.0
     CAMERA_ROTATION_DEG: int = 180
     MAX_SERVO_STEP_DEG: int = 1
-    SERVO_STEP_INTERVAL: float = 0.15
+    SERVO_STEP_INTERVAL: float = 0.08
+    MAX_ALIGNMENT_CORRECTION_DEG: int = 3
+    MAX_LOCAL_ALIGNMENT_DISTANCE_MM: float = 60.0
     MAX_CALIBRATION_DRIFT_MM: float = 15.0
+    MAX_CALIBRATION_JOINT_DRIFT_DEG: float = 25.0
     OBSERVATION_ANGLES: tuple = (90, 170, 180, 0, 180)
     MAX_OBSERVATION_PROBE_DEG: int = 6
     MIN_PROBE_RESPONSE_PX: float = 10.0
+    REFERENCE_CONTACT_XYZ: tuple = (350.0, 0.0, -50.0)
+    REFERENCE_OBSERVATION_XYZ: tuple = (
+        148.28131302104964, -2.588259946423777, 30.706214885524048
+    )
+    REFERENCE_OBSERVATION_ANGLES: tuple = (89.0, 159.0, 178.0, 2.0)
+    REFERENCE_TOOL_PITCH_DEG: float = -32.064516129032256
+    REFERENCE_BUTTON_DIAMETER_PX: float = 133.3
+    MIN_ESTIMATED_CONTACT_DISTANCE_MM: float = 120.0
+    MAX_ESTIMATED_CONTACT_DISTANCE_MM: float = 320.0
+    PRESS_RETRY_STEP_MM: float = 3.0
+    PRESS_ATTEMPTS: int = 3
+    PRESS_HOLD_SECONDS: float = 0.4
 
 
 CFG = Config()
@@ -139,110 +156,87 @@ class CameraManager:
 
 
 class ButtonDetector:
-    """Uses the project's ColorDetector and adds target locking/tracking."""
+    """Daniel color-object detection plus operator-selected target tracking."""
     def __init__(self, config: Config = CFG):
         if ColorDetector is None:
             raise RuntimeError("ColorDetector could not be loaded")
         self.config, self.detector = config, ColorDetector(min_object_area=config.MIN_RED_AREA)
         self.locked_center, self.locked_size, self.lost_frames = None, None, 0
-        self.confirmation_frames = 0
-        self.pending_center = None
+        self.selected = False
         self.target_id = 0
 
     def candidates(self, frame):
-        # Preserve the project's classifier, but find contours in its RED mask
-        # alone: adjacent blue/brown regions must not merge into the button.
+        """Return every red object using Daniel's classifier/contour detector.
+
+        Only the red part of the color map is passed to find_objects so a
+        touching object of another color cannot merge into the selected target.
+        There are deliberately no shape, circularity, white-background, or
+        image-edge requirements here.
+        """
         color_map = self.detector.classify_colors(frame)
-        mask = np.where(color_map == self.detector.RED, 255, 0).astype(np.uint8)
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        saturated = (((hsv[:, :, 0] <= 8) | (hsv[:, :, 0] >= 172)) &
-                     (hsv[:, :, 1] >= 90) & (hsv[:, :, 2] >= 55))
-        mask[~saturated] = 0
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        objects = []
-        height, width = frame.shape[:2]
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < self.config.MIN_RED_AREA:
-                continue
-            x, y, w, h = cv2.boundingRect(contour)
-            perimeter = cv2.arcLength(contour, True)
-            if not (0.6 <= w / h <= 1.7) or perimeter <= 0:
-                continue
-            if 4 * math.pi * area / perimeter**2 < 0.6:
-                continue
-            if x <= 1 or y <= 1 or x+w >= width-1 or y+h >= height-1:
-                continue  # cropped objects cannot provide a reliable centre/depth
-            pad = max(6, min(w, h)//5)
-            x0, y0, x1, y1 = max(0, x-pad), max(0, y-pad), min(width, x+w+pad), min(height, y+h+pad)
-            ring = np.ones((y1-y0, x1-x0), dtype=bool)
-            ring[y-y0:y-y0+h, x-x0:x-x0+w] = False
-            surround = hsv[y0:y1, x0:x1]
-            white = (surround[:, :, 1] < 70) & (surround[:, :, 2] > 100)
-            if not ring.any() or white[ring].mean() < 0.3:
-                continue
-            moments = cv2.moments(contour)
-            center = (round(moments['m10']/moments['m00']), round(moments['m01']/moments['m00']))
-            objects.append(dict(color="R", x=x, y=y, w=w, h=h, center=center, area=round(area)))
-        return objects
+        red_map = np.where(
+            color_map == self.detector.RED, self.detector.RED, 0
+        ).astype(np.uint8)
+        return self.detector.find_objects(red_map)
+
+    def select(self, obj):
+        self.target_id += 1
+        self.selected = True
+        self.locked_center = tuple(obj["center"])
+        self.locked_size = (obj["w"], obj["h"])
+        self.lost_frames = 0
 
     def detect(self, frame):
         objects = red = self.candidates(frame)
+        if not self.selected:
+            return None, objects
         if not red:
             self.lost_frames += 1
             return None, objects
-        if self.locked_center is None:
-            if len(red) != 1:
-                self.confirmation_frames = 0
-                return None, objects  # multiple buttons require an explicit click
-            chosen = red[0]
-            stable = self.pending_center is not None and math.dist(chosen['center'], self.pending_center) < 10
-            self.confirmation_frames = self.confirmation_frames + 1 if stable else 1
-            self.pending_center = chosen['center']
-            if self.confirmation_frames < 3:
-                return None, objects
-            self.target_id += 1
-        else:
-            chosen = min(red, key=lambda o: math.dist(o["center"], self.locked_center))
-            ratio = (chosen['w'] * chosen['h']) / (self.locked_size[0] * self.locked_size[1])
-            if math.dist(chosen["center"], self.locked_center) > min(50, max(chosen["w"], chosen["h"]) * 0.4) or not 0.6 < ratio < 1.6:
-                self.lost_frames += 1
-                return None, objects
+        chosen = min(red, key=lambda o: math.dist(o["center"], self.locked_center))
+        previous_area = max(1, self.locked_size[0] * self.locked_size[1])
+        ratio = (chosen['w'] * chosen['h']) / previous_area
+        max_shift = max(120, 1.5 * max(
+            chosen["w"], chosen["h"], self.locked_size[0], self.locked_size[1]
+        ))
+        if math.dist(chosen["center"], self.locked_center) > max_shift or not 0.15 < ratio < 6.0:
+            self.lost_frames += 1
+            return None, objects
         self.locked_center, self.locked_size, self.lost_frames = chosen["center"], (chosen["w"], chosen["h"]), 0
         chosen['target_id'] = self.target_id
         return chosen, objects
 
-    @staticmethod
-    def _is_saturated_red(frame, obj):
-        """Reject brown/wood areas that pass the legacy ratio classifier."""
-        if cv2 is None or np is None:
-            return True
-        x, y, w, h = (obj[k] for k in ("x", "y", "w", "h"))
-        roi = frame[max(0, y):y+h, max(0, x):x+w]
-        if roi.size == 0:
-            return False
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        hue = hsv[:, :, 0]
-        red = ((hue <= 8) | (hue >= 172)) & (hsv[:, :, 1] >= 90) & (hsv[:, :, 2] >= 55)
-        return float(red.mean()) >= 0.30
-
     def reset_lock(self):
         self.locked_center = self.locked_size = None
-        self.lost_frames = self.confirmation_frames = 0
-        self.pending_center = None
+        self.lost_frames = 0
+        self.selected = False
 
 
 class IndicatorDetector:
     def __init__(self, config: Config = CFG):
         self.config, self.roi = config, None
+        self.anchor_center = None
 
-    def set_roi(self, x, y, w, h):
+    def set_roi(self, x, y, w, h, anchor_center=None):
         self.roi = tuple(map(int, (x, y, w, h)))
+        self.anchor_center = (
+            None if anchor_center is None
+            else tuple(map(float, anchor_center))
+        )
 
-    def state(self, frame):
+    def current_roi(self, target_center=None):
+        if self.roi is None:
+            return None
+        x, y, w, h = self.roi
+        if self.anchor_center is not None and target_center is not None:
+            x += int(round(float(target_center[0]) - self.anchor_center[0]))
+            y += int(round(float(target_center[1]) - self.anchor_center[1]))
+        return x, y, w, h
+
+    def state(self, frame, target_center=None):
         if self.roi is None:
             return "UNKNOWN"
-        x, y, w, h = self.roi
+        x, y, w, h = self.current_roi(target_center)
         crop = frame[max(0, y):y+h, max(0, x):x+w]
         if crop.size == 0:
             return "UNKNOWN"
@@ -293,8 +287,16 @@ class ArmController:
                 low, high = self.config.SAFE_WORKSPACE[name]
                 if not low <= xyz[i] <= high:
                     raise RuntimeError('Outside configured workspace')
-        elif self.local_origin is None or math.dist(xyz, self.local_origin) > 20:
-            raise RuntimeError('Outside local 20 mm observation trial envelope')
+        elif (
+            self.local_origin is None or
+            math.dist(xyz, self.local_origin)
+            > self.config.MAX_LOCAL_ALIGNMENT_DISTANCE_MM
+        ):
+            raise RuntimeError(
+                'Outside local '
+                f'{self.config.MAX_LOCAL_ALIGNMENT_DISTANCE_MM:g} mm '
+                'alignment envelope'
+            )
 
     def move_angles(self, target):
         """Integer servo microsteps through arm_web's existing short endpoint.
@@ -338,13 +340,47 @@ class ArmController:
                 raise InterruptedError('EMERGENCY STOP')
             return self.status()
 
-    def _request(self, method, path, body=None):
+    def press_button(self, xyz, hold_seconds):
+        x, y, z = map(float, xyz)
+        if not all(math.isfinite(value) for value in (x, y, z)):
+            raise ValueError('non-finite button target')
+        with self.motion_lock:
+            if self.stop_event.is_set():
+                raise InterruptedError('EMERGENCY STOP')
+            return self._request(
+                'POST',
+                '/api/button-press',
+                {
+                    'x': x,
+                    'y': y,
+                    'z': z,
+                    'hold_seconds': float(hold_seconds),
+                },
+                timeout=90,
+            )
+
+    def emergency_stop(self):
+        if not self.base_url:
+            return
+        try:
+            self._request('POST', '/api/stop', {}, timeout=1)
+        except Exception as exc:
+            LOG.warning('Could not forward STOP to arm_web: %s', exc)
+
+    def _request(self, method, path, body=None, timeout=5):
         data = None if body is None else json.dumps(body).encode()
         req = Request(self.base_url + path, data=data, method=method,
                       headers={"Content-Type": "application/json"})
         try:
-            with urlopen(req, timeout=5) as response:
+            with urlopen(req, timeout=timeout) as response:
                 return json.loads(response.read().decode())
+        except HTTPError as exc:
+            try:
+                payload = json.loads(exc.read().decode())
+                detail = payload.get('error', str(exc))
+            except Exception:
+                detail = str(exc)
+            raise RuntimeError(f"arm_web rejected command: {detail}") from exc
         except (URLError, TimeoutError) as exc:
             raise RuntimeError(f"arm_web unavailable: {exc}") from exc
 
@@ -423,7 +459,7 @@ class VisualServoController:
 
 
 class ButtonTaskController:
-    STATES = ("IDLE", "SEARCH", "ALIGN", "APPROACH", "PRESS", "RETREAT", "VERIFY", "HOME", "SUCCESS", "FAILED", "STOP")
+    STATES = ("IDLE", "SEARCH", "ALIGN", "APPROACH", "PRESS", "RETREAT", "VERIFY", "HOME", "PRESSED", "SUCCESS", "FAILED", "STOP")
     def __init__(self, camera, arm, button, indicator, servo, config=CFG):
         self.camera, self.arm, self.button, self.indicator, self.servo, self.config = camera, arm, button, indicator, servo, config
         self.state, self.mode, self.attempt, self.stop_event = "IDLE", "", 0, threading.Event()
@@ -439,18 +475,36 @@ class ButtonTaskController:
             target, candidates = self.button.detect(frame)
             error = None if target is None else [target['center'][0]-self.config.TARGET_PIXEL_U,
                                                  target['center'][1]-self.config.TARGET_PIXEL_V]
-            self.status.update(button=target, error_px=error, candidates=candidates,
-                               frame_time=time.monotonic(), indicator=self.indicator.state(frame))
+            self.status.update(
+                button=target,
+                error_px=error,
+                candidates=candidates,
+                frame_time=time.monotonic(),
+                indicator=self.indicator.state(
+                    frame,
+                    None if target is None else target['center'],
+                ),
+            )
             return frame, target
 
     def telemetry(self):
+        blockers = []
+        if not self.button.selected:
+            blockers.append('выберите красную кнопку')
+        if not self.servo.calibrated:
+            blockers.append('выполните калибровку')
+        if not self.arm.base_url:
+            blockers.append('управление рукой отключено')
         return {**self.status, 'state': self.state, 'attempt': self.attempt,
                 'calibrated': self.servo.calibrated,
                 'jacobian': self.servo.jacobian,
-                'full_ready': False,
-                'full_blocker': 'Distance, contact offset and safe approach/retreat route require calibration'}
+                'full_ready': not blockers,
+                'full_blocker': '; '.join(blockers),
+                'verify_ready': self.state == 'PRESSED' and self.indicator.roi is not None}
 
     def fresh_target(self):
+        if not self.button.selected:
+            raise RuntimeError('Сначала включите камеру и щёлкните по нужному красному объекту')
         samples = []
         for _ in range(6):
             if self.stop_event.is_set():
@@ -465,9 +519,9 @@ class ButtonTaskController:
                     result = dict(samples[-1])
                     result['center'] = tuple(np.median(centers, axis=0).tolist())
                     return result
-            elif self.button.locked_center is not None:
+            elif self.button.lost_frames > self.config.MAX_TARGET_LOSS_FRAMES:
                 raise RuntimeError('Target lost: further motion cancelled')
-        raise RuntimeError('No confirmed red round button on white background')
+        raise RuntimeError('Выбранный красный объект потерян')
 
     def calibrate(self):
         """Measure two image directions using bounded monotonic probes.
@@ -559,22 +613,31 @@ class ButtonTaskController:
             raise RuntimeError("task already running")
         if self.arm.motion_lock.locked():
             raise RuntimeError('Arm command is already running')
-        if mode not in ('DRY_RUN', 'CALIBRATE', 'ALIGNMENT', 'FULL'):
+        if mode not in ('DRY_RUN', 'CALIBRATE', 'ALIGNMENT', 'FULL', 'VERIFY'):
             raise ValueError('Unknown test mode')
-        if mode == 'FULL':
+        if mode == 'FULL' and not self.telemetry()['full_ready']:
             raise RuntimeError(self.telemetry()['full_blocker'])
-        if mode == 'ALIGNMENT' and not self.servo.calibrated:
+        if mode == 'VERIFY' and not self.telemetry()['verify_ready']:
+            raise RuntimeError('Сначала нажмите кнопку и выделите лампу после возврата руки')
+        if mode in ('ALIGNMENT', 'FULL') and not self.servo.calibrated:
             raise RuntimeError('Run Calibrate before Alignment Test')
         self.mode, self.stop_event, self.thread = mode, threading.Event(), threading.Thread(target=self._run, daemon=True)
         self.arm.stop_event = self.stop_event
         self.servo.filtered_error = None
         self.status.pop('last_error', None)
+        self.status.pop('action_error', None)
+        self.status.pop('message', None)
+        if mode == 'FULL':
+            self.indicator.roi = None
+            self.indicator.anchor_center = None
+            self.status['indicator'] = 'UNKNOWN'
         self.thread.start()
 
     def stop(self):
         self.stop_event.set()
+        self.arm.emergency_stop()
         self.state = "STOP"
-        self.status['message'] = 'EMERGENCY STOP: further commands cancelled; an accepted servo write cannot be recalled'
+        self.status['message'] = 'EMERGENCY STOP: arm_web stop requested'
 
     def close(self):
         with self.lifecycle_lock:
@@ -587,6 +650,17 @@ class ButtonTaskController:
 
     def _run(self):
         try:
+            if self.mode == 'VERIFY':
+                self.state = 'VERIFY'
+                result = self._confirm_indicator(timeout=self.config.INDICATOR_CHECK_TIMEOUT)
+                self.state = 'SUCCESS' if result == 'GREEN' else 'PRESSED'
+                self.status['message'] = (
+                    'SUCCESS: зелёная лампа подтверждена' if result == 'GREEN'
+                    else f'Нажатие выполнено; лампа: {result}. Проверьте область индикатора.'
+                )
+                return
+            if not self.button.selected:
+                raise RuntimeError('Сначала включите камеру и щёлкните по нужному красному объекту')
             if self.mode == 'CALIBRATE':
                 self.calibrate()
                 self.state = 'CALIBRATED'
@@ -598,7 +672,7 @@ class ButtonTaskController:
                 while time.monotonic() < deadline and not self.stop_event.is_set():
                     _, target = self.observe()
                     if target: break
-                if not target: raise RuntimeError("button not found")
+                if not target: raise RuntimeError("Выбранный красный объект потерян")
                 if self.stop_event.is_set(): raise InterruptedError('EMERGENCY STOP')
                 LOG.info("BUTTON DETECTED / TARGET LOCKED: %s", target["center"])
                 if self.mode == "DRY_RUN":
@@ -613,24 +687,10 @@ class ButtonTaskController:
                     self.state = "ALIGNED"
                     self.status["message"] = "ALIGNMENT TEST COMPLETE"
                     return
-                initial_indicator = self._verify_initial_indicator()
-                if initial_indicator != "RED":
-                    raise RuntimeError("indicator is not confirmed RED before press")
-                self.state = "APPROACH"; self._approach()
-                self.state = "PRESS"; self._press()
-                self.state = "RETREAT"; self._retreat()
-                self.state = "VERIFY"
-                result = self._verify()
-                if result == "GREEN":
-                    self.state = "HOME"
-                    if self.config.HOME_XYZ is not None:
-                        self.arm.move_xyz(self.config.HOME_XYZ, 0, self.mode != "FULL")
-                    else:
-                        LOG.warning("SUCCESS, but HOME_XYZ is NOT_CALIBRATED; arm remains in retreat pose")
-                    self.state = "SUCCESS"; LOG.info("SUCCESS"); return
-                if result != "RED":
-                    raise RuntimeError("indicator state UNKNOWN; blind retry prohibited")
-                if attempt < self.config.MAX_ATTEMPTS: LOG.warning("RETRYING")
+                self._adaptive_press()
+                self.state = 'PRESSED'
+                self.status['message'] = 'Нажатие выполнено; рука вернулась в базовое положение. Теперь выделите лампу и нажмите «Проверить лампу».'
+                return
             self.state = "FAILED"
         except Exception as exc:
             LOG.error("FAILED: %s", exc); self.state = "STOP" if self.stop_event.is_set() else "FAILED"
@@ -647,7 +707,8 @@ class ButtonTaskController:
             if time.monotonic() > deadline:
                 break
             target = self.fresh_target()
-            error = [target['center'][0]-self.config.TARGET_PIXEL_U, target['center'][1]-self.config.TARGET_PIXEL_V]
+            center = self._control_center(target)
+            error = [center[0]-self.config.TARGET_PIXEL_U, center[1]-self.config.TARGET_PIXEL_V]
             self.status.update(button=target, error_px=error, iteration=iteration)
             if max(abs(v) for v in error) <= self.config.CENTER_TOLERANCE_PX:
                 LOG.info('ALIGNMENT COMPLETE: error=%s', error)
@@ -659,7 +720,7 @@ class ButtonTaskController:
                 raise RuntimeError('Jacobian NOT_CALIBRATED; alignment has not completed')
             pose = self.arm.status()
             ref = self.servo.reference
-            if ref is None or math.dist(pose['xyz'], ref['xyz']) > self.config.MAX_CALIBRATION_DRIFT_MM or abs(pose['tool_pitch']-ref['tool_pitch']) > 5:
+            if not self._pose_within_calibration_region(pose, ref):
                 raise RuntimeError('Camera moved beyond local calibration; run Calibrate again')
             magnitude = math.hypot(*error)
             if previous_error is not None and magnitude > previous_error + 5:
@@ -671,7 +732,9 @@ class ButtonTaskController:
                 next_angles = pose['angles'].copy()
                 elevation_joint = 'wrist' if self.servo.coordinates == 'base_wrist' else 'shoulder'
                 for joint, correction in zip(('base',elevation_joint),change):
-                    next_angles[joint] += int(np.sign(correction)) if abs(correction) >= .35 else 0
+                    next_angles[joint] += self._bounded_joint_correction(
+                        correction
+                    )
                 next_xyz = forward_kinematics(*(next_angles[n] for n in ('base','shoulder','elbow','wrist')))
                 self.status.update(proposed_xyz=next_xyz, proposed_angles=next_angles)
                 LOG.info('ALIGNMENT ERROR: %s proposed_angles=%s',error,next_angles)
@@ -680,7 +743,7 @@ class ButtonTaskController:
                     raise RuntimeError('Correction is below servo angular resolution')
                 self.arm.move_angles(next_angles)
                 continue
-            delta = self.servo.correction(target['center'])
+            delta = self.servo.correction(center)
             nxt = [a+b for a, b in zip(pose['xyz'], delta)]
             self.status['proposed_xyz'] = nxt
             LOG.info('ALIGNMENT ERROR: center=%s error=%s XYZ=%s next=%s iteration=%s', target['center'], error, pose['xyz'], nxt, iteration)
@@ -691,6 +754,129 @@ class ButtonTaskController:
             if math.dist(moved['xyz'], pose['xyz']) < 0.2:
                 raise RuntimeError('Requested correction is smaller than servo resolution')
         raise RuntimeError("alignment timeout")
+
+    def _control_center(self, target):
+        return target['center']
+
+    def _bounded_joint_correction(self, correction):
+        if abs(correction) < 0.35:
+            return 0
+        magnitude = min(
+            self.config.MAX_ALIGNMENT_CORRECTION_DEG,
+            max(1, int(round(abs(correction)))),
+        )
+        return int(math.copysign(magnitude, correction))
+
+    def _pose_within_calibration_region(self, pose, reference):
+        if reference is None:
+            return False
+        if self.servo.coordinates in ('base_shoulder', 'base_wrist'):
+            elevation_joint = (
+                'wrist' if self.servo.coordinates == 'base_wrist'
+                else 'shoulder'
+            )
+            return all(
+                abs(
+                    float(pose['angles'][joint]) -
+                    float(reference['angles'][joint])
+                ) <= self.config.MAX_CALIBRATION_JOINT_DRIFT_DEG
+                for joint in ('base', elevation_joint)
+            )
+        return (
+            math.dist(pose['xyz'], reference['xyz'])
+            <= self.config.MAX_CALIBRATION_DRIFT_MM
+            and abs(pose['tool_pitch'] - reference['tool_pitch']) <= 5
+        )
+
+    def _adaptive_contact_target(self, target, pose, extra_depth_mm=0.0):
+        diameter_px = math.sqrt(float(target['w']) * float(target['h']))
+        if diameter_px <= 1:
+            raise RuntimeError('Detected button size is invalid')
+
+        reference_vector = [
+            self.config.REFERENCE_CONTACT_XYZ[index] -
+            self.config.REFERENCE_OBSERVATION_XYZ[index]
+            for index in range(3)
+        ]
+        reference_distance = math.sqrt(sum(v*v for v in reference_vector))
+        estimated_distance = (
+            reference_distance *
+            self.config.REFERENCE_BUTTON_DIAMETER_PX /
+            diameter_px
+        )
+        estimated_distance = min(
+            self.config.MAX_ESTIMATED_CONTACT_DISTANCE_MM,
+            max(
+                self.config.MIN_ESTIMATED_CONTACT_DISTANCE_MM,
+                estimated_distance,
+            ),
+        )
+
+        pitch_delta = math.radians(
+            float(pose['tool_pitch']) -
+            self.config.REFERENCE_TOOL_PITCH_DEG
+        )
+        cp, sp = math.cos(pitch_delta), math.sin(pitch_delta)
+        vx, vy, vz = reference_vector
+        pitched = (vx*cp - vz*sp, vy, vx*sp + vz*cp)
+
+        yaw_delta = math.radians(
+            float(pose['angles']['base']) -
+            self.config.REFERENCE_OBSERVATION_ANGLES[0]
+        )
+        cy, sy = math.cos(yaw_delta), math.sin(yaw_delta)
+        rotated = (
+            pitched[0]*cy - pitched[1]*sy,
+            pitched[0]*sy + pitched[1]*cy,
+            pitched[2],
+        )
+        norm = math.sqrt(sum(v*v for v in rotated))
+        direction = tuple(v/norm for v in rotated)
+        travel = estimated_distance + float(extra_depth_mm)
+        xyz = tuple(
+            float(pose['xyz'][index]) + direction[index]*travel
+            for index in range(3)
+        )
+        return xyz, direction, estimated_distance
+
+    def _adaptive_press(self):
+        target = self.fresh_target()
+        pose = self.arm.status()
+        contact, direction, distance = self._adaptive_contact_target(
+            target, pose
+        )
+        self.status.update(
+            estimated_contact_xyz=contact,
+            estimated_contact_distance_mm=round(distance, 1),
+            approach_direction=direction,
+            button_diameter_px=round(
+                math.sqrt(float(target['w']) * float(target['h'])), 1
+            ),
+        )
+        if self.stop_event.is_set():
+            raise InterruptedError('EMERGENCY STOP')
+        self.state = 'PRESS'
+        self.status.update(press_attempt=1, press_target_xyz=contact,
+                           message='Одно нажатие, затем возврат в базовое положение')
+        result = self.arm.press_button(contact, self.config.PRESS_HOLD_SECONDS)
+        self.status['returned_angles'] = result.get('returned_angles')
+
+    def _confirm_indicator(self, timeout):
+        deadline = time.monotonic() + timeout
+        red_frames = green_frames = 0
+        while time.monotonic() < deadline and not self.stop_event.is_set():
+            state = self.indicator.state(
+                self.camera.read(),
+                self.button.locked_center,
+            )
+            self.status["indicator"] = state
+            red_frames = red_frames + 1 if state == "RED" else 0
+            green_frames = green_frames + 1 if state == "GREEN" else 0
+            if green_frames >= self.config.GREEN_CONFIRM_FRAMES:
+                return "GREEN"
+            if red_frames >= self.config.GREEN_CONFIRM_FRAMES:
+                return "RED"
+        return "UNKNOWN"
 
     def _approach(self):
         if self.config.APPROACH_AXIS is None: raise RuntimeError("approach axis NOT_CALIBRATED")
@@ -712,13 +898,17 @@ class ButtonTaskController:
     def _verify(self):
         deadline, greens = time.monotonic() + self.config.INDICATOR_CHECK_TIMEOUT, 0
         while time.monotonic() < deadline and not self.stop_event.is_set():
-            state = self.indicator.state(self.camera.read()); self.status["indicator"] = state
+            state = self.indicator.state(
+                self.camera.read(), self.button.locked_center
+            ); self.status["indicator"] = state
             greens = greens + 1 if state == "GREEN" else 0
             if greens >= self.config.GREEN_CONFIRM_FRAMES: LOG.info("GREEN CONFIRMED"); return "GREEN"
         return "RED" if self.status["indicator"] == "RED" else "UNKNOWN"
 
     def _verify_initial_indicator(self):
-        state = self.indicator.state(self.camera.read())
+        state = self.indicator.state(
+            self.camera.read(), self.button.locked_center
+        )
         self.status["indicator"] = state
         return state
 
@@ -729,27 +919,41 @@ HTML = """<!doctype html><html lang=ru><meta charset=utf-8>
 img{max-width:100%;height:auto;cursor:crosshair}button,select{font:inherit;padding:12px;margin:5px;border:0;border-radius:6px}
 button:disabled{opacity:.4}#stop{background:#e84444;color:white}#msg{white-space:pre-wrap;padding:14px;background:#263447}
 pre{overflow:auto}</style><h1>Наведение на красную кнопку</h1>
-<p>1. Включи камеру. 2. Проверь рамку кнопки. 3. Калибровка. 4. Центрирование.</p>
+<p>1. Включи камеру и щёлкни по кнопке. 2. Калибровка. 3. Центрирование.
+4. Нажатие и возврат в базовое положение. 5. Обведи лампу и проверь её.</p>
 <button onclick="v.src='/video'">Start Camera / Камера</button>
 <button onclick="go('DRY_RUN')">Dry Run / Только проверить</button>
 <button onclick="go('CALIBRATE')">Calibrate / Калибровка с движением</button>
 <button onclick="go('ALIGNMENT')">Alignment Test / Центрировать</button>
-<button disabled title="Нужны расстояние до контакта и проверенная траектория">Full Test / Нажать</button>
+<button id=full disabled onclick="if(confirm('Рука выполнит физическое нажатие. Пространство свободно?'))go('FULL')">Full Test / Нажать</button>
+<button id=verify disabled onclick="go('VERIFY')">Проверить лампу</button>
+<div id=fullStatus class=status>Выберите кнопку и выполните калибровку.</div>
 <button id=stop onclick="post('/api/stop')">STOP</button>
-<p>Калибровка двигает руку на несколько мм. STOP отменяет следующие команды;
+<p>Калибровка двигает суставы небольшими шагами; центрирование может сместить
+кончик руки до 60 мм от калибровочной позы. Освободите пространство. STOP отменяет следующие команды;
 уже отправленный шаг сервопривода завершится.</p>
 <label>Выбрать в кадре: <select id=selection><option value=button>кнопку — щелчком</option>
 <option value=indicator>индикатор — выделить прямоугольник</option></select></label>
 <div><img id=v width=640 height=480 alt="Нажмите Камера"></div><div id=msg>Ожидание</div>
 <details><summary>Подробные данные</summary><pre id=s></pre></details>
 <script>
+const fullButton=document.getElementById('full');
+const verifyButton=document.getElementById('verify');
+const fullStatus=document.getElementById('fullStatus');
 async function post(url,data={}){try{let r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});let j=await r.json();if(!r.ok)msg.textContent=j.error;return j}catch(e){msg.textContent=e.message}}
 function go(mode){post('/api/start',{mode})}
 function point(e){let b=v.getBoundingClientRect();return {x:Math.round((e.clientX-b.left)*640/b.width),y:Math.round((e.clientY-b.top)*480/b.height)}}
 let start=null;v.ondragstart=e=>e.preventDefault();v.onpointerdown=e=>{start=point(e)};
 v.onpointerup=e=>{let p=point(e);if(selection.value==='button')post('/api/select',p);else if(start)post('/api/indicator-roi',{x:Math.min(start.x,p.x),y:Math.min(start.y,p.y),w:Math.abs(p.x-start.x),h:Math.abs(p.y-start.y)});start=null};
 setInterval(async()=>{try{let j=await(await fetch('/api/status',{cache:'no-store'})).json();s.textContent=JSON.stringify(j,null,2);
-msg.textContent='Этап: '+j.state+'\\nОшибка (пиксели): '+JSON.stringify(j.error_px)+'\\n'+(j.message||'')+'\\n'+(j.arm_error||'')}catch(e){msg.textContent='Нет связи с сервером'}},700);
+let errors=[j.message,j.arm_error].filter((v,i,a)=>v&&a.indexOf(v)===i);
+fullButton.disabled=!j.full_ready;fullButton.title=j.full_blocker||'Выполнить адаптивное нажатие';
+verifyButton.disabled=!j.verify_ready;
+fullStatus.textContent=j.state==='PRESSED'?
+  (j.verify_ready?'Рука вернулась. Нажмите «Проверить лампу».':'Рука вернулась. Обведите лампу, затем проверьте её.'):
+  (j.full_ready?'Нажатие доступно.':'Нажатие недоступно: '+j.full_blocker);
+if(j.action_error)errors.unshift(j.action_error);
+msg.textContent='Этап: '+j.state+'\\nОшибка (пиксели): '+JSON.stringify(j.error_px)+'\\n'+errors.join('\\n')}catch(e){msg.textContent='Нет связи с сервером'}},700);
 </script></html>"""
 
 
@@ -767,13 +971,21 @@ def make_server(controller, host="0.0.0.0", port=8090):
                 try:
                     while not self.server.closing.is_set():
                         frame, target = controller.observe()
+                        for index, obj in enumerate(controller.status.get('candidates', []), 1):
+                            x, y, w, h = (obj[k] for k in ("x", "y", "w", "h"))
+                            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 200, 255), 2)
+                            cv2.putText(frame, str(index), (x, max(20, y-6)),
+                                        cv2.FONT_HERSHEY_SIMPLEX, .65, (0, 200, 255), 2)
                         if target:
                             x, y, w, h = (target[k] for k in ("x", "y", "w", "h"))
-                            cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 255, 255), 2)
-                            cv2.circle(frame, tuple(target["center"]), 5, (0, 255, 255), -1)
+                            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 3)
+                            cv2.circle(frame, tuple(target["center"]), 5, (0, 255, 0), -1)
                         cv2.drawMarker(frame, (int(CFG.TARGET_PIXEL_U), int(CFG.TARGET_PIXEL_V)), (255, 0, 255), cv2.MARKER_CROSS, 18, 2)
-                        if controller.indicator.roi:
-                            x,y,w,h = controller.indicator.roi
+                        indicator_roi = controller.indicator.current_roi(
+                            controller.button.locked_center
+                        )
+                        if indicator_roi:
+                            x,y,w,h = indicator_roi
                             cv2.rectangle(frame,(x,y),(x+w,y+h),(0,255,0),2)
                         ok, encoded = cv2.imencode(".jpg", frame)
                         if not ok: continue
@@ -817,20 +1029,27 @@ def make_server(controller, host="0.0.0.0", port=8090):
                 elif self.path == "/api/indicator-roi":
                     if controller.thread and controller.thread.is_alive(): raise ValueError('Task is running')
                     if min(body['w'],body['h']) < 4: raise ValueError('Indicator rectangle is too small')
-                    controller.indicator.set_roi(body["x"], body["y"], body["w"], body["h"]); self.send_json({"ok": True})
+                    controller.indicator.set_roi(
+                        body["x"], body["y"], body["w"], body["h"],
+                    ); self.send_json({"ok": True})
                 elif self.path == '/api/select':
                     if controller.thread and controller.thread.is_alive(): raise ValueError('Task is running')
                     with controller.observation_lock:
                         frame = controller.camera.read()
                         candidates = controller.button.candidates(frame)
                         clicked = [o for o in candidates if o['x'] <= body['x'] <= o['x']+o['w'] and o['y'] <= body['y'] <= o['y']+o['h']]
-                        if len(clicked) != 1: raise ValueError('Click inside one red round button on white background')
+                        if len(clicked) != 1: raise ValueError('Щёлкните внутри рамки одного красного объекта')
                         obj = clicked[0]
-                        controller.button.locked_center = obj['center']; controller.button.locked_size=(obj['w'],obj['h'])
-                        controller.button.target_id += 1
-                    self.send_json({'ok':True})
+                        controller.button.select(obj)
+                        controller.status.update(
+                            button=obj,
+                            message='Красный объект выбран; зелёная рамка — текущая цель',
+                        )
+                    self.send_json({'ok':True, 'selected': obj})
                 else: self.send_json({"error": "not found"}, 404)
-            except Exception as exc: self.send_json({"error": str(exc)}, 400)
+            except Exception as exc:
+                controller.status['action_error'] = str(exc)
+                self.send_json({"error": str(exc)}, 400)
         def log_message(self, *args): pass
     server = ThreadingHTTPServer((host, port), Handler)
     server.closing = threading.Event()
@@ -844,6 +1063,19 @@ def main():
     parser.add_argument("--camera-only", action="store_true", help="disable arm control for this run")
     parser.add_argument("--host", default="0.0.0.0"); parser.add_argument("--port", type=int, default=8090)
     args = parser.parse_args(); logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if not args.camera_only:
+        from run_button_system import arm_status, require_press_capability
+        existing_arm = arm_status(args.arm_url)
+        if existing_arm is None or existing_arm.get("connected") is not True:
+            LOG.info("arm_web недоступен; переключаюсь на единый запуск системы")
+            os.execv(sys.executable, [
+                sys.executable,
+                str(Path(__file__).resolve().parent / "run_button_system.py"),
+                "--arm-url", args.arm_url,
+                "--host", args.host,
+                "--port", str(args.port),
+            ])
+        require_press_capability(existing_arm)
     camera = CameraManager(); controller = ButtonTaskController(camera, ArmController(None if args.camera_only else args.arm_url), ButtonDetector(), IndicatorDetector(), VisualServoController())
     try:
         server = make_server(controller, args.host, args.port)

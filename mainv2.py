@@ -64,7 +64,7 @@ BUTTON_SETTLE_SECONDS = 0.20
 # Button tip target (mm, arm_web coordinate system). Arm moves in two stages.
 BUTTON_X_MM = 350.0
 BUTTON_Y_MM = 0.0
-BUTTON_Z_MM = -40.0
+BUTTON_Z_MM = -50.0
 
 # Charging: 9 s red blink, then 2 s solid green; total 11 s before R.
 CHARGE_SECONDS = 11.0

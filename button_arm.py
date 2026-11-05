@@ -143,7 +143,10 @@ def plan_button_paths(arm_web, x, y, z):
             target = {
                 "x": tx, "y": ty, "z": tz, "tool_pitch": BUTTON_TOOL_PITCH,
             }
-            path = (arm_web.plan_locked_pitch_path(target) if index == 0
+            # The configured observation/start pose is intentionally tilted.
+            # First move smoothly into the horizontal staging pose; only the
+            # subsequent press transition must preserve horizontal pitch.
+            path = (arm_web.plan_target_pitch_path(target) if index == 0
                     else _plan_early_z_press_path(arm_web, target))
             paths.append(path)
             for name, angle in path[-1].items():
