@@ -90,7 +90,6 @@ BUTTON_FINAL_RIGHT_ANGLE = 80.0
 FIRE_APPROACH_SPEED = 70
 FIRE_APPROACH_MAX_SPEED = 100
 FIRE_APPROACH_TIMEOUT = 12.0
-FIRE_FINAL_RIGHT_ANGLE = 300.0
 
 # Automatic route: one entry for each detected junction, in order.
 # L=left, R=right, S=straight, B=press button, C=charging, F=firefighter, Q=stop.
@@ -641,7 +640,11 @@ def button_arm_action(board):
 
 def firefighter_task(calibration, detector, bus, offset, board):
     """Left turn, stationary arm pose, confirmed flame, at most two sprays."""
-    from firefighter import Firefighter, firefighting_pose
+    from firefighter import (
+        Firefighter,
+        firefighting_pose,
+        scan_for_confirmed_flame,
+    )
     from roboarm import get_shared_arm
     from arm_web import START_ANGLES, AUTO_MAX_STEP_DEG, STEP_DELAY
     from button_arm import _return_home
@@ -682,8 +685,13 @@ def firefighter_task(calibration, detector, bus, offset, board):
 
             if flame_detected:
                 stop()
-                if fire.confirm_flame():
-                    print("\nF: flame confirmed for 1 second. Water ON.")
+                confirmed = fire.confirm_flame()
+                if not confirmed:
+                    confirmed = scan_for_confirmed_flame(
+                        fire, arm, pose["base"]
+                    )
+                if confirmed:
+                    print("\nF: flame confirmed for 0.5 seconds. Water ON.")
                     fire.spray()
                     # Discard reports taken during spraying. Keep the input
                     # subscribed: there is no sensor power-control pin.
@@ -692,7 +700,7 @@ def firefighter_task(calibration, detector, bus, offset, board):
                         print("\nF: flame remains. Second and final 5 s spray.")
                         fire.spray()
                     break
-                # A transient signal must not trigger the pump.
+                # A transient signal and an empty scan must not trigger water.
                 continue
             state = line_tracker.update(calibration)
             if not differential_drive(
@@ -714,8 +722,10 @@ def firefighter_task(calibration, detector, bus, offset, board):
             return False
         if not follow_for(calibration, RETURN_FORWARD_TIME):
             return False
-        print(f"\nF: turn RIGHT by {FIRE_FINAL_RIGHT_ANGLE:g} degrees.")
-        ok, _ = pivot(bus, offset, "R", angle_target=FIRE_FINAL_RIGHT_ANGLE)
+        print(f"\nF: turn RIGHT by {BUTTON_FINAL_RIGHT_ANGLE:g} degrees.")
+        ok, _ = pivot(
+            bus, offset, "R", angle_target=BUTTON_FINAL_RIGHT_ANGLE
+        )
         return ok and reacquire_line(calibration)
     finally:
         try:

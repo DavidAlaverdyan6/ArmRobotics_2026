@@ -25,7 +25,7 @@ def load_navigation():
     with patch.dict(sys.modules, stubs):
         import importlib.util
         spec = importlib.util.spec_from_file_location('navigation_test',
-            Path(__file__).resolve().parents[1] / 'main.py')
+            Path(__file__).resolve().parents[1] / 'main_test.py')
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     return module
@@ -79,7 +79,7 @@ class FireTests(unittest.TestCase):
             nav.pivot = lambda bus, offset, direction, **kw: (
                 events.append(direction) or True, 1)
             nav.differential_drive = lambda *a, **kw: events.append('drive') or line_ok
-            nav.read_fresh = Mock(return_value={'position': 0})
+            nav.line_tracker.update = Mock(return_value={'position': 0})
             nav.button_return = lambda *a: events.append('reverse') or True
             nav.follow_for = lambda *a: events.append('forward') or True
             nav.reacquire_line = lambda *a: events.append('reacquire') or True
@@ -120,7 +120,9 @@ class FireTests(unittest.TestCase):
              patch.object(hardware.time, 'sleep', side_effect=sleep):
             fire.sample = (2500, 0.0)
             self.assertTrue(fire.confirm_flame())
-            self.assertGreaterEqual(clock[0], 1.0)
+            self.assertGreaterEqual(
+                clock[0], hardware.FLAME_CONFIRM_SECONDS
+            )
             now = clock[0]
             fire.wait_for_sample(after=now)
             self.assertGreater(fire.sample[1], now)
@@ -138,18 +140,52 @@ class FireTests(unittest.TestCase):
             self.assertGreaterEqual(clock[0] - start, 3.0)
 
     def test_firefighting_pose(self):
-        self.assertEqual(hardware.firefighting_pose(), {
-            'base': 90,
-            'shoulder': 90,
-            'elbow': 160,
-            'wrist': 70,
-            'gripper': 180,
-        })
+        from arm_ik import forward_kinematics
+
+        pose = hardware.firefighting_pose()
+        xyz = forward_kinematics(
+            pose['base'], pose['shoulder'], pose['elbow'], pose['wrist']
+        )
+        for actual, expected in zip(xyz, (300.0, 0.0, 50.0)):
+            self.assertAlmostEqual(actual, expected, delta=0.1)
+        self.assertEqual(pose['gripper'], 180)
+
+    def test_failed_confirmation_scans_minus_20_to_plus_20(self):
+        fire = Mock()
+        fire.detected.return_value = False
+        arm = Mock()
+        with patch.object(hardware.time, 'sleep'):
+            self.assertFalse(
+                hardware.scan_for_confirmed_flame(fire, arm, 90.0)
+            )
+
+        commanded = [call.kwargs['base'] for call in arm.write.call_args_list]
+        self.assertEqual(commanded[0], 88.0)
+        self.assertIn(70.0, commanded)
+        self.assertIn(110.0, commanded)
+        self.assertEqual(commanded[-1], 90.0)
+        fire.confirm_flame.assert_not_called()
+
+    def test_scan_stops_when_flame_is_confirmed(self):
+        fire = Mock()
+        fire.detected.return_value = True
+        fire.confirm_flame.side_effect = [False, True]
+        arm = Mock()
+        with patch.object(hardware.time, 'sleep'):
+            self.assertTrue(
+                hardware.scan_for_confirmed_flame(fire, arm, 90.0)
+            )
+
+        self.assertEqual(
+            [call.kwargs['base'] for call in arm.write.call_args_list],
+            [88.0, 86.0],
+        )
 
     def test_route_commands(self):
         nav = load_navigation()
-        nav.ROUTE = ['F', 'C', 'Q']
-        self.assertEqual(nav.load_route(), nav.ROUTE)
+        nav.ROUTE = ['Firefighter', 'charging', 'Cube1', 'Q']
+        expected = ['FIREFIGHTER', 'CHARGING', 'CUBE1', 'Q']
+        self.assertEqual(nav.load_route(), expected)
         nav.ROUTE = ['P', 'Q']
         with self.assertRaises(ValueError):
             nav.load_route()

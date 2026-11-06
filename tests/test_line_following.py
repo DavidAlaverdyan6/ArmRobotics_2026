@@ -66,12 +66,20 @@ class LineFollowerTests(unittest.TestCase):
         self.assertLess(left, 0)
         self.assertLess(right, 0)
 
+    def test_reverse_never_commands_below_hardware_minimum(self):
+        self.follower.reverse({"position": 1.0}, speed=130)
+        left, right = self.motors.commands[-1]
+        self.assertLessEqual(left, -80)
+        self.assertLessEqual(right, -80)
+        self.assertGreaterEqual(left, -130)
+        self.assertGreaterEqual(right, -130)
+
     def test_reverse_fallback_uses_heading_correction(self):
         self.follower.reverse_straight(
             speed=100,
             heading_correction=10,
         )
-        self.assertEqual(self.motors.commands[-1], (-90, -110))
+        self.assertEqual(self.motors.commands[-1], (-100, -90))
 
 
 if __name__ == "__main__":

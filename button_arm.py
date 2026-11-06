@@ -192,3 +192,46 @@ def move_to_xyz_and_home(board, x, y, z):
     _return_home(arm, home, arm_web.AUTO_MAX_STEP_DEG, arm_web.STEP_DELAY)
     print("ARM: home commanded.")
     return True
+
+
+def move_to_xyz_and_hold(board, x, y, z, tool_pitch=0.0, gripper=0):
+    """Move to one checked XYZ/pitch pose and stay there.
+
+    Unlike the button cycle this does not return home.  The complete final
+    pose is solved before any joint moves, then the gripper is commanded only
+    after the target pose has been reached.
+    """
+    x, y, z, tool_pitch = map(float, (x, y, z, tool_pitch))
+    if not all(math.isfinite(v) for v in (x, y, z, tool_pitch)):
+        raise ValueError("XYZ coordinates and tool pitch must be finite.")
+    gripper = float(gripper)
+    if not 0.0 <= gripper <= 180.0:
+        raise ValueError("Gripper angle must be between 0 and 180 degrees.")
+
+    import arm_web
+    from roboarm import get_shared_arm
+
+    arm, newly_attached = get_shared_arm(board)
+    home = dict(arm_web.START_ANGLES)
+    arm_web.arm = arm
+    if newly_attached:
+        arm.write(**home)
+    else:
+        _return_home(
+            arm, home, arm_web.AUTO_MAX_STEP_DEG, arm_web.STEP_DELAY
+        )
+    time.sleep(0.6)
+
+    path = arm_web.plan_target_pitch_path({
+        "x": x,
+        "y": y,
+        "z": z,
+        "tool_pitch": tool_pitch,
+    })
+    _execute_plan(arm, path, arm_web.STEP_DELAY)
+    arm.write(gripper=gripper)
+    print(
+        f"ARM: holding ({x:g}, {y:g}, {z:g}) mm at "
+        f"{tool_pitch:+g} degrees; gripper={gripper:g}."
+    )
+    return True

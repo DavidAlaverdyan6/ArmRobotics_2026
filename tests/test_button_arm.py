@@ -8,12 +8,11 @@ from arm_ik import forward_kinematics
 
 
 class ButtonPathTests(unittest.TestCase):
-    def test_arm_web_and_camera_use_the_same_start_pose(self):
+    def test_arm_web_uses_main_task_start_pose(self):
         with patch.dict(sys.modules, {
             'telemetrix': types.SimpleNamespace(telemetrix=Mock())
         }):
             import arm_web
-            from arm_camera_button import CFG
         expected = (90, 170, 180, 0, 180)
         self.assertEqual(
             tuple(arm_web.START_ANGLES[name] for name in (
@@ -21,7 +20,6 @@ class ButtonPathTests(unittest.TestCase):
             )),
             expected,
         )
-        self.assertEqual(CFG.OBSERVATION_ANGLES, expected)
 
     def test_shared_arm_attaches_servos_only_once(self):
         from roboarm import get_shared_arm
@@ -78,6 +76,31 @@ class ButtonPathTests(unittest.TestCase):
         xyz = forward_kinematics(**paths[-1][-1])
         for actual, expected in zip(xyz, (350, 0, -50)):
             self.assertAlmostEqual(actual, expected, delta=0.2)
+
+    def test_cube1_pose_is_horizontal_and_stays_open(self):
+        with patch.dict(sys.modules, {
+            'telemetrix': types.SimpleNamespace(telemetrix=Mock())
+        }):
+            import arm_web as web
+            from roboarm import RoboArm
+
+        board = Mock()
+        arm = RoboArm(board)
+        with patch('roboarm.get_shared_arm', return_value=(arm, True)), \
+             patch.dict(sys.modules, {'arm_web': web}), \
+             patch.object(button_arm.time, 'sleep'):
+            web.arm = arm
+            self.assertTrue(button_arm.move_to_xyz_and_hold(
+                board, 350, 0, -120, tool_pitch=0, gripper=0
+            ))
+
+        xyz = web.get_current_xyz()
+        for actual, expected in zip(xyz, (350, 0, -120)):
+            # Physical servo commands are integer degrees, so the reproduced
+            # Cartesian point is checked within the model's quantization.
+            self.assertAlmostEqual(actual, expected, delta=1.5)
+        self.assertAlmostEqual(web.get_current_tool_pitch(), 0, delta=1.0)
+        self.assertEqual(arm.gripper.angle, 0)
 
     def test_press_cycle_returns_to_base_pose_after_observation(self):
         with patch.dict(sys.modules, {

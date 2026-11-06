@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ArmRobotics: differential2 line following + junction commands + button task."""
+"""ArmRobotics main route: navigation and fixed robot tasks."""
 
 import math
 import time
@@ -74,36 +74,43 @@ TURN_90_FORWARD_TIME = 0.5
 TURN_TOLERANCE_DEG = 8.0
 TURN_CORRECTION_START_DEG = 4.0
 
-BUTTON_DISTANCE_CM = 21.5
-BUTTON_DISTANCE_TOLERANCE_CM = 0.5
-BUTTON_SLOWDOWN_CM = 28.0
-BUTTON_MIN_CLEARANCE_CM = 18.0
-BUTTON_CENTER_TOLERANCE = 0.25
-BUTTON_ADJUST_SPEED = 70
-BUTTON_ADJUST_SECONDS = 0.08
-BUTTON_SETTLE_SECONDS = 0.20
-# Button tip target (mm, arm_web coordinate system). Arm moves in two stages.
-BUTTON_X_MM = 350.0
-BUTTON_Y_MM = 0.0
-BUTTON_Z_MM = -50.0
+BUTTON_BUMPER_START_CM = 20.0
+BUTTON_BUMPER_START_TOLERANCE_CM = 1.0
+BUTTON_BUMPER_RAM_SECONDS = 1.0
+BUTTON_BUMPER_APPROACH_TIMEOUT = 18.0
+BUTTON_BUMPER_SPEED = 255
+BUTTON_BUMPER_STATUS_SECONDS = 0.25
 
 # Charging: 9 s red blink, then 2 s solid green; total 11 s before R.
 CHARGE_SECONDS = 11.0
 CHARGE_RED_SECONDS = 9.0
 CHARGE_BLINK_HALF_PERIOD = 0.5
-BUTTON_MAX_TIME = 18.0
-BUTTON_CONFIRM = 3
-BUTTON_CLEAR_TIMEOUT = 3.0
+# Reverse line-following geometry (all distances are millimetres).  The line
+# tracker is 70 mm in front of the axle, so it becomes a trailing sensor while
+# reversing; it cannot use the forward controller unchanged.
+RETURN_SPEED = 130
+RETURN_SLOW_SPEED = 115
+REVERSE_MIN_PWM = 80
+REVERSE_MAX_PWM = 150
+REVERSE_TRACKER_OFFSET_MM = 70.0
+REVERSE_WHEELBASE_MM = 226.0
+REVERSE_SENSOR_SPAN_MM = 60.0
+REVERSE_POSITION_MM_PER_UNIT = REVERSE_SENSOR_SPAN_MM / 7.0
 
-RETURN_SPEED = 150
-RETURN_SLOW_SPEED = 95
-RETURN_GYRO_KP = 2.0
-RETURN_MAX_DELTA = 85
-RETURN_MAX_TIME = 15.0
-RETURN_MAX_ANGLE = 30.0
-RETURN_RECOVERY_ANGLE = 12.0
-RETURN_RECOVERY_SAFE = 6.0
-RETURN_RECOVERY_TIMEOUT = 1.5
+# Separate reverse PD/gyro observer.  Tune these on the real robot only.
+REVERSE_LATERAL_KP = 2.6          # PWM / mm from estimated axle error
+REVERSE_LATERAL_KD = 0.055        # PWM / (mm/s), suppresses oscillation
+REVERSE_HEADING_KP = 0.70         # PWM / degree from MPU heading error
+REVERSE_YAW_RATE_KD = 0.12        # PWM / (degree/s), damps yaw rate
+REVERSE_REFERENCE_FOLLOW = 2.5    # 1/s: lets course reference follow curves
+REVERSE_REFERENCE_WINDOW_MM = 7.0
+REVERSE_MAX_BRAKE_PWM = 70
+REVERSE_PWM_SLEW_PER_LOOP = 7
+REVERSE_LINE_LOSS_TIMEOUT = 0.8
+# Set to -1 only if a brief bench test proves the physical motor sides are
+# wired opposite to the documented LEFT/RIGHT convention.
+REVERSE_STEER_SIGN = 1
+RETURN_MAX_TIME = 24.0
 
 RETURN_FORWARD_TIME = 0.3
 BUTTON_FINAL_RIGHT_ANGLE = 80.0
@@ -111,23 +118,34 @@ BUTTON_FINAL_RIGHT_ANGLE = 80.0
 FIRE_APPROACH_SPEED = 70
 FIRE_APPROACH_MAX_SPEED = 100
 FIRE_APPROACH_TIMEOUT = 12.0
-FIRE_FINAL_RIGHT_ANGLE = 300.0
+
+# CUBE1: arm stays at this XYZ with the gripper open while the chassis moves.
+CUBE1_X_MM = 360.0
+CUBE1_Y_MM = 0.0
+CUBE1_Z_MM = -150.0
+CUBE1_TOOL_PITCH_DEG = -20.0
+CUBE1_DROP_TIMEOUT = 20.0
+CUBE1_ARM_SETTLE_SECONDS = 1.0
+CUBE1_JUNCTION_CROSS_SECONDS = 0.5
 
 # Automatic route: one entry for each detected junction, in order.
-# L=left, R=right, S=straight, B=press button, C=charging, F=firefighter, Q=stop.
-# Example: ROUTE = ["L", "S", "B", "R", "C", "F", "Q"]
+# L/R/S and L90/R90 are movement commands. Named robot tasks are BUTTON,
+# CHARGING, FIREFIGHTER and CUBE1. Q stops the route.
+# Example: ROUTE = ["L", "S", "BUTTON", "R", "CHARGING", "CUBE1",
+#                   "FIREFIGHTER", "Q"]
 # The commented entries below are placeholders: edit them before launching.
 ROUTE = [
-    "B", 
+    "BUTTON",
+    "L",
+    "S",
+    "CUBE1",
     "L",
     "R",
-    "S",
-    "R",
     "L",
-    "C", 
+    "CHARGING",
     "S",
     "R",
-    "S", 
+    "FIREFIGHTER",
     "L",
     "R",
     "R",
@@ -136,7 +154,8 @@ ROUTE = [
 
 ]
 ALLOWED_ROUTE_COMMANDS = {
-    "L", "R", "L90", "R90", "S", "B", "C", "F", "Q"
+    "L", "R", "L90", "R90", "S",
+    "BUTTON", "CHARGING", "FIREFIGHTER", "CUBE1", "Q",
 }
 
 
@@ -215,14 +234,11 @@ def update_straight_speed(state, left, right, candidate, controller, now):
     )
 
 
-def differential_reverse(state, speed, heading_correction=0.0):
-    """Compatibility wrapper for reverse line following."""
-    return line_follower.reverse(
-        state,
-        speed,
-        heading_correction=heading_correction,
-        max_delta=RETURN_MAX_DELTA,
-    )
+def differential_reverse(state, speed, controller=None):
+    """Drive the dedicated reverse controller (legacy fallback for tests)."""
+    if controller is not None:
+        return controller.drive(state, speed)
+    return line_follower.reverse(state, speed)
 
 
 class JunctionDetector:
@@ -304,13 +320,140 @@ class Heading:
         self.sign = left_positive
         self.angle = 0.0
         self.last = time.monotonic()
+        self.last_rate = 0.0
 
     def read(self):
         now = time.monotonic()
-        rate = gyro_rate(self.bus, self.offset)
-        self.angle += self.sign * rate * max(0.0, now - self.last)
+        rate = self.sign * gyro_rate(self.bus, self.offset)
+        self.angle += rate * max(0.0, now - self.last)
         self.last = now
+        self.last_rate = rate
         return self.angle
+
+
+def _wrap_degrees(angle):
+    """Keep a heading difference in [-180, 180) degrees."""
+    return (angle + 180.0) % 360.0 - 180.0
+
+
+class ReverseLineController:
+    """Geometry-aware line controller for a tracker ahead of the axle.
+
+    The tracker measures the line at x=+70 mm.  During reverse motion that
+    point trails the axle, so raw sensor error alone is phase-lagged and makes
+    an ordinary PD loop oscillate.  The MPU heading supplies the missing
+    orientation term; while centred, its reference slowly follows bends in
+    the track instead of forcing the robot to a fixed global compass course.
+    """
+
+    def __init__(self, heading):
+        self.heading = heading
+        self.reference_heading = None
+        self.previous_axle_error = None
+        self.previous_time = None
+        self.previous_pwm = None
+        self.line_lost_since = None
+        self.last_angle = 0.0
+        self.last_axle_error = None
+        self.mode = "LINE"
+
+    @staticmethod
+    def _slew(previous, target):
+        if previous is None:
+            return target
+        step = REVERSE_PWM_SLEW_PER_LOOP
+        return max(previous - step, min(previous + step, target))
+
+    def _wheel_command(self, base_pwm, steering):
+        """Brake one reverse wheel only; slew-rate-limit both PWM values."""
+        base = max(REVERSE_MIN_PWM, min(REVERSE_MAX_PWM, round(base_pwm)))
+        brake = min(REVERSE_MAX_BRAKE_PWM, abs(steering))
+        left = right = -base
+
+        # Positive steering means brake the right wheel.  With reverse motion
+        # this yields the opposite body reaction to forward travel.  The sign
+        # is a single hardware calibration point, not a PWM swap workaround.
+        if steering * REVERSE_STEER_SIGN >= 0:
+            right = -max(REVERSE_MIN_PWM, base - round(brake))
+        else:
+            left = -max(REVERSE_MIN_PWM, base - round(brake))
+
+        old_left, old_right = self.previous_pwm or (None, None)
+        left = self._slew(old_left, left)
+        right = self._slew(old_right, right)
+        self.previous_pwm = (left, right)
+        motors.set_speeds(left, right)
+        return True
+
+    def drive(self, state, speed):
+        now = time.monotonic()
+        angle = self.heading.read()
+        rate = self.heading.last_rate
+        self.last_angle = angle
+        position = state.get("position") if state else None
+
+        if position is None:
+            # A short gyro-only bridge prevents an ADC gap from causing a
+            # sudden stop.  It is deliberately bounded: blindly reversing
+            # without a line is less safe than stopping.
+            if self.line_lost_since is None:
+                self.line_lost_since = now
+            if now - self.line_lost_since > REVERSE_LINE_LOSS_TIMEOUT:
+                return False
+            self.mode = "GYRO"
+            heading_error = (
+                0.0 if self.reference_heading is None else
+                _wrap_degrees(angle - self.reference_heading)
+            )
+            steering = (
+                REVERSE_HEADING_KP * heading_error
+                + REVERSE_YAW_RATE_KD * rate
+            )
+            return self._wheel_command(RETURN_SLOW_SPEED, steering)
+
+        self.line_lost_since = None
+        sensor_error_mm = position * REVERSE_POSITION_MM_PER_UNIT
+        if self.reference_heading is None:
+            self.reference_heading = angle
+        heading_error = _wrap_degrees(angle - self.reference_heading)
+
+        # The tracker displacement is measured at x=+70 mm, not at the axle.
+        # Project the heading component away to obtain the axle-line error.
+        axle_error = sensor_error_mm - (
+            REVERSE_TRACKER_OFFSET_MM
+            * math.sin(math.radians(heading_error))
+        )
+        self.last_axle_error = axle_error
+
+        dt = 0.0 if self.previous_time is None else now - self.previous_time
+        derivative = 0.0
+        if (self.previous_axle_error is not None
+                and 0.005 <= dt <= 0.25):
+            derivative = (axle_error - self.previous_axle_error) / dt
+        self.previous_axle_error = axle_error
+        self.previous_time = now
+
+        # On a curve the compass heading must be allowed to follow the local
+        # track direction, but only once the lateral error is near centre.
+        if abs(sensor_error_mm) <= REVERSE_REFERENCE_WINDOW_MM and dt > 0:
+            follow = min(1.0, REVERSE_REFERENCE_FOLLOW * dt)
+            self.reference_heading += heading_error * follow
+            heading_error = _wrap_degrees(angle - self.reference_heading)
+
+        steering = (
+            REVERSE_LATERAL_KP * axle_error
+            + REVERSE_LATERAL_KD * derivative
+            + REVERSE_HEADING_KP * heading_error
+            + REVERSE_YAW_RATE_KD * rate
+        )
+        # Slow somewhat on large deviations, preserving room for differential
+        # braking while never exceeding the specified 150-PWM reverse limit.
+        base = max(
+            RETURN_SLOW_SPEED,
+            speed - min(25.0, abs(axle_error) * 0.8),
+        )
+        self.mode = "LINE"
+        return self._wheel_command(base, steering)
 
 
 def pivot(bus, offset, direction, angle_target=TURN_ANGLE):
@@ -337,12 +480,14 @@ def pivot(bus, offset, direction, angle_target=TURN_ANGLE):
                 print("\nTurn timeout.")
                 return False, None
             time.sleep(0.005)
-        sign = (
-            (1 if signed > 0 else -1)
-            if left and abs(signed) > 20
-            else None
-        )
-        return True, sign
+        # Always return the gyro polarity for a physical LEFT turn.  For a
+        # right turn the observed polarity is the opposite.  Reverse driving
+        # can therefore use the same heading correction after either turn.
+        left_sign = None
+        if abs(signed) > 20:
+            observed_sign = 1 if signed > 0 else -1
+            left_sign = observed_sign if left else -observed_sign
+        return True, left_sign
     finally:
         stop()
         time.sleep(PIVOT_SETTLE_SECONDS)
@@ -444,12 +589,11 @@ def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE):
             f"\nGYRO_TURN {direction}: target={angle_target:.1f}, "
             f"gyro={final_angle:.1f}, error={final_angle-angle_target:+.1f}"
         )
-        sign = (
-            (1 if signed > 0 else -1)
-            if left and abs(signed) > 5
-            else None
-        )
-        return abs(final_angle - angle_target) <= tolerance, sign
+        left_sign = None
+        if abs(signed) > 5:
+            observed_sign = 1 if signed > 0 else -1
+            left_sign = observed_sign if left else -observed_sign
+        return abs(final_angle - angle_target) <= tolerance, left_sign
 
     finally:
         stop()
@@ -515,190 +659,137 @@ def follow_for(calibration, seconds, *, speed=MANEUVER_SPEED,
         time.sleep(0.15)
 
 
-def button_position_ready(state, distance_cm):
-    """Check distance and use line alignment when it is available."""
-    position = state["position"]
-    if not (0 < distance_cm):
-        return False
-    distance_ready = (
-        abs(distance_cm - BUTTON_DISTANCE_CM)
-        <= BUTTON_DISTANCE_TOLERANCE_CM
-    )
-    if not distance_ready:
-        return False
-    if position is None:
-        return True
-    values = state["normalized"]
-    return (
-        abs(position - TARGET_POSITION) <= BUTTON_CENTER_TOLERANCE
-        and max(values[2:6]) >= START_CENTER_BLACK_MIN
-        and max(values[0], values[7]) <= START_OUTER_BLACK_MAX
-    )
+def activate_arm_home(board):
+    """Enable all arm servos once and command the safe base pose."""
+    from arm_web import START_ANGLES
+    from roboarm import get_shared_arm
+
+    arm, _ = get_shared_arm(board)
+    arm.write(**START_ANGLES)
+    print("ARM: active in base pose (90, 170, 180, 0, 180).")
 
 
-def button_approach(calibration, detector, sensor):
-    """Stop at 21.5 cm, then verify distance and line before moving the arm."""
-    start = time.monotonic()
-    cleared_count = 0
-    left_initial_junction = False
-    ready_count = 0
+def button_bumper_approach(calibration, sensor):
+    """Use the chassis bumper to press the button; the arm never moves."""
+    deadline = time.monotonic() + BUTTON_BUMPER_APPROACH_TIMEOUT
+    ram_started = False
+    ram_deadline = None
+    last_status = 0.0
 
     try:
-        while time.monotonic() - start < BUTTON_MAX_TIME:
-            state = line_tracker.update(calibration)
-            left, right, _ = detector.read(state)
-
-            if not left and not right:
-                cleared_count += 1
-            else:
-                cleared_count = 0
-
-            if cleared_count >= JUNCTION_CLEAR:
-                left_initial_junction = True
-
-            if (
-                not left_initial_junction
-                and time.monotonic() - start > BUTTON_CLEAR_TIMEOUT
-            ):
-                print("\nB: initial junction did not clear.")
-                return False
-
+        while time.monotonic() < deadline:
             distance_cm = sensor.read_distance_mm() / 10.0
-            if distance_cm <= 0:
-                stop()
-                print("\nB: invalid distance reading; arm remains off.")
+            if not math.isfinite(distance_cm):
+                print("\nBUTTON: invalid distance reading; stopping.")
                 return False
 
-            if (state["position"] is None
-                    and (not left_initial_junction
-                         or distance_cm > BUTTON_SLOWDOWN_CM)):
-                ready_count = 0
-                speed = (
-                    BUTTON_ADJUST_SPEED
-                    if distance_cm <= BUTTON_SLOWDOWN_CM
-                    else MANEUVER_SPEED
-                )
-                line_follower.drive_straight(
-                    speed=speed,
-                    max_speed=MANEUVER_MAX_SPEED,
-                )
-                time.sleep(LOOP_DELAY)
-                continue
-
-            if not left_initial_junction:
-                # The range sensor may already see the button immediately
-                # after the turn. Clear the junction before fine positioning.
-                if distance_cm < BUTTON_MIN_CLEARANCE_CM:
+            state = line_tracker.update(calibration)
+            if not ram_started:
+                # Begin the full-speed bumper run at 20 ± 1 cm.
+                if distance_cm <= (
+                    BUTTON_BUMPER_START_CM + BUTTON_BUMPER_START_TOLERANCE_CM
+                ):
+                    ram_started = True
+                    ram_deadline = (
+                        time.monotonic() + BUTTON_BUMPER_RAM_SECONDS
+                    )
+                    print(
+                        f"\nBUTTON: {distance_cm:.1f} cm; "
+                        f"starting {BUTTON_BUMPER_RAM_SECONDS:g}-second "
+                        "full-speed bumper press."
+                    )
+                elif state["position"] is None:
                     stop()
-                    print(
-                        f"\nB: only {distance_cm:.1f} cm before leaving "
-                        "junction; arm remains off."
-                    )
-                    return False
-                speed = (
-                    BUTTON_ADJUST_SPEED if distance_cm <= BUTTON_SLOWDOWN_CM
-                    else MANEUVER_SPEED
-                )
-                differential_drive(
-                    state, speed=speed,
-                    max_speed=MANEUVER_MAX_SPEED
-                )
-                time.sleep(LOOP_DELAY)
-                continue
-
-            if distance_cm > BUTTON_SLOWDOWN_CM:
-                ready_count = 0
-                differential_drive(
-                    state, speed=MANEUVER_SPEED,
-                    max_speed=MANEUVER_MAX_SPEED
-                )
-                time.sleep(LOOP_DELAY)
-                continue
-
-            # All checks below use fresh readings after the motors have stopped.
-            stop()
-            time.sleep(BUTTON_SETTLE_SECONDS)
-            state = line_tracker.update(calibration)
-            distance_cm = sensor.read_distance_mm() / 10.0
-            if distance_cm <= 0:
-                print("\nB: distance missing while stopped; arm remains off.")
-                return False
-
-            line_text = (
-                "---" if state["position"] is None
-                else f"{state['position']:+.3f}"
-            )
-            print(
-                f"\rB ALIGN distance={distance_cm:.1f} cm "
-                f"line={line_text}",
-                end="", flush=True,
-            )
-
-            if button_position_ready(state, distance_cm):
-                ready_count += 1
-                if ready_count >= BUTTON_CONFIRM:
-                    print(
-                        f"\nB: stopped at {distance_cm:.1f} cm, "
-                        f"line position {line_text}. Starting arm."
-                    )
-                    return True
-                continue
-
-            ready_count = 0
-            if distance_cm < BUTTON_DISTANCE_CM - BUTTON_DISTANCE_TOLERANCE_CM:
-                if state["position"] is None:
-                    line_follower.reverse_straight(BUTTON_ADJUST_SPEED)
-                else:
-                    differential_reverse(state, BUTTON_ADJUST_SPEED)
-            else:
-                # Also use a short forward steering pulse when the distance is
-                # correct but the line is still off center.
-                if state["position"] is None:
-                    line_follower.drive_straight(
-                        speed=BUTTON_ADJUST_SPEED,
-                        max_speed=BUTTON_ADJUST_SPEED + 40,
-                    )
+                    time.sleep(LOOP_DELAY)
+                    continue
                 else:
                     differential_drive(
-                        state, speed=BUTTON_ADJUST_SPEED,
-                        max_speed=BUTTON_ADJUST_SPEED + 40,
+                        state,
+                        speed=MANEUVER_SPEED,
+                        max_speed=MANEUVER_MAX_SPEED,
                     )
-            time.sleep(BUTTON_ADJUST_SECONDS)
-            stop()
+                    time.sleep(LOOP_DELAY)
+                    continue
 
-        print("\nB: could not verify 21.5 cm and centered line; arm remains off.")
+            if time.monotonic() >= ram_deadline:
+                stop()
+                print(
+                    f"\nBUTTON: bumper run complete; final distance "
+                    f"{distance_cm:.1f} cm. Returning to junction."
+                )
+                return True
+
+            now = time.monotonic()
+            if now - last_status >= BUTTON_BUMPER_STATUS_SECONDS:
+                print(
+                    f"\rBUTTON RAM distance={distance_cm:.1f} cm",
+                    end="",
+                    flush=True,
+                )
+                last_status = now
+            if state["position"] is None:
+                # Continue straight only during the bounded two-second press.
+                line_follower.drive_straight(
+                    speed=BUTTON_BUMPER_SPEED,
+                    max_speed=BUTTON_BUMPER_SPEED,
+                )
+            else:
+                differential_drive(
+                    state,
+                    speed=BUTTON_BUMPER_SPEED,
+                    max_speed=BUTTON_BUMPER_SPEED,
+                )
+            time.sleep(LOOP_DELAY)
+
+        print("\nBUTTON: bumper approach timeout.")
         return False
-
     finally:
         stop()
 
 
-def button_return(calibration, detector, bus, offset, left_sign):
-    """Reverse on the differential2 sensor position, with gyro protection."""
+
+def button_return(
+    calibration,
+    detector,
+    bus,
+    offset,
+    left_sign,
+    label="BUTTON",
+    accept_s8_only=False,
+):
+    """Return using the geometry-aware reverse line controller."""
     heading = Heading(bus, offset, left_sign)
+    reverse_controller = ReverseLineController(heading)
     start = time.monotonic()
     cleared_count = 0
+    outer_confirm_count = 0
     candidate_since = None
-    recovery_since = None
 
     try:
         while time.monotonic() - start < RETURN_MAX_TIME:
             state = line_tracker.update(calibration)
             left, right, _ = detector.read(state)
             now = time.monotonic()
-            angle = heading.read()
 
             if not left and not right:
                 cleared_count += 1
 
-            # Preserve the original B return-junction rule.
-            if cleared_count >= JUNCTION_CLEAR and left and right:
-                print("\nB: return junction found (both outer sensors).")
+            if accept_s8_only:
+                outer_confirm_count = (
+                    outer_confirm_count + 1
+                    if cleared_count >= JUNCTION_CLEAR and right
+                    else 0
+                )
+                if outer_confirm_count >= JUNCTION_CONFIRM:
+                    print(
+                        f"\n{label}: return junction found by S8 "
+                        "(S1 is ignored for this task)."
+                    )
+                    return True
+            # Preserve the original BUTTON/FIREFIGHTER return rule.
+            elif cleared_count >= JUNCTION_CLEAR and left and right:
+                print(f"\n{label}: return junction found (both outer sensors).")
                 return True
-
-            if abs(angle) >= RETURN_MAX_ANGLE:
-                print("\nB: reverse gyro angle limit reached.")
-                return False
 
             if left != right:
                 if candidate_since is None:
@@ -706,48 +797,28 @@ def button_return(calibration, detector, bus, offset, left_sign):
             elif not left and not right:
                 candidate_since = None
 
-            if abs(angle) >= RETURN_RECOVERY_ANGLE:
-                if recovery_since is None:
-                    recovery_since = now
-            elif abs(angle) <= RETURN_RECOVERY_SAFE:
-                recovery_since = None
-
-            if (
-                recovery_since is not None
-                and now - recovery_since >= RETURN_RECOVERY_TIMEOUT
-            ):
-                print("\nB: reverse heading recovery timeout.")
-                return False
-
             if state["position"] is not None:
                 speed = (
-                    RETURN_SLOW_SPEED
-                    if candidate_since is not None or recovery_since is not None
-                    else RETURN_SPEED
-                )
-                differential_reverse(
-                    state, speed, RETURN_GYRO_KP * angle
+                    RETURN_SLOW_SPEED if candidate_since is not None else RETURN_SPEED
                 )
             else:
                 speed = (
-                    RETURN_SLOW_SPEED
-                    if candidate_since is not None or recovery_since is not None
-                    else RETURN_SPEED
+                    RETURN_SLOW_SPEED if candidate_since is not None else RETURN_SPEED
                 )
-                line_follower.reverse_straight(
-                    speed,
-                    heading_correction=RETURN_GYRO_KP * angle,
-                    max_delta=RETURN_MAX_DELTA,
-                )
+            if not differential_reverse(state, speed, reverse_controller):
+                print(f"\n{label}: line lost too long while reversing.")
+                return False
 
             print(
-                f'\rB BACK pos={state["position"]} angle={angle:+.1f} '
+                f'\r{label} BACK {reverse_controller.mode} '
+                f'pos={state["position"]} axle={reverse_controller.last_axle_error} '
+                f'angle={reverse_controller.last_angle:+.1f} '
                 f'S1={int(left)} S8={int(right)}',
                 end="", flush=True,
             )
             time.sleep(LOOP_DELAY)
 
-        print("\nB: reverse timeout.")
+        print(f"\n{label}: reverse timeout.")
         return False
 
     finally:
@@ -764,11 +835,7 @@ def button_task(calibration, detector, sensor, bus, offset, board):
     if not reacquire_line(calibration):
         return False
 
-    if not button_approach(calibration, detector, sensor):
-        return False
-
-    # The drive motors stay stopped until the arm maneuver finishes.
-    if not button_arm_action(board):
+    if not button_bumper_approach(calibration, sensor):
         return False
 
     if not button_return(calibration, detector, bus, offset, left_sign):
@@ -785,33 +852,179 @@ def button_task(calibration, detector, sensor, bus, offset, board):
     return ok and reacquire_line(calibration)
 
 
-def button_arm_action(board):
-    """Move arm to the tested button XYZ, then return home before reversing."""
-    from button_arm import move_to_xyz_and_home
+def cube1_arm_action(board):
+    """Hold the open gripper at the configured CUBE1 pose."""
+    from button_arm import move_to_xyz_and_hold
 
     stop()
     print(
-        f"\nB: moving arm automatically to X={BUTTON_X_MM:g}, "
-        f"Y={BUTTON_Y_MM:g}, Z={BUTTON_Z_MM:g} mm."
+        f"\nCUBE1: moving arm to X={CUBE1_X_MM:g}, Y={CUBE1_Y_MM:g}, "
+        f"Z={CUBE1_Z_MM:g} mm, fixed pitch "
+        f"{CUBE1_TOOL_PITCH_DEG:g} degrees."
     )
     try:
-        ok = move_to_xyz_and_home(
-            board, BUTTON_X_MM, BUTTON_Y_MM, BUTTON_Z_MM
+        return move_to_xyz_and_hold(
+            board,
+            CUBE1_X_MM,
+            CUBE1_Y_MM,
+            CUBE1_Z_MM,
+            tool_pitch=CUBE1_TOOL_PITCH_DEG,
+            gripper=0.0,
         )
-        if ok:
-            print("B: arm returned to home. Reversing to junction.")
-        return ok
     except Exception as exc:
-        print(f"\nB: arm movement failed: {exc}")
-        print("B: drive stopped. Check arm position before continuing.")
+        print(f"CUBE1: arm positioning failed: {exc}")
         return False
+    finally:
+        stop()
+
+
+def cube1_fold_arm(board):
+    """Fold the arm home after the cube disappears, before reversing."""
+    from arm_web import START_ANGLES, AUTO_MAX_STEP_DEG, STEP_DELAY
+    from button_arm import _return_home
+    from roboarm import get_shared_arm
+
+    stop()
+    print("\nCUBE1: cube is gone; folding arm home before reversing.")
+    try:
+        arm, newly_attached = get_shared_arm(board)
+        if newly_attached:
+            arm.write(**START_ANGLES)
+        else:
+            _return_home(
+                arm, START_ANGLES, AUTO_MAX_STEP_DEG, STEP_DELAY
+            )
+        # _return_home also applies the configured home gripper angle.
+        print("CUBE1: arm is home; starting reverse return.")
+        return True
+    except Exception as exc:
+        print(f"CUBE1: could not fold arm home: {exc}")
+        return False
+    finally:
+        stop()
+
+
+def cube1_cross_junction_until_drop(calibration, detector):
+    """Cross one junction, then use line loss as the cube drop marker."""
+    deadline = time.monotonic() + CUBE1_DROP_TIMEOUT
+    clear_count = 0
+    junction_armed = False
+    candidate_count = 0
+    junction_crossed = False
+
+    try:
+        while time.monotonic() < deadline:
+            state = line_tracker.update(calibration)
+
+            if not junction_crossed:
+                left, right, candidate = detector.read(state)
+                clear_count = clear_count + 1 if not left and not right else 0
+                if clear_count >= JUNCTION_CLEAR:
+                    junction_armed = True
+                if junction_armed and candidate:
+                    candidate_count += 1
+                else:
+                    candidate_count = 0
+
+                if candidate_count >= JUNCTION_CONFIRM:
+                    print("\nCUBE1: junction found; continuing straight through it.")
+                    if not follow_for(
+                        calibration,
+                        CUBE1_JUNCTION_CROSS_SECONDS,
+                        speed=MANEUVER_SPEED,
+                        max_speed=MANEUVER_MAX_SPEED,
+                    ):
+                        return False
+                    junction_crossed = True
+                    continue
+            elif state["position"] is None:
+                stop()
+                print(
+                    "\nCUBE1: line lost after junction; "
+                    "using it as the cube drop point."
+                )
+                return True
+
+            if state["position"] is None:
+                stop()
+            else:
+                differential_drive(state)
+            time.sleep(LOOP_DELAY)
+
+        print("\nCUBE1: junction/drop sequence timeout.")
+        return False
+    finally:
+        stop()
+
+
+def cube1_task(calibration, detector, bus, offset, board):
+    """Execute the complete first cube task without using the camera."""
+    stop()
+    try:
+        print("\nCUBE1: execute R90.")
+        if not follow_for(
+            calibration,
+            TURN_90_FORWARD_TIME,
+            speed=TURN_90_FORWARD_SPEED,
+            max_speed=TURN_90_FORWARD_MAX_SPEED,
+        ):
+            return False
+        ok, left_sign = pivot_90(
+            bus, offset, "R", angle_target=TURN_90_ANGLE
+        )
+        if not ok or left_sign is None:
+            print("CUBE1: initial turn/gyro check failed.")
+            return False
+        if not reacquire_line(calibration):
+            return False
+
+        # Keep the arm folded while entering and completing the turn.  The
+        # gripper is lowered only after the robot is aligned on the new line.
+        if not cube1_arm_action(board):
+            return False
+        print(
+            f"CUBE1: arm positioned; waiting "
+            f"{CUBE1_ARM_SETTLE_SECONDS:g} second before moving."
+        )
+        time.sleep(CUBE1_ARM_SETTLE_SECONDS)
+
+        if not cube1_cross_junction_until_drop(calibration, detector):
+            return False
+        if not cube1_fold_arm(board):
+            return False
+        if not button_return(
+            calibration,
+            detector,
+            bus,
+            offset,
+            left_sign,
+            label="CUBE1",
+            accept_s8_only=True,
+        ):
+            return False
+
+        print("\nCUBE1: move forward for 0.3 seconds before final turn.")
+        if not follow_for(calibration, RETURN_FORWARD_TIME):
+            return False
+        print(
+            f"\nCUBE1: turn RIGHT by "
+            f"{BUTTON_FINAL_RIGHT_ANGLE:g} degrees."
+        )
+        ok, _ = pivot(
+            bus, offset, "R", angle_target=BUTTON_FINAL_RIGHT_ANGLE
+        )
+        return ok and reacquire_line(calibration)
     finally:
         stop()
 
 
 def firefighter_task(calibration, detector, bus, offset, board):
     """Left turn, stationary arm pose, confirmed flame, at most two sprays."""
-    from firefighter import Firefighter, firefighting_pose
+    from firefighter import (
+        Firefighter,
+        firefighting_pose,
+        scan_for_confirmed_flame,
+    )
     from roboarm import get_shared_arm
     from arm_web import START_ANGLES, AUTO_MAX_STEP_DEG, STEP_DELAY
     from button_arm import _return_home
@@ -852,8 +1065,13 @@ def firefighter_task(calibration, detector, bus, offset, board):
 
             if flame_detected:
                 stop()
-                if fire.confirm_flame():
-                    print("\nF: flame confirmed for 1 second. Water ON.")
+                confirmed = fire.confirm_flame()
+                if not confirmed:
+                    confirmed = scan_for_confirmed_flame(
+                        fire, arm, pose["base"]
+                    )
+                if confirmed:
+                    print("\nF: flame confirmed for 0.5 seconds. Water ON.")
                     fire.spray()
                     # Discard reports taken during spraying. Keep the input
                     # subscribed: there is no sensor power-control pin.
@@ -862,7 +1080,7 @@ def firefighter_task(calibration, detector, bus, offset, board):
                         print("\nF: flame remains. Second and final 5 s spray.")
                         fire.spray()
                     break
-                # A transient signal must not trigger the pump.
+                # A transient signal and an empty scan must not trigger water.
                 continue
             state = line_tracker.update(calibration)
             if not differential_drive(
@@ -884,8 +1102,10 @@ def firefighter_task(calibration, detector, bus, offset, board):
             return False
         if not follow_for(calibration, RETURN_FORWARD_TIME):
             return False
-        print(f"\nF: turn RIGHT by {FIRE_FINAL_RIGHT_ANGLE:g} degrees.")
-        ok, _ = pivot(bus, offset, "R", angle_target=FIRE_FINAL_RIGHT_ANGLE)
+        print(f"\nF: turn RIGHT by {BUTTON_FINAL_RIGHT_ANGLE:g} degrees.")
+        ok, _ = pivot(
+            bus, offset, "R", angle_target=BUTTON_FINAL_RIGHT_ANGLE
+        )
         return ok and reacquire_line(calibration)
     finally:
         try:
@@ -960,7 +1180,8 @@ def load_route():
         if cmd not in ALLOWED_ROUTE_COMMANDS:
             raise ValueError(
                 f"Invalid ROUTE entry #{index}: {command!r}. "
-                "Allowed: L, R, L90, R90, S, B, C, F, Q."
+                "Allowed: L, R, L90, R90, S, BUTTON, CHARGING, "
+                "FIREFIGHTER, CUBE1, Q."
             )
         if cmd == "Q" and index != len(ROUTE):
             raise ValueError("Q must be the last ROUTE entry.")
@@ -977,8 +1198,16 @@ def main():
         route = load_route()
         print(f"Automatic ROUTE loaded: {route}")
         # Use the same connection and ADC subscription order as ADC.py:
-        # connect once, then immediately register all eight callbacks.
+        # connect once, force the drive outputs to zero, then enable the arm.
         board = telemetrix.Telemetrix(com_port=SERIAL_PORT)
+        # Do this before any servo motion or callback wait.  It prevents a
+        # previous PWM state from moving the chassis while servos wake up.
+        motors.initialize(board)
+        motors_on = True
+        stop()
+        activate_arm_home(board)
+
+        # Only after the arm is held safely at home, register all ADC inputs.
         line_tracker.initialize(board)
         tracker_on = True
 
@@ -1002,10 +1231,6 @@ def main():
         startup_state = line_tracker.update(calibration)
         print(f"All eight ADC channels ready: {startup_state['raw']}")
         print(f"Initial line position: {startup_state['position']}")
-
-        # Configure the motor outputs only after ADC subscriptions are alive.
-        motors.initialize(board)
-        motors_on = True
 
         print("Starting route; line tracker will self-center the robot.")
 
@@ -1069,7 +1294,10 @@ def main():
                     print("ROUTE: stop command.")
                     break
 
-                if cmd in ("L", "R", "L90", "R90", "B", "C", "F"):
+                if cmd in (
+                    "L", "R", "L90", "R90", "BUTTON", "CHARGING",
+                    "FIREFIGHTER", "CUBE1",
+                ):
                     # Gyro stays unloaded until a maneuver requires it.
                     if bus is None:
                         bus = smbus.SMBus(I2C_BUS)
@@ -1081,18 +1309,22 @@ def main():
                     else:
                         offset = gyro_calibrate(bus)
 
-                    if cmd == "B":
+                    if cmd == "BUTTON":
                         if sensor is None:
                             sensor = VL53L0XSensor()
                             sensor.initialize()
                         ok = button_task(
                             calibration, detector, sensor, bus, offset, board
                         )
-                    elif cmd == "F":
+                    elif cmd == "FIREFIGHTER":
                         ok = firefighter_task(
                             calibration, detector, bus, offset, board
                         )
-                    elif cmd == "C":
+                    elif cmd == "CUBE1":
+                        ok = cube1_task(
+                            calibration, detector, bus, offset, board
+                        )
+                    elif cmd == "CHARGING":
                         ok = charging_task()
                         if ok:
                             # Same 80-degree R turn and differential reacquire.
@@ -1126,7 +1358,10 @@ def main():
                 straight_speed["previous_error"] = None
                 straight_speed["previous_time"] = None
                 straight_speed["straight_since"] = None
-                if cmd in ("L", "R", "L90", "R90", "B", "C", "F"):
+                if cmd in (
+                    "L", "R", "L90", "R90", "BUTTON", "CHARGING",
+                    "FIREFIGHTER", "CUBE1",
+                ):
                     junction_ignore_until = (
                         time.monotonic() + POST_TURN_JUNCTION_IGNORE_SECONDS
                     )

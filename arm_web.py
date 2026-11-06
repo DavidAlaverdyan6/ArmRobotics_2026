@@ -1129,74 +1129,6 @@ def execute_button_cycle(target, hold_seconds=0.4):
     }
 
 
-def execute_cube_step(delta):
-    """Move the arm by one bounded camera guided relative step."""
-    global moving
-
-    dx, dy, dz = (float(delta[name]) for name in ('dx', 'dy', 'dz'))
-    if not all(math.isfinite(value) for value in (dx, dy, dz)):
-        raise ValueError('Cube step must contain finite deltas.')
-    if not 0 < math.sqrt(dx*dx + dy*dy + dz*dz) <= 8.01:
-        raise ValueError('Cube step must be at most 8 mm.')
-
-    with arm_lock:
-        if moving:
-            raise RuntimeError('Arm is already moving.')
-        stop_requested.clear()
-        moving = True
-        try:
-            current = get_current_xyz()
-            x, y, z = (current[0]+dx, current[1]+dy, current[2]+dz)
-            if not (100 <= x <= 390 and -120 <= y <= 120 and
-                    -100 <= z <= 140):
-                raise ValueError('Cube step leaves the bounded arm workspace.')
-            current_pitch = get_current_tool_pitch()
-            try:
-                path = plan_target_pitch_path({
-                    'x': x, 'y': y, 'z': z,
-                    'tool_pitch': current_pitch,
-                })
-            except IKError:
-                # At elbow=180/wrist=0 the feasible pitch interval can be less
-                # than one degree wide. The generic 3-degree search misses it.
-                path = None
-                for index in range(1, 21):
-                    for sign in (-1, 1):
-                        chosen_pitch = current_pitch + sign * index * 0.25
-                        try:
-                            path = plan_target_pitch_path({
-                                'x': x, 'y': y, 'z': z,
-                                'tool_pitch': chosen_pitch,
-                            })
-                            break
-                        except IKError:
-                            continue
-                    if path is not None:
-                        break
-                if path is None:
-                    raise IKError('No local cube step within 5 degrees of current pitch.')
-        except Exception:
-            moving = False
-            raise
-
-    try:
-        for angles in path:
-            if stop_requested.is_set():
-                raise InterruptedError('Emergency stop requested.')
-            with arm_lock:
-                if stop_requested.is_set():
-                    raise InterruptedError('Emergency stop requested.')
-                arm.write(**angles)
-            time.sleep(STEP_DELAY)
-    finally:
-        with arm_lock:
-            moving = False
-
-    return {'delta': {'dx': dx, 'dy': dy, 'dz': dz},
-            'xyz': get_current_xyz(),
-            'angles': get_current_angles()}
-
-
 class Handler(BaseHTTPRequestHandler):
     def send_json(self, status, payload):
         body = json.dumps(payload).encode("utf-8")
@@ -1226,7 +1158,7 @@ class Handler(BaseHTTPRequestHandler):
                 with arm_lock:
                     self.send_json(200, {
                         "connected": True,
-                        "capabilities": ["button-press-v2", "cube-step-v2", "stop-v1"],
+                        "capabilities": ["button-press-v2", "stop-v1"],
                         "moving": moving,
                         "angles": get_current_angles(),
                         "xyz": get_current_xyz(),
@@ -1273,15 +1205,6 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(409, {"error": str(error), "stopped": True})
                     return
                 self.send_json(200, {"ok": True, **result})
-                return
-
-            if path == '/api/cube-step':
-                try:
-                    result = execute_cube_step(data)
-                except InterruptedError as error:
-                    self.send_json(409, {'error': str(error), 'stopped': True})
-                    return
-                self.send_json(200, {'ok': True, **result})
                 return
 
             if path == "/api/servo":

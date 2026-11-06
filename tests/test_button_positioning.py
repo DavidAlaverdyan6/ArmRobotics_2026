@@ -1,4 +1,4 @@
-"""Offline checks for the B task's final position before servo motion."""
+"""Offline checks for the bumper-based BUTTON task."""
 
 import importlib.util
 import sys
@@ -9,141 +9,94 @@ from unittest.mock import Mock, patch
 
 
 def load_navigation():
-    stubs = {name: types.ModuleType(name) for name in
-             ("smbus", "telemetrix", "motors", "line_tracker",
-              "sensors.vl53l0x_sensor", "led", "robot_pin_config")}
+    stubs = {name: types.ModuleType(name) for name in (
+        "smbus", "telemetrix", "motors", "line_tracker",
+        "sensors.vl53l0x_sensor", "led", "robot_pin_config",
+    )}
     stubs["telemetrix"].telemetrix = Mock()
     stubs["line_tracker"].LineTrackingEngine = Mock(return_value=Mock())
     stubs["line_tracker"].CENTER_POSITION = 0.0
-    stubs["led"].RGBLED = Mock(return_value=Mock())
-    stubs["robot_pin_config"].LED_RED = 17
-    stubs["robot_pin_config"].LED_GREEN = 27
-    stubs["robot_pin_config"].LED_BLUE = 22
     stubs["sensors.vl53l0x_sensor"].VL53L0XSensor = Mock()
     with patch.dict(sys.modules, stubs):
         spec = importlib.util.spec_from_file_location(
-            "button_position_navigation",
-            Path(__file__).resolve().parents[1] / "main.py",
+            "button_bumper_navigation",
+            Path(__file__).resolve().parents[1] / "main_test.py",
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     return module
 
 
-class ButtonPositionTests(unittest.TestCase):
+class ButtonBumperTests(unittest.TestCase):
     def setUp(self):
         self.nav = load_navigation()
-        self.centered = {
-            "position": 0.08,
-            "normalized": [0, 0, 0.2, 0.8, 0.8, 0.2, 0, 0],
-        }
+        self.centered = {"position": 0.08}
 
-    def test_distance_and_line_must_both_match(self):
+    def test_full_speed_runs_for_two_seconds_and_reads_distance_continuously(self):
         nav = self.nav
-        self.assertTrue(nav.button_position_ready(self.centered, 21.5))
-        self.assertFalse(nav.button_position_ready(self.centered, 21.0))
-        self.assertTrue(nav.button_position_ready(self.centered, 22.0))
-        self.assertFalse(nav.button_position_ready(self.centered, 20.9))
-        self.assertTrue(nav.button_position_ready(self.centered, 22.1))
-        self.assertFalse(nav.button_position_ready(self.centered, 22.6))
-        off_center = {**self.centered, "position": 0.6}
-        self.assertFalse(nav.button_position_ready(off_center, 21.5))
+        clock = [0.0]
+        nav.stop = Mock()
+        nav.differential_drive = Mock()
+        nav.line_tracker.update = Mock(return_value=self.centered)
+        sensor = Mock()
+        # 30 cm approach, 20 cm bumper-run trigger, then many live readings.
+        sensor.read_distance_mm.side_effect = [300, 200] + [50] * 110
 
-    def test_junction_is_detected_without_centered_history(self):
+        with patch.object(nav.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(nav.time, "sleep", side_effect=lambda seconds:
+                          clock.__setitem__(0, clock[0] + seconds)):
+            self.assertTrue(nav.button_bumper_approach(None, sensor))
+
+        self.assertEqual(
+            nav.differential_drive.call_args_list[0].kwargs["speed"],
+            nav.MANEUVER_SPEED,
+        )
+        full_speed_calls = nav.differential_drive.call_args_list[1:]
+        self.assertTrue(full_speed_calls)
+        self.assertTrue(all(
+            call.kwargs["speed"] == nav.BUTTON_BUMPER_SPEED
+            and call.kwargs["max_speed"] == nav.BUTTON_BUMPER_SPEED
+            for call in full_speed_calls
+        ))
+        self.assertGreaterEqual(sensor.read_distance_mm.call_count, 100)
+
+    def test_zero_distance_is_read_during_the_timed_bumper_run(self):
         nav = self.nav
-        detector = nav.JunctionDetector()
-        branch = {
-            "position": -1.4,
-            "normalized": [0.9, 0.7, 0, 0.8, 0.8, 0, 0, 0],
-        }
-        self.assertTrue(detector.read(branch)[2])
+        clock = [0.0]
+        nav.stop = Mock()
+        nav.differential_drive = Mock()
+        nav.line_tracker.update = Mock(return_value=self.centered)
+        sensor = Mock()
+        sensor.read_distance_mm.side_effect = [200] + [0] * 110
 
-    def test_isolated_outer_patch_is_rejected(self):
+        with patch.object(nav.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(nav.time, "sleep", side_effect=lambda seconds:
+                          clock.__setitem__(0, clock[0] + seconds)):
+            self.assertTrue(nav.button_bumper_approach(None, sensor))
+        self.assertGreaterEqual(sensor.read_distance_mm.call_count, 100)
+
+    def test_arm_is_activated_in_base_pose(self):
+        arm = Mock()
+        home = {
+            "base": 90, "shoulder": 170, "elbow": 180,
+            "wrist": 0, "gripper": 180,
+        }
+        with patch.dict(sys.modules, {
+            "arm_web": types.SimpleNamespace(START_ANGLES=home),
+            "roboarm": types.SimpleNamespace(
+                get_shared_arm=Mock(return_value=(arm, True))
+            ),
+        }):
+            self.nav.activate_arm_home(Mock())
+        arm.write.assert_called_once_with(**home)
+
+    def test_junction_detection_still_rejects_isolated_outer_patch(self):
         detector = self.nav.JunctionDetector()
         patch_state = {
             "position": -1.4,
             "normalized": [0.9, 0.2, 0, 0.8, 0.8, 0, 0, 0],
         }
         self.assertFalse(detector.read(patch_state)[2])
-
-    def test_too_close_reverses_then_confirms_while_stopped(self):
-        nav = self.nav
-        clock = [0.0]
-        nav.stop = Mock()
-        nav.differential_drive = Mock(return_value=True)
-        nav.differential_reverse = Mock(return_value=True)
-        nav.read_fresh = Mock(return_value=self.centered)
-        detector = Mock()
-        detector.read.return_value = (False, False, False)
-        sensor = Mock()
-        sensor.read_distance_mm.side_effect = (
-            [350] * 3 + [200] * 2 + [215] * 6
-        )
-
-        with patch.object(nav.time, "monotonic", side_effect=lambda: clock[0]), \
-             patch.object(nav.time, "sleep",
-                          side_effect=lambda seconds: clock.__setitem__(
-                              0, clock[0] + seconds)):
-            self.assertTrue(nav.button_approach(None, detector, sensor))
-
-        nav.differential_reverse.assert_called_once_with(
-            self.centered, nav.BUTTON_ADJUST_SPEED
-        )
-        self.assertGreaterEqual(nav.stop.call_count, 4)
-        self.assertEqual(sensor.read_distance_mm.call_count, 11)
-
-    def test_invalid_distance_stops_without_moving(self):
-        nav = self.nav
-        nav.stop = Mock()
-        nav.differential_drive = Mock()
-        nav.read_fresh = Mock(return_value=self.centered)
-        detector = Mock()
-        detector.read.return_value = (False, False, False)
-        sensor = Mock()
-        sensor.read_distance_mm.return_value = 0
-
-        self.assertFalse(nav.button_approach(None, detector, sensor))
-        nav.differential_drive.assert_not_called()
-        nav.stop.assert_called()
-
-    def test_button_visible_before_junction_clears(self):
-        nav = self.nav
-        clock = [0.0]
-        nav.stop = Mock()
-        nav.differential_drive = Mock(return_value=True)
-        nav.read_fresh = Mock(return_value=self.centered)
-        detector = Mock()
-        detector.read.side_effect = (
-            [(True, False, False)] * 2 + [(False, False, False)] * 7
-        )
-        sensor = Mock()
-        sensor.read_distance_mm.return_value = 215
-
-        with patch.object(nav.time, "monotonic", side_effect=lambda: clock[0]), \
-             patch.object(nav.time, "sleep",
-                          side_effect=lambda seconds: clock.__setitem__(
-                              0, clock[0] + seconds)):
-            self.assertTrue(nav.button_approach(None, detector, sensor))
-
-        self.assertEqual(nav.differential_drive.call_count, 5)
-        self.assertTrue(all(
-            call.kwargs["speed"] == nav.BUTTON_ADJUST_SPEED
-            for call in nav.differential_drive.call_args_list
-        ))
-
-    def test_too_close_on_junction_stops(self):
-        nav = self.nav
-        nav.stop = Mock()
-        nav.differential_drive = Mock()
-        nav.read_fresh = Mock(return_value=self.centered)
-        detector = Mock()
-        detector.read.return_value = (True, False, False)
-        sensor = Mock()
-        sensor.read_distance_mm.return_value = 170
-
-        self.assertFalse(nav.button_approach(None, detector, sensor))
-        nav.differential_drive.assert_not_called()
-        nav.stop.assert_called()
 
 
 if __name__ == "__main__":

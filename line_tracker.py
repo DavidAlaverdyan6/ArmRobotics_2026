@@ -252,22 +252,17 @@ class LineTrackingEngine:
     def correction(self, position):
         return self.kp * (position - self.target_position)
 
-    def drive(self, state, speed=None, max_speed=None):
-        """Follow the line forward. Return False when no line is visible."""
-        if state is None or state.get("position") is None:
-            self.stop()
-            return False
-
-        speed = self.base_speed if speed is None else speed
-        max_speed = self.max_speed if max_speed is None else max_speed
-        correction = self.correction(state["position"])
-        error = state["position"] - self.target_position
+    def steering_correction(self, position):
+        """Return the shared P+D line correction from all eight sensors."""
+        correction = self.correction(position)
+        error = position - self.target_position
         now = time.monotonic()
         if self.previous_time is not None:
             dt = now - self.previous_time
             if 0.005 <= dt <= 0.25:
-                # Positive D strengthens correction while moving outward and
-                # reduces it while approaching center, before overshooting.
+                # The same damping is used forward and in reverse.  It makes
+                # the robot ease into the centre instead of zig-zagging past
+                # the line whenever the sensor position changes rapidly.
                 alpha = dt / (0.06 + dt)
                 rate = (error - self.previous_error) / dt
                 self.filtered_derivative += alpha * (
@@ -278,6 +273,17 @@ class LineTrackingEngine:
         correction += clamp(self.kd * self.filtered_derivative, -20, 20)
         self.previous_error = error
         self.previous_time = now
+        return correction
+
+    def drive(self, state, speed=None, max_speed=None):
+        """Follow the line forward. Return False when no line is visible."""
+        if state is None or state.get("position") is None:
+            self.stop()
+            return False
+
+        speed = self.base_speed if speed is None else speed
+        max_speed = self.max_speed if max_speed is None else max_speed
+        correction = self.steering_correction(state["position"])
         left = clamp(speed + correction, self.min_speed, max_speed)
         right = clamp(speed - correction, self.min_speed, max_speed)
         self.motor_driver.set_speeds(round(left), round(right))
@@ -292,20 +298,32 @@ class LineTrackingEngine:
         self.motor_driver.set_speeds(pwm, pwm)
         return True
 
-    def reverse(self, state, speed, heading_correction=0.0, max_delta=85):
-        """Follow the same line in reverse with optional gyro correction."""
-        self.reset_steering()
+    def reverse(
+        self, state, speed, heading_correction=0.0, max_delta=85,
+        line_gain=1.0,
+    ):
+        """Follow a visible line backwards by braking one wheel only."""
         if state is None or state.get("position") is None:
             self.stop()
             return False
 
         correction = clamp(
-            self.correction(state["position"]) + heading_correction,
+            self.steering_correction(state["position"]) * line_gain
+            + heading_correction,
             -max_delta,
             max_delta,
         )
-        left = clamp(-speed + correction, -255, -15)
-        right = clamp(-speed - correction, -255, -15)
+        # The sensor's forward steering polarity must be inverted in reverse.
+        # Keep one wheel at the requested reverse speed and *brake* the other
+        # one.  Do not accelerate either wheel above base: on this robot that
+        # made reverse return pull to the left.  PWM 80 is the physical floor.
+        base = max(abs(speed), 80)
+        if correction >= 0:
+            left = -base
+            right = -clamp(base - correction, 80, base)
+        else:
+            left = -clamp(base + correction, 80, base)
+            right = -base
         self.motor_driver.set_speeds(round(left), round(right))
         return True
 
@@ -313,8 +331,13 @@ class LineTrackingEngine:
         """Continue reversing from gyro heading when line position is absent."""
         self.reset_steering()
         correction = clamp(heading_correction, -max_delta, max_delta)
-        left = clamp(-speed + correction, -255, -15)
-        right = clamp(-speed - correction, -255, -15)
+        base = max(abs(speed), 80)
+        if correction >= 0:
+            left = -base
+            right = -clamp(base - correction, 80, base)
+        else:
+            left = -clamp(base + correction, 80, base)
+            right = -base
         self.motor_driver.set_speeds(round(left), round(right))
         return True
 
