@@ -175,10 +175,10 @@ COLOR_MARKER_STABLE_FRAMES = 3
 #                   "FIREFIGHTER", "Q"]
 # The commented entries below are placeholders: edit them before launching.
 ROUTE = [
-    # "BUTTON",
-    # "L",
-    # "R",
-    # "L",
+    "BUTTON",
+    "L",
+    "R",
+    "L",
     "CUBE1",
     "SLOW",
     "L",
