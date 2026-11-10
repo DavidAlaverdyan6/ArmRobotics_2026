@@ -1093,8 +1093,14 @@ def button_task(calibration, detector, sensor, bus, offset, board):
 
 
 def button_arm_action(board):
-    """Press at the requested XYZ with the gripper horizontal, then go home."""
-    from button_arm import move_to_xyz_and_home
+    """Use the proven arm_web XYZ/pitch planner, hold, then return home."""
+    from arm_web import START_ANGLES, AUTO_MAX_STEP_DEG, STEP_DELAY
+    from button_arm import (
+        BUTTON_HOLD_SECONDS,
+        _return_home,
+        move_to_xyz_and_hold,
+    )
+    from roboarm import get_shared_arm
 
     stop()
     print(
@@ -1102,10 +1108,27 @@ def button_arm_action(board):
         f"Z={BUTTON_Z_MM:g} mm, tool pitch={BUTTON_TOOL_PITCH_DEG:g} degrees."
     )
     try:
-        # move_to_xyz_and_home uses the tested horizontal (0-degree) tool path.
-        return move_to_xyz_and_home(
-            board, BUTTON_X_MM, BUTTON_Y_MM, BUTTON_Z_MM
+        # This is the same checked XYZ + tool-pitch planner used by arm_web.
+        ok = move_to_xyz_and_hold(
+            board,
+            BUTTON_X_MM,
+            BUTTON_Y_MM,
+            BUTTON_Z_MM,
+            tool_pitch=BUTTON_TOOL_PITCH_DEG,
+            gripper=170.0,
         )
+        if not ok:
+            return False
+
+        print("BUTTON: horizontal tool at 0 degrees. Holding button press.")
+        time.sleep(BUTTON_HOLD_SECONDS)
+
+        arm, _ = get_shared_arm(board)
+        home = dict(START_ANGLES)
+        home["gripper"] = 170.0
+        _return_home(arm, home, AUTO_MAX_STEP_DEG, STEP_DELAY)
+        print("BUTTON: arm returned home. Reversing to junction.")
+        return True
     except Exception as exc:
         print(f"\nBUTTON: arm movement failed: {exc}")
         print("BUTTON: drive stopped. Check arm position before continuing.")
