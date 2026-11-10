@@ -13,7 +13,7 @@ from navigation_core import FreshFrames
 from stm32_reset import STM32_RESET_GPIO, reset_stm32
 from sensors.vl53l0x_sensor import VL53L0XSensor
 
-PROGRAM_BUILD = "button-arm-l90-35.5cm-2026-11-10.16"
+PROGRAM_BUILD = "button-arm-l90-23.5cm-2026-11-10.17"
 
 # Previously tested differential2 line-following speeds.
 SERIAL_PORT = "/dev/serial0"
@@ -84,10 +84,10 @@ TURN_TOLERANCE_DEG = 8.0
 TURN_CORRECTION_START_DEG = 4.0
 
 # BUTTON: stop at the requested range, then press with the arm.
-BUTTON_DISTANCE_CM = 35.5
+BUTTON_DISTANCE_CM = 23.5
 BUTTON_DISTANCE_TOLERANCE_CM = 1.0
-BUTTON_SLOWDOWN_CM = 45.0
-BUTTON_MIN_CLEARANCE_CM = 30.0
+BUTTON_SLOWDOWN_CM = 33.0
+BUTTON_MIN_CLEARANCE_CM = 15.0
 BUTTON_CENTER_TOLERANCE = 0.25
 BUTTON_ADJUST_SPEED = 70
 BUTTON_ADJUST_SECONDS = 0.08
@@ -752,7 +752,7 @@ def button_position_ready(state, distance_cm):
 
 
 def button_approach(calibration, detector, sensor):
-    """Stop at 35.5 +/- 1 cm and verify the pose before moving the arm."""
+    """Stop at 23.5 +/- 1 cm and verify the pose before moving the arm."""
     start = time.monotonic()
     cleared_count = 0
     left_initial_junction = False
@@ -782,6 +782,25 @@ def button_approach(calibration, detector, sensor):
                 stop()
                 print("\nBUTTON: invalid distance reading; arm remains off.")
                 return False
+
+            # Distance positioning takes priority near the target. If the
+            # robot starts extremely close (for example at 5 cm), reverse
+            # immediately until it reaches the 23.5 +/- 1 cm target range.
+            if distance_cm <= (
+                BUTTON_DISTANCE_CM + BUTTON_DISTANCE_TOLERANCE_CM
+            ):
+                left_initial_junction = True
+            if distance_cm < (
+                BUTTON_DISTANCE_CM - BUTTON_DISTANCE_TOLERANCE_CM
+            ):
+                ready_count = 0
+                if state["position"] is None:
+                    line_follower.reverse_straight(BUTTON_ADJUST_SPEED)
+                else:
+                    differential_reverse(state, BUTTON_ADJUST_SPEED)
+                time.sleep(BUTTON_ADJUST_SECONDS)
+                stop()
+                continue
 
             if (
                 state["position"] is None
@@ -886,7 +905,7 @@ def button_approach(calibration, detector, sensor):
             stop()
 
         print(
-            "\nBUTTON: could not verify 35.5 +/- 1 cm and centered line; "
+            "\nBUTTON: could not verify 23.5 +/- 1 cm and centered line; "
             "arm remains off."
         )
         return False
@@ -1021,6 +1040,18 @@ def button_return(
 
 
 def button_task(calibration, detector, sensor, bus, offset, board):
+    print(
+        f"\nBUTTON: drive forward for {TURN_90_FORWARD_TIME:g} seconds "
+        "before L90."
+    )
+    if not follow_for(
+        calibration,
+        TURN_90_FORWARD_TIME,
+        speed=TURN_90_FORWARD_SPEED,
+        max_speed=TURN_90_FORWARD_MAX_SPEED,
+    ):
+        return False
+
     print("\nBUTTON: execute L90.")
     ok, left_sign = pivot_90(
         bus, offset, "L", angle_target=TURN_90_ANGLE
