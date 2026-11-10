@@ -73,6 +73,15 @@ class ReverseLineControllerTests(unittest.TestCase):
         left, right = self.nav.motors.set_speeds.call_args.args
         self.assertEqual((left, right), (-150, -80))
 
+    def test_button_edge_recovery_turns_toward_left_line_while_reversing(self):
+        controller = self.nav.ReverseLineController(
+            StaticHeading(), edge_recovery=True
+        )
+        with patch.object(self.nav.time, "monotonic", return_value=1.0):
+            self.assertTrue(controller.drive({"position": -2.5}, 115))
+
+        self.assertEqual(self.nav.motors.set_speeds.call_args.args, (-80, -150))
+
 
 if __name__ == "__main__":
     unittest.main()

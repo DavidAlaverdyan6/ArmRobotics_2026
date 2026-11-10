@@ -284,12 +284,33 @@ class FireTests(unittest.TestCase):
 
     def test_route_commands(self):
         nav = load_navigation()
-        nav.ROUTE = ['Firefighter', 'charging', 'Cube1', 'Q']
-        expected = ['FIREFIGHTER', 'CHARGING', 'CUBE1', 'Q']
+        nav.ROUTE = ['Firefighter', 'charging', 'Cube1', 'slow', 'Q']
+        expected = ['FIREFIGHTER', 'CHARGING', 'CUBE1', 'SLOW', 'Q']
         self.assertEqual(nav.load_route(), expected)
         nav.ROUTE = ['P', 'Q']
         with self.assertRaises(ValueError):
             nav.load_route()
+
+    def test_slow_straight_holds_low_speed_before_ramping(self):
+        nav = load_navigation()
+        self.assertEqual(
+            nav.post_junction_drive_limits(0.0, slow=True),
+            (nav.SLOW_STRAIGHT_SPEED, nav.SLOW_STRAIGHT_MAX_SPEED),
+        )
+        self.assertEqual(
+            nav.post_junction_drive_limits(
+                nav.SLOW_STRAIGHT_HOLD_SECONDS - 0.01, slow=True
+            ),
+            (nav.SLOW_STRAIGHT_SPEED, nav.SLOW_STRAIGHT_MAX_SPEED),
+        )
+        self.assertEqual(
+            nav.post_junction_drive_limits(
+                nav.SLOW_STRAIGHT_HOLD_SECONDS
+                + nav.POST_JUNCTION_ACCEL_SECONDS,
+                slow=True,
+            ),
+            (nav.BASE_SPEED, nav.MAX_SPEED),
+        )
 
 
 if __name__ == '__main__':

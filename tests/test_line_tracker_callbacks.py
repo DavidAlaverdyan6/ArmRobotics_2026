@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 
 import line_tracker
-from pins import PB0, PA6, PA5, PA4, PA3, PA2, PA1, PA0
+from pins import PA7, PA6, PA5, PA4, PA3, PA2, PA1, PA0
 
 
 class FakeBoard:
@@ -27,7 +27,7 @@ class LineTrackerCallbackTests(unittest.TestCase):
         self.assertEqual(len(board.inputs), 8)
         self.assertEqual(
             [pin for pin, _ in board.inputs],
-            [PB0, PA6, PA5, PA4, PA3, PA2, PA1, PA0],
+            [PA7, PA6, PA5, PA4, PA3, PA2, PA1, PA0],
         )
         self.assertFalse(line_tracker.all_callbacks_ready())
 
@@ -46,6 +46,9 @@ class LineTrackerCallbackTests(unittest.TestCase):
                     "white": [3000] * 8,
                     "black": [3900] * 8,
                 }
+                line_tracker.save_calibration(old)
+                self.assertIsNone(line_tracker.load_calibration())
+                old["pins"] = [200, PA6, PA5, PA4, PA3, PA2, PA1, PA0]
                 line_tracker.save_calibration(old)
                 self.assertIsNone(line_tracker.load_calibration())
                 old["pins"] = line_tracker.SENSOR_PINS.copy()

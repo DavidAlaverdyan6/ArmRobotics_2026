@@ -20,7 +20,7 @@ def show_position(state):
     print("=" * 48)
 
     print("\nRAW SENSOR VALUES:")
-    prin3-.t(" ".join(
+    print(" ".join(
         f"S{i + 1}:{value:4}"
         for i, value in enumerate(state["raw"])
     ))

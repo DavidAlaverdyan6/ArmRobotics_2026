@@ -32,7 +32,7 @@ class ButtonBumperTests(unittest.TestCase):
         self.nav = load_navigation()
         self.centered = {"position": 0.08}
 
-    def test_full_speed_runs_for_one_second_and_reads_distance_continuously(self):
+    def test_bumper_speed_runs_for_one_second_and_reads_distance_continuously(self):
         nav = self.nav
         clock = [0.0]
         nav.stop = Mock()
@@ -52,12 +52,12 @@ class ButtonBumperTests(unittest.TestCase):
         nav.motors.set_speeds.assert_called_once_with(
             nav.MANEUVER_SPEED, nav.MANEUVER_SPEED
         )
-        full_speed_calls = nav.differential_drive.call_args_list
-        self.assertTrue(full_speed_calls)
+        bumper_speed_calls = nav.differential_drive.call_args_list
+        self.assertTrue(bumper_speed_calls)
         self.assertTrue(all(
             call.kwargs["speed"] == nav.BUTTON_BUMPER_SPEED
             and call.kwargs["max_speed"] == nav.BUTTON_BUMPER_SPEED
-            for call in full_speed_calls
+            for call in bumper_speed_calls
         ))
         self.assertGreaterEqual(sensor.read_distance_mm.call_count, 50)
 
@@ -221,10 +221,8 @@ class ButtonBumperTests(unittest.TestCase):
         nav.motors.set_speeds.assert_called_once_with(160, 40)
 
     def test_button_finishes_with_the_tested_r90_turn(self):
-        self.nav.pivot = Mock(return_value=(True, 1))
-        self.nav.pivot_90 = Mock(return_value=(True, None))
+        self.nav.pivot_90 = Mock(side_effect=[(True, 1), (True, None)])
         self.nav.reacquire_line = Mock(return_value=True)
-        self.nav.button_depart_and_check_line = Mock(return_value=True)
         self.nav.button_bumper_approach = Mock(return_value=True)
         self.nav.button_return = Mock(return_value=True)
         self.nav.follow_for = Mock(return_value=True)
@@ -234,8 +232,12 @@ class ButtonBumperTests(unittest.TestCase):
             None, Mock(), Mock(), bus, 12.0, Mock()
         ))
 
-        self.nav.pivot.assert_called_once_with(bus, 12.0, "L")
-        self.nav.button_depart_and_check_line.assert_called_once_with(None)
+        self.assertEqual(
+            self.nav.pivot_90.call_args_list[0],
+            unittest.mock.call(
+                bus, 12.0, "L", angle_target=self.nav.TURN_90_ANGLE
+            ),
+        )
         self.nav.button_return.assert_called_once_with(
             None,
             unittest.mock.ANY,
@@ -244,14 +246,23 @@ class ButtonBumperTests(unittest.TestCase):
             1,
             line_loss_timeout=self.nav.BUTTON_REVERSE_LINE_LOSS_TIMEOUT,
         )
-        self.nav.follow_for.assert_called_once_with(
-            None, self.nav.RETURN_FORWARD_TIME
+        self.assertEqual(
+            self.nav.follow_for.call_args_list,
+            [
+                unittest.mock.call(
+                    None,
+                    self.nav.TURN_90_FORWARD_TIME,
+                    speed=self.nav.TURN_90_FORWARD_SPEED,
+                    max_speed=self.nav.TURN_90_FORWARD_MAX_SPEED,
+                ),
+                unittest.mock.call(None, self.nav.RETURN_FORWARD_TIME),
+            ],
         )
-        self.nav.pivot_90.assert_called_once_with(
-            unittest.mock.ANY,
-            12.0,
-            "R",
-            angle_target=self.nav.TURN_90_ANGLE,
+        self.assertEqual(
+            self.nav.pivot_90.call_args_list[1],
+            unittest.mock.call(
+                bus, 12.0, "R", angle_target=self.nav.TURN_90_ANGLE
+            ),
         )
 
 

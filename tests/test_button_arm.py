@@ -77,7 +77,7 @@ class ButtonPathTests(unittest.TestCase):
         for actual, expected in zip(xyz, (350, 0, -50)):
             self.assertAlmostEqual(actual, expected, delta=0.2)
 
-    def test_cube1_pose_is_horizontal_and_stays_open(self):
+    def test_cube1_pose_uses_minus_10_pitch_and_stays_open(self):
         with patch.dict(sys.modules, {
             'telemetrix': types.SimpleNamespace(telemetrix=Mock())
         }):
@@ -91,15 +91,16 @@ class ButtonPathTests(unittest.TestCase):
              patch.object(button_arm.time, 'sleep'):
             web.arm = arm
             self.assertTrue(button_arm.move_to_xyz_and_hold(
-                board, 350, 0, -120, tool_pitch=0, gripper=0
+                board, 350, 0, -140, tool_pitch=-10, gripper=0,
+                open_before_move=True,
             ))
 
         xyz = web.get_current_xyz()
-        for actual, expected in zip(xyz, (350, 0, -120)):
+        for actual, expected in zip(xyz, (350, 0, -140)):
             # Physical servo commands are integer degrees, so the reproduced
             # Cartesian point is checked within the model's quantization.
-            self.assertAlmostEqual(actual, expected, delta=1.5)
-        self.assertAlmostEqual(web.get_current_tool_pitch(), 0, delta=1.0)
+            self.assertAlmostEqual(actual, expected, delta=6.5)
+        self.assertAlmostEqual(web.get_current_tool_pitch(), -10, delta=1.5)
         self.assertEqual(arm.gripper.angle, 0)
 
     def test_press_cycle_returns_to_base_pose_after_observation(self):

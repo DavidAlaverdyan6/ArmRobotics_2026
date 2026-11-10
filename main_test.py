@@ -13,7 +13,7 @@ from navigation_core import FreshFrames
 from stm32_reset import STM32_RESET_GPIO, reset_stm32
 from sensors.vl53l0x_sensor import VL53L0XSensor
 
-PROGRAM_BUILD = "adc-pin-fresh-frames-accel-2026-11-10.15"
+PROGRAM_BUILD = "cube-speeds-130-150-2026-11-10.28"
 
 # Previously tested differential2 line-following speeds.
 SERIAL_PORT = "/dev/serial0"
@@ -46,6 +46,9 @@ JUNCTION_CONFIRM = 2
 JUNCTION_CLEAR = 3
 ROUTE_JUNCTION_CLEAR = 4
 POST_JUNCTION_ACCEL_SECONDS = 0.5
+SLOW_STRAIGHT_HOLD_SECONDS = 0.75
+SLOW_STRAIGHT_SPEED = 60
+SLOW_STRAIGHT_MAX_SPEED = 100
 STRAIGHT_MAX_SPEED = 255
 STRAIGHT_ACCEL_RATE = 180.0
 STRAIGHT_DECEL_RATE = 300.0
@@ -87,7 +90,7 @@ BUTTON_BUMPER_START_CM = 20.0
 BUTTON_BUMPER_START_TOLERANCE_CM = 1.0
 BUTTON_BUMPER_RAM_SECONDS = 1.0
 BUTTON_BUMPER_APPROACH_TIMEOUT = 18.0
-BUTTON_BUMPER_SPEED = 255
+BUTTON_BUMPER_SPEED = 180
 BUTTON_BUMPER_STATUS_SECONDS = 0.25
 BUTTON_DEPART_SECONDS = 0.4
 BUTTON_FORWARD_MIN_PWM = 40
@@ -126,7 +129,6 @@ REVERSE_STEER_SIGN = 1
 RETURN_MAX_TIME = 24.0
 
 RETURN_FORWARD_TIME = 0.5
-CUBE_LOST_FINAL_RIGHT_ANGLE = 80.0
 
 FIRE_APPROACH_SPEED = 70
 FIRE_APPROACH_MAX_SPEED = 100
@@ -137,16 +139,24 @@ FIRE_LINE_RECOVERY_CONFIRM = 2
 FIRE_RETURN_MAX_TIME = 40.0
 
 # CUBE1: arm stays at this XYZ with the gripper open while the chassis moves.
-CUBE1_X_MM = 360.0
+CUBE1_X_MM = 350.0
 CUBE1_Y_MM = 0.0
-CUBE1_Z_MM = -150.0
-CUBE1_TOOL_PITCH_DEG = -20.0
+CUBE1_Z_MM = -140.0
+CUBE1_TOOL_PITCH_DEG = -10.0
 CUBE1_DROP_TIMEOUT = 20.0
-CUBE1_APPROACH_SPEED = 90
-CUBE1_APPROACH_MAX_SPEED = 130
-CUBE1_ARM_SETTLE_SECONDS = 1.0
-CUBE1_FOUND_PAUSE_SECONDS = 0.5
-CUBE1_POST_PUSH_HOLD_SECONDS = 1.0
+CUBE1_APPROACH_SPEED = 130
+CUBE1_APPROACH_MAX_SPEED = 150
+CUBE1_TURN_SPEED = 130
+CUBE1_TURN_TIMEOUT = 4.0
+CUBE1_TURN_MIN_ANGLE = 45.0
+CUBE1_TURN_CLEAR_CONFIRM = 3
+CUBE1_TURN_LINE_CONFIRM = 3
+CUBE1_LASER_MIN_DISTANCE_MM = 140.0
+CUBE1_LASER_MAX_DISTANCE_MM = 160.0
+CUBE1_DROP_PUSH_SPEED = 130
+CUBE1_DROP_PUSH_MAX_SPEED = 150
+CUBE1_DROP_PUSH_TIMEOUT = 3.0
+CUBE1_DROP_BLINK_HALF_PERIOD = 0.25
 CUBE1_SENSOR_CONFIRM = 3
 CUBE1_LINE_LOSS_CONFIRM = 5
 
@@ -157,42 +167,43 @@ COLOR_MARKER_MIN_AREA = 10_000
 COLOR_MARKER_STABLE_FRAMES = 3
 
 # Automatic route: one entry for each detected junction, in order.
-# L/R/S and L90/R90 are movement commands. Named robot tasks are BUTTON,
+# L/R/S/SLOW and L90/R90 are movement commands. SLOW goes straight without
+# a blind timed crossing and holds a low speed while junction sensing stays
+# active. Named robot tasks are BUTTON,
 # CHARGING, FIREFIGHTER, CUBE1 and COLOR. Q stops the route.
 # Example: ROUTE = ["L", "S", "BUTTON", "R", "CHARGING", "CUBE1",
 #                   "FIREFIGHTER", "Q"]
 # The commented entries below are placeholders: edit them before launching.
 ROUTE = [
-    "BUTTON",
-    "L",
+    # "BUTTON",
+    # "L",
+    # "R",
+    # "L",
     "CUBE1",
-    "L",
+    "SLOW",
     "L",
     "R",
+    "L",
     "CHARGING",
+    "L90",
+    "L90",
     "R",
     "L",
     "R",
-    "R",
-    "L90",
     "FIREFIGHTER",
-    "L90",
+    "S",
+    "L",
     "R",
     "S",
     "R",
-    "L",
     "R",
-    "R",
-    "S",
-    "L",
-    "L",
     "S",
     "Q",
 
 
 ]
 ALLOWED_ROUTE_COMMANDS = {
-    "L", "R", "L90", "R90", "S",
+    "L", "R", "L90", "R90", "S", "SLOW",
     "BUTTON", "CHARGING", "FIREFIGHTER", "CUBE1", "COLOR", "Q",
 }
 
@@ -216,11 +227,21 @@ def differential_drive(state, speed=BASE_SPEED, max_speed=MAX_SPEED):
     return line_follower.drive(state, speed=speed, max_speed=max_speed)
 
 
-def post_junction_drive_limits(elapsed):
+def post_junction_drive_limits(elapsed, *, slow=False):
     """Ramp both base PWM and the wheel PWM ceiling after a maneuver."""
+    if slow and elapsed < SLOW_STRAIGHT_HOLD_SECONDS:
+        return SLOW_STRAIGHT_SPEED, SLOW_STRAIGHT_MAX_SPEED
+    if slow:
+        elapsed -= SLOW_STRAIGHT_HOLD_SECONDS
     fraction = max(0.0, min(1.0, elapsed / POST_JUNCTION_ACCEL_SECONDS))
-    start_speed = min(MANEUVER_SPEED, BASE_SPEED)
-    start_max = min(MANEUVER_MAX_SPEED, MAX_SPEED)
+    start_speed = min(
+        SLOW_STRAIGHT_SPEED if slow else MANEUVER_SPEED,
+        BASE_SPEED,
+    )
+    start_max = min(
+        SLOW_STRAIGHT_MAX_SPEED if slow else MANEUVER_MAX_SPEED,
+        MAX_SPEED,
+    )
     speed = start_speed + (BASE_SPEED - start_speed) * fraction
     max_speed = start_max + (MAX_SPEED - start_max) * fraction
     return speed, max_speed
@@ -446,16 +467,7 @@ class ReverseLineController:
                 and now - self.line_lost_since > self.line_loss_timeout
             ):
                 return False
-            self.mode = "GYRO"
-            heading_error = (
-                0.0 if self.reference_heading is None else
-                _wrap_degrees(angle - self.reference_heading)
-            )
-            steering = (
-                REVERSE_HEADING_KP * heading_error
-                + REVERSE_YAW_RATE_KD * rate
-            )
-            return self._wheel_command(REVERSE_GYRO_SPEED, steering)
+            return self.drive_gyro(min(speed, REVERSE_GYRO_SPEED), angle, rate)
 
         self.line_lost_since = None
         sensor_error_mm = position * REVERSE_POSITION_MM_PER_UNIT
@@ -508,6 +520,23 @@ class ReverseLineController:
             )
         self.mode = "LINE"
         return self._wheel_command(base, steering)
+
+    def drive_gyro(self, speed, angle=None, rate=None):
+        """Reverse on a fixed gyro heading, without using the line position."""
+        if angle is None:
+            angle = self.heading.read()
+        if rate is None:
+            rate = self.heading.last_rate
+        if self.reference_heading is None:
+            self.reference_heading = angle
+        heading_error = _wrap_degrees(angle - self.reference_heading)
+        steering = (
+            REVERSE_HEADING_KP * heading_error
+            + REVERSE_YAW_RATE_KD * rate
+        )
+        self.mode = "GYRO"
+        self.last_angle = angle
+        return self._wheel_command(speed, steering)
 
 
 def pivot(bus, offset, direction, angle_target=TURN_ANGLE):
@@ -776,7 +805,7 @@ def button_bumper_approach(calibration, sensor):
 
             state = line_tracker.update(calibration)
             if not ram_started:
-                # Begin the full-speed bumper run at 20 ± 1 cm.
+                # Begin the bounded 180-PWM bumper run at 20 ± 1 cm.
                 if distance_cm <= (
                     BUTTON_BUMPER_START_CM + BUTTON_BUMPER_START_TOLERANCE_CM
                 ):
@@ -787,7 +816,7 @@ def button_bumper_approach(calibration, sensor):
                     print(
                         f"\nBUTTON: {distance_cm:.1f} cm; "
                         f"starting {BUTTON_BUMPER_RAM_SECONDS:g}-second "
-                        "full-speed bumper press."
+                        f"bumper press at PWM {BUTTON_BUMPER_SPEED}."
                     )
                 elif state["position"] is None:
                     stop()
@@ -858,6 +887,7 @@ def button_return(
     cleared_count = 0
     outer_confirm_count = 0
     candidate_since = None
+    last_status = 0.0
 
     try:
         while (
@@ -940,17 +970,21 @@ def button_return(
                 print(f"\n{label}: line lost too long while reversing.")
                 return False
 
-            print(
-                f'\r{label} BACK {reverse_controller.mode} '
-                f'pos={state["position"]} axle={reverse_controller.last_axle_error} '
-                f'angle={reverse_controller.last_angle:+.1f} '
-                f'S1={int(left)} S8={int(right)} '
-                f'armed={int(cleared_count >= JUNCTION_CLEAR)} '
-                'N=[' + ' '.join(
-                    f'{value:.2f}' for value in state.get('normalized', [])
-                ) + ']',
-                end="", flush=True,
-            )
+            if now - last_status >= 0.2:
+                print(
+                    f'\r{label} BACK {reverse_controller.mode} '
+                    f'pos={state["position"]} '
+                    f'axle={reverse_controller.last_axle_error} '
+                    f'angle={reverse_controller.last_angle:+.1f} '
+                    f'PWM={reverse_controller.previous_pwm} '
+                    f'S1={int(left)} S8={int(right)} '
+                    f'armed={int(cleared_count >= JUNCTION_CLEAR)} '
+                    'N=[' + ' '.join(
+                        f'{value:.2f}' for value in state.get('normalized', [])
+                    ) + ']',
+                    end="", flush=True,
+                )
+                last_status = now
             time.sleep(LOOP_DELAY)
 
         print(f"\n{label}: reverse timeout.")
@@ -961,13 +995,27 @@ def button_return(
 
 
 def button_task(calibration, detector, sensor, bus, offset, board):
-    print("\nB: turn LEFT.")
-    ok, left_sign = pivot(bus, offset, "L")
-    if not ok or left_sign is None:
-        print("\nB: initial turn/gyro check failed.")
+    print(
+        f"\nBUTTON: drive forward for {TURN_90_FORWARD_TIME:g} seconds "
+        "before L90."
+    )
+    if not follow_for(
+        calibration,
+        TURN_90_FORWARD_TIME,
+        speed=TURN_90_FORWARD_SPEED,
+        max_speed=TURN_90_FORWARD_MAX_SPEED,
+    ):
         return False
 
-    if not button_depart_and_check_line(calibration):
+    print("\nBUTTON: execute L90.")
+    ok, left_sign = pivot_90(
+        bus, offset, "L", angle_target=TURN_90_ANGLE
+    )
+    if not ok or left_sign is None:
+        print("\nBUTTON: initial L90/gyro check failed.")
+        return False
+
+    if not reacquire_line(calibration):
         return False
 
     if not button_bumper_approach(calibration, sensor):
@@ -1014,6 +1062,7 @@ def cube1_arm_action(board):
             CUBE1_Z_MM,
             tool_pitch=CUBE1_TOOL_PITCH_DEG,
             gripper=0.0,
+            open_before_move=True,
         )
     except Exception as exc:
         print(f"CUBE1: arm positioning failed: {exc}")
@@ -1048,14 +1097,92 @@ def cube1_fold_arm(board, reason="task endpoint reached"):
         stop()
 
 
-def cube1_carry_until_drop(calibration, detector, cube_sensor):
-    """Find/carry the cube using the same optical input as FIREFIGHTER."""
+def cube1_turn_to_center_line(calibration, bus, offset, distance_sensor):
+    """Turn to four center sensors; report the diagnostic laser distance."""
+    deadline = time.monotonic() + CUBE1_TURN_TIMEOUT
+    previous = time.monotonic()
+    signed_angle = 0.0
+    clear_count = 0
+    line_count = 0
+    armed = False
+    try:
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            signed_angle += gyro_rate(bus, offset) * max(
+                0.0, min(now - previous, 0.1)
+            )
+            previous = now
+            state = line_tracker.update(calibration)
+            values = state.get("normalized", [])
+            four_center_black = (
+                len(values) == 8
+                and min(values[2:6]) >= JUNCTION_CENTER_MIN
+            )
+            distance_mm = None
+            if four_center_black:
+                try:
+                    measured_mm = float(distance_sensor.read_distance_mm())
+                    if math.isfinite(measured_mm):
+                        distance_mm = measured_mm
+                except Exception:
+                    # Laser is diagnostic-only for now; it must not alter motion.
+                    pass
+
+            if not four_center_black:
+                clear_count += 1
+                line_count = 0
+                if clear_count >= CUBE1_TURN_CLEAR_CONFIRM:
+                    armed = True
+            elif armed and abs(signed_angle) >= CUBE1_TURN_MIN_ANGLE:
+                line_count += 1
+                if line_count >= CUBE1_TURN_LINE_CONFIRM:
+                    observed_sign = 1 if signed_angle > 0 else -1
+                    left_sign = -observed_sign
+                    laser_ok = (
+                        distance_mm is not None
+                        and CUBE1_LASER_MIN_DISTANCE_MM
+                        <= distance_mm
+                        <= CUBE1_LASER_MAX_DISTANCE_MM
+                    )
+                    laser_text = (
+                        "unavailable"
+                        if distance_mm is None
+                        else f"{distance_mm:.0f} mm "
+                             f"({'OK' if laser_ok else 'OUTSIDE 140-160'})"
+                    )
+                    print(
+                        "\nCUBE1: all four center sensors confirmed the new "
+                        f"line at {abs(signed_angle):.1f} gyro degrees; "
+                        f"laser={laser_text}."
+                    )
+                    return True, left_sign
+
+            motors.set_speeds(CUBE1_TURN_SPEED, -CUBE1_TURN_SPEED)
+            time.sleep(LOOP_DELAY)
+
+        print("\nCUBE1: sensor-guided right turn timed out.")
+        return False, None
+    finally:
+        stop()
+
+
+def cube1_create_indicator():
+    """Create the RGB indicator using this robot's swapped red/blue wiring."""
+    import led
+    import robot_pin_config as pins
+
+    return led.RGBLED(pins.LED_BLUE, pins.LED_GREEN, pins.LED_RED)
+
+
+def cube1_carry_until_drop(
+    calibration, detector, cube_sensor, on_cube_found=None,
+):
+    """Find the cube, then carry it to the next confirmed junction."""
     deadline = time.monotonic() + CUBE1_DROP_TIMEOUT
     clear_count = 0
     junction_armed = False
     junction_count = 0
     cube_count = 0
-    lost_count = 0
     line_loss_count = 0
     cube_found = False
     last_status = 0.0
@@ -1067,52 +1194,42 @@ def cube1_carry_until_drop(calibration, detector, cube_sensor):
             clear_count = clear_count + 1 if not left and not right else 0
             if clear_count >= JUNCTION_CLEAR:
                 junction_armed = True
-            junction_count = (
-                junction_count + 1 if junction_armed and candidate else 0
-            )
-
-            # Once the robot has physically cleared the starting junction,
-            # the next confirmed junction always ends CUBE1.  This is
-            # independent of whether the optical sensor still sees the cube.
-            if junction_count >= JUNCTION_CONFIRM:
-                stop()
-                print(
-                    "\nCUBE1: next junction reached; stopping before "
-                    "crossing it."
-                )
-                return "junction"
-
-            cube_visible = cube_sensor.detected()
-            if cube_visible is None:
-                stop()
-                print("\nCUBE1: cube sensor report is missing or stale; stopping.")
-                return None
 
             if not cube_found:
+                cube_visible = cube_sensor.detected()
+                if cube_visible is None:
+                    stop()
+                    print(
+                        "\nCUBE1: cube sensor report is missing or stale; "
+                        "stopping."
+                    )
+                    return None
                 cube_count = (
                     cube_count + 1 if cube_visible else 0
                 )
                 if cube_count >= CUBE1_SENSOR_CONFIRM:
-                    stop()
                     cube_found = True
-                    # A junction is an endpoint only after the cube has first
-                    # been confirmed. Ignore any candidate accumulated while
-                    # approaching it.
                     junction_count = 0
+                    if on_cube_found is not None:
+                        on_cube_found()
                     print(
                         "\nCUBE1: cube detected by optical sensor; "
-                        f"pausing {CUBE1_FOUND_PAUSE_SECONDS:g} second."
+                        "orange indicator ON; continuing to second junction."
                     )
-                    time.sleep(CUBE1_FOUND_PAUSE_SECONDS)
-                    continue
             else:
-                lost_count = (
-                    lost_count + 1 if not cube_visible else 0
+                # Ignore the arm IR sensor while carrying. It becomes the
+                # drop detector only after the second junction is reached.
+                cube_visible = True
+                junction_count = (
+                    junction_count + 1 if junction_armed and candidate else 0
                 )
-                if lost_count >= CUBE1_SENSOR_CONFIRM:
+                if junction_count >= JUNCTION_CONFIRM:
                     stop()
-                    print("\nCUBE1: cube lost by optical sensor; stopping.")
-                    return "cube lost"
+                    print(
+                        "\nCUBE1: second junction reached; stopping before "
+                        "the timed drop push."
+                    )
+                    return "junction"
 
             if state["position"] is None:
                 line_loss_count += 1
@@ -1154,57 +1271,66 @@ def cube1_carry_until_drop(calibration, detector, cube_sensor):
         stop()
 
 
-def cube1_push_past_junction(calibration, cube_sensor):
-    """Push for 0.5 s past the junction and report whether cube remains."""
-    deadline = time.monotonic() + TURN_90_FORWARD_TIME
+def cube1_push_past_junction(calibration, cube_sensor, indicator=None):
+    """Push slowly until the cube disappears, with a three-second limit."""
+    start = time.monotonic()
+    deadline = start + CUBE1_DROP_PUSH_TIMEOUT
     lost_count = 0
-    cube_dropped = False
+    blink_on = None
     try:
         while time.monotonic() < deadline:
-            if not cube_dropped:
-                cube_visible = cube_sensor.detected()
-                if cube_visible is None:
-                    print("\nCUBE1: cube sensor became stale during final push.")
-                    return None
+            now = time.monotonic()
+            next_blink_on = (
+                int((now - start) / CUBE1_DROP_BLINK_HALF_PERIOD) % 2 == 0
+            )
+            if indicator is not None and next_blink_on != blink_on:
+                indicator.orange() if next_blink_on else indicator.off()
+                blink_on = next_blink_on
 
-                lost_count = lost_count + 1 if not cube_visible else 0
-                if lost_count >= CUBE1_SENSOR_CONFIRM:
-                    cube_dropped = True
-                    print(
-                        "\nCUBE1: cube dropped; completing the full "
-                        "0.5-second positioning drive."
-                    )
+            cube_visible = cube_sensor.detected()
+            if cube_visible is None:
+                print("\nCUBE1: cube sensor became stale during final push.")
+                return None
+
+            lost_count = lost_count + 1 if not cube_visible else 0
+            if lost_count >= CUBE1_SENSOR_CONFIRM:
+                print("\nCUBE1: cube dropped; stopping the slow push.")
+                return False
 
             state = line_tracker.update(calibration)
             if state["position"] is None:
                 line_follower.drive_straight(
-                    speed=MANEUVER_SPEED,
-                    max_speed=MANEUVER_MAX_SPEED,
+                    speed=CUBE1_DROP_PUSH_SPEED,
+                    max_speed=CUBE1_DROP_PUSH_MAX_SPEED,
                 )
             else:
                 differential_drive(
                     state,
-                    speed=MANEUVER_SPEED,
-                    max_speed=MANEUVER_MAX_SPEED,
+                    speed=CUBE1_DROP_PUSH_SPEED,
+                    max_speed=CUBE1_DROP_PUSH_MAX_SPEED,
                 )
             time.sleep(LOOP_DELAY)
 
-        if cube_dropped:
-            return False
-        print("\nCUBE1: cube still present after the 0.5-second push.")
+        print(
+            f"\nCUBE1: cube still present after the "
+            f"{CUBE1_DROP_PUSH_TIMEOUT:g}-second slow-push timeout."
+        )
         return True
     finally:
         stop()
+        if indicator is not None:
+            indicator.off()
         time.sleep(0.15)
 
 
-def cube1_task(calibration, detector, bus, offset, board):
+def cube1_task(calibration, detector, bus, offset, board, distance_sensor):
     """Find and carry CUBE1 with the optical sensor, stopping at junction."""
     from firefighter import Firefighter
 
+    rgb = None
     stop()
     try:
-        print("\nCUBE1: execute R90.")
+        print("\nCUBE1: turn RIGHT until center sensors confirm the new line.")
         if not follow_for(
             calibration,
             TURN_90_FORWARD_TIME,
@@ -1212,24 +1338,15 @@ def cube1_task(calibration, detector, bus, offset, board):
             max_speed=TURN_90_FORWARD_MAX_SPEED,
         ):
             return False
-        ok, left_sign = pivot_90(
-            bus, offset, "R", angle_target=TURN_90_ANGLE
+        ok, left_sign = cube1_turn_to_center_line(
+            calibration, bus, offset, distance_sensor
         )
         if not ok or left_sign is None:
-            print("CUBE1: initial turn/gyro check failed.")
+            print("CUBE1: center-line turn failed.")
             return False
-        if not reacquire_line(calibration):
-            return False
-
-        # Keep the arm folded while entering and completing the turn.  The
-        # gripper is lowered only after the robot is aligned on the new line.
+        # The gripper opens before the arm moves into its working coordinates.
         if not cube1_arm_action(board):
             return False
-        print(
-            f"CUBE1: arm positioned; holding still for "
-            f"{CUBE1_ARM_SETTLE_SECONDS:g} second."
-        )
-        time.sleep(CUBE1_ARM_SETTLE_SECONDS)
 
         # PB0 belongs to CUBE1 only from this point onward.  Reports produced
         # during the turn or arm motion must never count as cube detections.
@@ -1237,74 +1354,64 @@ def cube1_task(calibration, detector, bus, offset, board):
         cube_sensor.initialize()
         sensor_enabled_at = time.monotonic()
         cube_sensor.wait_for_sample(after=sensor_enabled_at)
+        rgb = cube1_create_indicator()
+        rgb.off()
         print("CUBE1: optical sensor ready; starting line following.")
 
         endpoint = cube1_carry_until_drop(
-            calibration, detector, cube_sensor
+            calibration,
+            detector,
+            cube_sensor,
+            on_cube_found=rgb.orange,
         )
-        if endpoint is None:
+        if endpoint != "junction":
             return False
 
-        cube_still_present = False
-        if endpoint == "junction":
-            print(
-                f"\nCUBE1: pushing past the junction for "
-                f"{TURN_90_FORWARD_TIME:g} second."
-            )
-            cube_still_present = cube1_push_past_junction(
-                calibration, cube_sensor
-            )
-            if cube_still_present is None:
-                return False
-
-            if cube_still_present:
-                stop()
-                print(
-                    f"\nCUBE1: cube still present; waiting "
-                    f"{CUBE1_POST_PUSH_HOLD_SECONDS:g} second before "
-                    "raising the arm."
-                )
-                time.sleep(CUBE1_POST_PUSH_HOLD_SECONDS)
+        print(
+            f"\nCUBE1: pushing slowly past the junction until the cube "
+            f"drops (timeout {CUBE1_DROP_PUSH_TIMEOUT:g} seconds)."
+        )
+        cube_still_present = cube1_push_past_junction(
+            calibration, cube_sensor, indicator=rgb
+        )
+        if cube_still_present is None:
+            return False
 
         if not cube1_fold_arm(board, reason=endpoint):
             return False
 
-        if endpoint == "junction" and cube_still_present:
-            if not button_return(
-                calibration,
-                detector,
-                bus,
-                offset,
-                left_sign,
-                label="CUBE1",
-                accept_s8_only=True,
-                line_loss_timeout=None,
-            ):
-                return False
+        if not button_return(
+            calibration,
+            detector,
+            bus,
+            offset,
+            left_sign,
+            label="CUBE1",
+            accept_s8_only=True,
+            line_loss_timeout=None,
+        ):
+            return False
 
-        if endpoint == "junction":
-            if cube_still_present:
-                print(
-                    f"\nCUBE1: move forward for "
-                    f"{RETURN_FORWARD_TIME:g} seconds before final R90."
-                )
-                if not follow_for(calibration, RETURN_FORWARD_TIME):
-                    return False
-            print(f"\nCUBE1: execute final R90.")
-            ok, _ = pivot_90(
-                bus, offset, "R", angle_target=TURN_90_ANGLE
-            )
-        else:
-            print(
-                f"\nCUBE1: turn RIGHT by "
-                f"{CUBE_LOST_FINAL_RIGHT_ANGLE:g} degrees."
-            )
-            ok, _ = pivot(
-                bus, offset, "R", angle_target=CUBE_LOST_FINAL_RIGHT_ANGLE
-            )
+        print(
+            f"\nCUBE1: move forward for "
+            f"{RETURN_FORWARD_TIME:g} seconds before final R90."
+        )
+        if not follow_for(calibration, RETURN_FORWARD_TIME):
+            return False
+        print(f"\nCUBE1: execute final R90.")
+        ok, _ = pivot_90(
+            bus, offset, "R", angle_target=TURN_90_ANGLE
+        )
         return ok and reacquire_line(calibration)
     finally:
-        stop()
+        try:
+            stop()
+        finally:
+            if rgb is not None:
+                try:
+                    rgb.off()
+                finally:
+                    rgb.close()
 
 
 def firefighter_reverse_until_line(calibration):
@@ -1539,7 +1646,7 @@ def load_route():
             raise ValueError(
                 f"Invalid ROUTE entry #{index}: {command!r}. "
                 "Allowed: L, R, L90, R90, S, BUTTON, CHARGING, "
-                "FIREFIGHTER, CUBE1, COLOR, Q."
+                "SLOW, FIREFIGHTER, CUBE1, COLOR, Q."
             )
         if cmd == "Q" and index != len(ROUTE):
             raise ValueError("Q must be the last ROUTE entry.")
@@ -1560,8 +1667,7 @@ def main():
             f"Resetting STM32 through Raspberry Pi BCM{STM32_RESET_GPIO}..."
         )
         reset_stm32()
-        # Use the same connection and ADC subscription order as ADC.py:
-        # connect once, force the drive outputs to zero, then enable the arm.
+        # Connect once, force the drive outputs to zero, then enable the arm.
         board = telemetrix.Telemetrix(com_port=SERIAL_PORT)
         # Do this before any servo motion or callback wait.  It prevents a
         # previous PWM state from moving the chassis while servos wake up.
@@ -1650,7 +1756,12 @@ def main():
                 print("\nADC ready: all 8 channels fresh; route resumed.")
                 adc_paused = False
             position = state["position"]
-            left, right, candidate = detector.read(state)
+            # Use the same crossing result shown by show_line_position.py.
+            # The task routines retain their own detector and maneuver rules.
+            crossing = state["crossing"]
+            left = crossing in ("LEFT", "BOTH")
+            right = crossing in ("RIGHT", "BOTH")
+            candidate = crossing is not None
             if not left and not right:
                 clear_count += 1
             else:
@@ -1685,6 +1796,10 @@ def main():
 
                 if cmd == "COLOR":
                     ok = color_marker_task()
+                elif cmd == "SLOW":
+                    # Do not call follow_for(): junction detection must remain
+                    # active because the following junction is very close.
+                    ok = True
                 elif cmd in (
                     "L", "R", "L90", "R90", "BUTTON", "CHARGING",
                     "FIREFIGHTER", "CUBE1",
@@ -1693,7 +1808,7 @@ def main():
                     if bus is None:
                         bus = smbus.SMBus(I2C_BUS)
                         gyro_setup(bus)
-                    if cmd in ("L90", "R90"):
+                    if cmd in ("L90", "R90", "BUTTON"):
                         if offset_90 is None:
                             offset_90 = gyro_calibrate(bus, settle_seconds=0.05)
                         offset = offset_90
@@ -1712,8 +1827,11 @@ def main():
                             calibration, detector, bus, offset, board
                         )
                     elif cmd == "CUBE1":
+                        if sensor is None:
+                            sensor = VL53L0XSensor()
+                            sensor.initialize()
                         ok = cube1_task(
-                            calibration, detector, bus, offset, board
+                            calibration, detector, bus, offset, board, sensor
                         )
                     elif cmd == "CHARGING":
                         ok = charging_task()
@@ -1745,7 +1863,10 @@ def main():
                     print("\nManeuver failed. Robot stopped.")
                     break
                 acceleration_started = time.monotonic()
-                straight_speed["current_speed"] = MANEUVER_SPEED
+                slow_departure = cmd == "SLOW"
+                straight_speed["current_speed"] = (
+                    SLOW_STRAIGHT_SPEED if slow_departure else MANEUVER_SPEED
+                )
                 straight_speed["previous_error"] = None
                 straight_speed["previous_time"] = None
                 straight_speed["straight_since"] = None
@@ -1763,7 +1884,8 @@ def main():
                     acceleration_started = time.monotonic()
                 print(
                     '\rNO LINE: paused; route resumes when line returns. '
-                    f'raw={state["raw"]}',
+                    f'RAW={state["raw"]} '
+                    f'CROSSING={crossing or "None"}',
                     end="", flush=True,
                 )
             else:
@@ -1775,9 +1897,14 @@ def main():
                     differential_drive(state, speed=speed, max_speed=max_speed)
                 else:
                     elapsed = time.monotonic() - acceleration_started
-                    speed, max_speed = post_junction_drive_limits(elapsed)
+                    speed, max_speed = post_junction_drive_limits(
+                        elapsed, slow=slow_departure
+                    )
                     differential_drive(state, speed=speed, max_speed=max_speed)
-                    if elapsed >= POST_JUNCTION_ACCEL_SECONDS:
+                    profile_seconds = POST_JUNCTION_ACCEL_SECONDS + (
+                        SLOW_STRAIGHT_HOLD_SECONDS if slow_departure else 0.0
+                    )
+                    if elapsed >= profile_seconds:
                         acceleration_started = None
                         straight_speed["current_speed"] = speed
                         straight_speed["previous_error"] = None
@@ -1786,6 +1913,8 @@ def main():
                 print(
                     f"\rLINE pos={position:+.3f} "
                     f"S1={int(left)} S8={int(right)} "
+                    f"CROSSING={crossing or 'None'} "
+                    f"RAW={state['raw']} "
                     "N=["
                     + " ".join(
                         f"{value:.2f}" for value in state["normalized"]

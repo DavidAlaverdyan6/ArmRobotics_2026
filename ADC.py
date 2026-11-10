@@ -11,7 +11,7 @@ from pins import (
     PA4,
     PA5,
     PA6,
-    PB0
+    PA7
 )
 
 
@@ -20,7 +20,7 @@ from pins import (
 # ============================================================
 
 SENSOR_PINS = [
-    PB0,
+    PA7,
     PA6,
     PA5,
     PA4,
@@ -83,7 +83,7 @@ print()
 for i, pin in enumerate(SENSOR_PINS):
 
     print(
-        f"S{i + 1} -> PA{i} -> {pin}"
+        f"S{i + 1} -> PA{7 - i} -> {pin}"
     )
 
     board.set_pin_mode_analog_input(
