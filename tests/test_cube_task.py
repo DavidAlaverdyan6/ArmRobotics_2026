@@ -266,6 +266,7 @@ class Cube1TaskTests(unittest.TestCase):
             (False, False, False),
             (False, False, False),
             (True, True, True),
+            (True, True, True),
         ]
         with patch.object(
             self.nav.time, "monotonic", side_effect=lambda: clock[0]

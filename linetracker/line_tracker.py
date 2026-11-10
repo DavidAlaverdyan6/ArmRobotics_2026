@@ -19,7 +19,12 @@ SENSOR_NAMES = [f"S{i}" for i in range(1, 9)]
 WEIGHTS = [-3, -2, -1, 0, 1, 2, 3, 4]
 SENSOR_COUNT = 8
 
-LINE_DETECTED_THRESHOLD = 0.15
+LINE_NOISE_FLOOR = 0.20
+LINE_DETECTED_PEAK_MIN = 0.45
+LINE_DETECTED_TOTAL_MIN = 0.70
+LINE_DETECTED_STRONG_PEAK = 0.80
+LINE_DOMINANT_PEAK_MIN = 0.80
+LINE_DOMINANT_FRACTION = 0.70
 CROSSING_SIDE_THRESHOLD = 0.45
 CROSSING_CENTER_THRESHOLD = 0.20
 
@@ -62,6 +67,7 @@ def load_calibration():
         if (
             len(data.get("white", [])) != SENSOR_COUNT
             or len(data.get("black", [])) != SENSOR_COUNT
+            or data.get("pins") != SENSOR_PINS
         ):
             return None
 
@@ -104,7 +110,7 @@ def calibrate():
     input("Place all sensors over BLACK, then press ENTER...")
     black = _read_average_samples()
 
-    calibration = {"white": white, "black": black}
+    calibration = {"white": white, "black": black, "pins": SENSOR_PINS.copy()}
     save_calibration(calibration)
     return calibration
 
@@ -132,11 +138,33 @@ def get_normalized_values(calibration):
 
 
 def calculate_position(values):
-    total = sum(values)
-    if total < LINE_DETECTED_THRESHOLD:
+    if len(values) != SENSOR_COUNT:
         return None
 
-    return sum(value * weight for value, weight in zip(values, WEIGHTS)) / total
+    peak = max(values, default=0.0)
+    filtered = [
+        value if value >= LINE_NOISE_FLOOR else 0.0
+        for value in values
+    ]
+    total = sum(filtered)
+    if not (
+        (peak >= LINE_DETECTED_PEAK_MIN
+         and total >= LINE_DETECTED_TOTAL_MIN)
+        or peak >= LINE_DETECTED_STRONG_PEAK
+    ):
+        return None
+
+    if peak >= LINE_DOMINANT_PEAK_MIN:
+        dominant_min = max(LINE_NOISE_FLOOR, peak * LINE_DOMINANT_FRACTION)
+        filtered = [
+            value if value >= dominant_min else 0.0
+            for value in values
+        ]
+        total = sum(filtered)
+
+    return sum(
+        value * weight for value, weight in zip(filtered, WEIGHTS)
+    ) / total
 
 
 def _group_strength(values, indexes):

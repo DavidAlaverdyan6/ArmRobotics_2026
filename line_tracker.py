@@ -29,7 +29,18 @@ WEIGHTS = [-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5]
 # and S5. Both sensors contribute equally there, producing position 0.0.
 CENTER_POSITION = (WEIGHTS[0] + WEIGHTS[-1]) / 2.0
 
-LINE_DETECTED_THRESHOLD = 0.15
+# Reject faint marker residue and floor shading. A usable line must either
+# cover enough of the array with visible contrast, or be genuinely black on
+# one sensor (which still allows a narrow real line between sensors).
+LINE_NOISE_FLOOR = 0.20
+LINE_DETECTED_PEAK_MIN = 0.45
+LINE_DETECTED_TOTAL_MIN = 0.70
+LINE_DETECTED_STRONG_PEAK = 0.80
+# When black tape and a gray remnant appear in the same ADC frame, steer by
+# the black tape. Keep the ordinary threshold when no dark anchor is present:
+# a partially covered real line can read only about 0.5 on several sensors.
+LINE_DOMINANT_PEAK_MIN = 0.80
+LINE_DOMINANT_FRACTION = 0.70
 
 # A real branch normally covers the extreme sensor and its inward neighbor.
 # This is less calibration-sensitive than demanding near-perfect black (0.95)
@@ -121,6 +132,7 @@ def load_calibration():
         if (
             len(data.get("white", [])) != SENSOR_COUNT
             or len(data.get("black", [])) != SENSOR_COUNT
+            or data.get("pins") != SENSOR_PINS
         ):
             return None
 
@@ -172,6 +184,7 @@ def calibrate():
     calibration = {
         "white": white,
         "black": black,
+        "pins": SENSOR_PINS.copy(),
     }
 
     save_calibration(calibration)
@@ -203,14 +216,35 @@ def get_normalized_values(calibration):
 
 def calculate_position(values):
     """Return a signed line position: left < 0, center = 0, right > 0."""
-    total = sum(values)
-
-    if total < LINE_DETECTED_THRESHOLD:
+    if len(values) != SENSOR_COUNT:
         return None
+
+    peak = max(values, default=0.0)
+    filtered = [
+        value if value >= LINE_NOISE_FLOOR else 0.0
+        for value in values
+    ]
+    total = sum(filtered)
+
+    visible_patch = (
+        peak >= LINE_DETECTED_PEAK_MIN
+        and total >= LINE_DETECTED_TOTAL_MIN
+    )
+    narrow_black_line = peak >= LINE_DETECTED_STRONG_PEAK
+    if not (visible_patch or narrow_black_line):
+        return None
+
+    if peak >= LINE_DOMINANT_PEAK_MIN:
+        dominant_min = max(LINE_NOISE_FLOOR, peak * LINE_DOMINANT_FRACTION)
+        filtered = [
+            value if value >= dominant_min else 0.0
+            for value in values
+        ]
+        total = sum(filtered)
 
     return sum(
         value * weight
-        for value, weight in zip(values, WEIGHTS)
+        for value, weight in zip(filtered, WEIGHTS)
     ) / total
 
 

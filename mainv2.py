@@ -97,31 +97,32 @@ FIRE_APPROACH_TIMEOUT = 12.0
 # Example: ROUTE = ["L", "S", "B", "R", "C", "F", "Q"]
 # The commented entries below are placeholders: edit them before launching.
 ROUTE = [
-    "B", #
+    "B",
+    "L",
+    "R",
+    "R",
+    "L",
+    "L",
+    "R",
+    "C",
+    "R",
+    "L",
+    "R",
+    "R",
+    "L",
+    "F",
     "L",
     "R",
     "S",
     "R",
     "L",
-    "C",#C
+    "R",
+    "R",
     "S",
-    "R",
-    "S", #F
     "L",
-    "R",
-    "R",
     "L",
+    "S",
     "Q",
-    # "S",
-    # "L",
-    # "R",
-    # "R",
-    # "R",
-    # "R",
-    # "S",
-    # "L",
-    # "R",
-    # "Q",
 
 ]
 ALLOWED_ROUTE_COMMANDS = {"L", "R", "S", "B", "C", "F", "Q"}

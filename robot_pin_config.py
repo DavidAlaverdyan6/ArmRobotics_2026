@@ -16,7 +16,8 @@ line_l4 = PA3
 line_r1 = PA4
 line_r2 = PA5
 line_r3 = PA6
-line_r4 = PA7
+# ADC.py's physical S1 is PB0; the array is reversed by line_tracker.py.
+line_r4 = PB0
 
 LINE_SENSORS = (
     line_l1, line_l2, line_l3, line_l4,

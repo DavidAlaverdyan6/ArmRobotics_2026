@@ -9,10 +9,11 @@ from telemetrix import telemetrix
 
 import line_tracker
 import motors
+from navigation_core import FreshFrames
 from stm32_reset import STM32_RESET_GPIO, reset_stm32
 from sensors.vl53l0x_sensor import VL53L0XSensor
 
-PROGRAM_BUILD = "cube-fire-2026-11-10.1"
+PROGRAM_BUILD = "adc-pin-fresh-frames-accel-2026-11-10.15"
 
 # Previously tested differential2 line-following speeds.
 SERIAL_PORT = "/dev/serial0"
@@ -24,7 +25,10 @@ MANEUVER_MAX_SPEED = 170
 KP = 50.0
 KD = 2.0
 TARGET_POSITION = line_tracker.CENTER_POSITION
+# Task/maneuver timing remains unchanged. Main V2's 25 Hz cadence is used
+# only by route line-following and post-turn reacquisition below.
 LOOP_DELAY = 0.02
+ROUTE_LOOP_DELAY = 0.04
 
 # Line-strength limits reused by the button positioning task.
 START_CENTER_BLACK_MIN = 0.30
@@ -33,13 +37,14 @@ START_OUTER_BLACK_MAX = 0.70
 # Junction recognition is separate from line tracking.
 BLACK_ON = 0.85
 BLACK_OFF = 0.65
-JUNCTION_SIDE_SUPPORT_ON = 0.55
-JUNCTION_SIDE_SUPPORT_OFF = 0.35
+# A rubbed-off gray line can darken the edge sensor while the inward sensor
+# remains only moderately dark. Real tape covers both sensors together.
+JUNCTION_SIDE_SUPPORT_ON = 0.75
+JUNCTION_SIDE_SUPPORT_OFF = 0.55
 JUNCTION_CENTER_MIN = 0.50
 JUNCTION_CONFIRM = 2
 JUNCTION_CLEAR = 3
-JUNCTION_REARM_CLEAR_FRAMES = 3
-POST_TURN_JUNCTION_IGNORE_SECONDS = 0.0
+ROUTE_JUNCTION_CLEAR = 4
 POST_JUNCTION_ACCEL_SECONDS = 0.5
 STRAIGHT_MAX_SPEED = 255
 STRAIGHT_ACCEL_RATE = 180.0
@@ -49,12 +54,9 @@ STRAIGHT_POSITION_TOLERANCE = 0.35
 STRAIGHT_DERROR_LIMIT = 8.0
 
 # After any gyro turn, differential2 centers the robot again.
-REACQUIRE_TIMEOUT = 1.2
-REACQUIRE_TOLERANCE = 0.25
-REACQUIRE_CONFIRM = 3
-REACQUIRE_SPEED = 80
-REACQUIRE_MAX_SPEED = 170
-REACQUIRE_STEER_GAIN = 1.6
+REACQUIRE_TIMEOUT = 2.0
+REACQUIRE_TOLERANCE = 0.65
+REACQUIRE_CONFIRM = 4
 
 I2C_BUS = 1
 MPU_ADDR = 0x68
@@ -87,6 +89,8 @@ BUTTON_BUMPER_RAM_SECONDS = 1.0
 BUTTON_BUMPER_APPROACH_TIMEOUT = 18.0
 BUTTON_BUMPER_SPEED = 255
 BUTTON_BUMPER_STATUS_SECONDS = 0.25
+BUTTON_DEPART_SECONDS = 0.4
+BUTTON_FORWARD_MIN_PWM = 40
 
 # Charging: 9 s red blink, then 2 s solid green; total 11 s before R.
 CHARGE_SECONDS = 11.0
@@ -170,9 +174,9 @@ ROUTE = [
     "L",
     "R",
     "R",
-    "L",
+    "L90",
     "FIREFIGHTER",
-    "L",
+    "L90",
     "R",
     "S",
     "R",
@@ -320,35 +324,6 @@ class JunctionDetector:
         return self.left_black, self.right_black, candidate
 
 
-class JunctionRearmGate:
-    """Require a stable centered line before accepting another junction."""
-
-    def __init__(self):
-        self.armed = True
-        self.clear_count = 0
-
-    def mark_junction(self):
-        self.armed = False
-        self.clear_count = 0
-
-    def update(self, left, right, position):
-        if self.armed:
-            return
-        centered_clear = (
-            not left
-            and not right
-            and position is not None
-            and abs(position - TARGET_POSITION) <= STRAIGHT_POSITION_TOLERANCE
-        )
-        if not centered_clear:
-            self.clear_count = 0
-            return
-        self.clear_count += 1
-        if self.clear_count >= JUNCTION_REARM_CLEAR_FRAMES:
-            self.armed = True
-            self.clear_count = 0
-
-
 def gyro_raw(bus):
     hi = bus.read_byte_data(MPU_ADDR, GYRO_Z_REG)
     lo = bus.read_byte_data(MPU_ADDR, GYRO_Z_REG + 1)
@@ -409,9 +384,13 @@ class ReverseLineController:
     the track instead of forcing the robot to a fixed global compass course.
     """
 
-    def __init__(self, heading, line_loss_timeout=REVERSE_LINE_LOSS_TIMEOUT):
+    def __init__(
+        self, heading, line_loss_timeout=REVERSE_LINE_LOSS_TIMEOUT,
+        edge_recovery=False,
+    ):
         self.heading = heading
         self.line_loss_timeout = line_loss_timeout
+        self.edge_recovery = edge_recovery
         self.reference_heading = None
         self.previous_axle_error = None
         self.previous_time = None
@@ -519,6 +498,14 @@ class ReverseLineController:
             RETURN_SLOW_SPEED,
             speed - min(25.0, abs(axle_error) * 0.8),
         )
+        if self.edge_recovery and abs(position) >= 1.5:
+            # BUTTON can reverse with only S7/S8 seeing the line. Give the
+            # outer wheel the full reverse PWM and brake the inner wheel;
+            # both wheels remain in reverse instead of pivoting in place.
+            base = REVERSE_MAX_PWM
+            steering = math.copysign(
+                REVERSE_MAX_BRAKE_PWM, sensor_error_mm
+            )
         self.mode = "LINE"
         return self._wheel_command(base, steering)
 
@@ -667,33 +654,8 @@ def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE):
         time.sleep(0.02)
 
 
-def aggressive_reacquire_drive(state):
-    """Steer sharply at low speed until the sensor array is centered."""
-    position = state.get("position") if state else None
-    if position is None:
-        line_follower.drive_straight(
-            speed=REACQUIRE_SPEED,
-            max_speed=REACQUIRE_MAX_SPEED,
-        )
-        return False
-
-    correction = (
-        line_follower.steering_correction(position) * REACQUIRE_STEER_GAIN
-    )
-    left = max(
-        MIN_SPEED,
-        min(REACQUIRE_MAX_SPEED, REACQUIRE_SPEED + correction),
-    )
-    right = max(
-        MIN_SPEED,
-        min(REACQUIRE_MAX_SPEED, REACQUIRE_SPEED - correction),
-    )
-    motors.set_speeds(round(left), round(right))
-    return True
-
-
 def reacquire_line(calibration):
-    """Use differential2 driving after EVERY turn, including edge-only line."""
+    """Use the proven Main V2 differential2 centering after every turn."""
     deadline = time.monotonic() + REACQUIRE_TIMEOUT
     stable = 0
 
@@ -702,31 +664,29 @@ def reacquire_line(calibration):
             state = line_tracker.update(calibration)
             position = state["position"]
 
-            if not aggressive_reacquire_drive(state):
+            if position is None:
+                line_follower.drive_straight(
+                    speed=MANEUVER_SPEED,
+                    max_speed=MANEUVER_MAX_SPEED,
+                )
                 stable = 0
             else:
+                differential_drive(
+                    state,
+                    speed=MANEUVER_SPEED,
+                    max_speed=MANEUVER_MAX_SPEED,
+                )
                 if abs(position - TARGET_POSITION) <= REACQUIRE_TOLERANCE:
                     stable += 1
                     if stable >= REACQUIRE_CONFIRM:
-                        print("\nREACQUIRE: line centered.")
                         return True
                 else:
                     stable = 0
 
-            print(
-                f"\rREACQUIRE pos={position} N=["
-                + " ".join(
-                    f"{value:.2f}" for value in state["normalized"]
-                )
-                + "]",
-                end="",
-                flush=True,
-            )
+            time.sleep(ROUTE_LOOP_DELAY)
 
-            time.sleep(LOOP_DELAY)
-
-        print("\nREACQUIRE timeout: line is not centered; stopping maneuver.")
-        return False
+        print("\nLine not centered yet; returning control to route tracking.")
+        return True
 
     finally:
         stop()
@@ -765,6 +725,41 @@ def activate_arm_home(board):
     print("ARM: active in base pose (90, 170, 180, 0, 170).")
 
 
+def button_depart_and_check_line(calibration):
+    """Leave the turn straight, then inspect the line before approaching."""
+    deadline = time.monotonic() + BUTTON_DEPART_SECONDS
+    try:
+        while time.monotonic() < deadline:
+            line_follower.drive_straight(
+                speed=MANEUVER_SPEED,
+                max_speed=MANEUVER_MAX_SPEED,
+            )
+            time.sleep(LOOP_DELAY)
+    finally:
+        stop()
+
+    state = line_tracker.update(calibration)
+    print(f"\nBUTTON: after straight departure, line pos={state['position']}.")
+    if state["position"] is None:
+        print("BUTTON: line missing after departure; stopping.")
+        return False
+    return True
+
+
+def button_safe_forward_drive(state):
+    """Approach the button with both wheels forward, even on an edge line."""
+    correction = max(
+        -(MANEUVER_SPEED - BUTTON_FORWARD_MIN_PWM),
+        min(
+            MANEUVER_SPEED - BUTTON_FORWARD_MIN_PWM,
+            line_follower.steering_correction(state["position"]),
+        ),
+    )
+    left = min(MANEUVER_MAX_SPEED, MANEUVER_SPEED + correction)
+    right = min(MANEUVER_MAX_SPEED, MANEUVER_SPEED - correction)
+    motors.set_speeds(round(left), round(right))
+
+
 def button_bumper_approach(calibration, sensor):
     """Use the chassis bumper to press the button; the arm never moves."""
     deadline = time.monotonic() + BUTTON_BUMPER_APPROACH_TIMEOUT
@@ -799,11 +794,7 @@ def button_bumper_approach(calibration, sensor):
                     time.sleep(LOOP_DELAY)
                     continue
                 else:
-                    differential_drive(
-                        state,
-                        speed=MANEUVER_SPEED,
-                        max_speed=MANEUVER_MAX_SPEED,
-                    )
+                    button_safe_forward_drive(state)
                     time.sleep(LOOP_DELAY)
                     continue
 
@@ -824,7 +815,7 @@ def button_bumper_approach(calibration, sensor):
                 )
                 last_status = now
             if state["position"] is None:
-                # Continue straight only during the bounded two-second press.
+                # Continue straight only during the bounded bumper press.
                 line_follower.drive_straight(
                     speed=BUTTON_BUMPER_SPEED,
                     max_speed=BUTTON_BUMPER_SPEED,
@@ -859,7 +850,9 @@ def button_return(
     """Return using the geometry-aware reverse line controller."""
     heading = Heading(bus, offset, left_sign)
     reverse_controller = ReverseLineController(
-        heading, line_loss_timeout=line_loss_timeout
+        heading,
+        line_loss_timeout=line_loss_timeout,
+        edge_recovery=label == "BUTTON",
     )
     start = time.monotonic()
     cleared_count = 0
@@ -875,7 +868,21 @@ def button_return(
             left, right, candidate = detector.read(state)
             now = time.monotonic()
 
-            if not left and not right:
+            values = state.get("normalized", [])
+            wide_black = (
+                len(values) == 8
+                and sum(value >= BLACK_ON for value in values) >= 4
+            )
+
+            # During BUTTON reverse the line can sit on S7/S8 throughout.
+            # That narrow edge line still means the starting junction has
+            # cleared; requiring S8 to go white would never arm detection.
+            if label == "BUTTON":
+                if not candidate and not (left and right) and not wide_black:
+                    cleared_count += 1
+                elif cleared_count < JUNCTION_CLEAR:
+                    cleared_count = 0
+            elif not left and not right:
                 cleared_count += 1
 
             if accept_any_junction:
@@ -902,10 +909,20 @@ def button_return(
                         "(S1 is ignored for this task)."
                     )
                     return True
-            # Preserve the original BUTTON/FIREFIGHTER return rule.
-            elif cleared_count >= JUNCTION_CLEAR and left and right:
-                print(f"\n{label}: return junction found (both outer sensors).")
-                return True
+            else:
+                # The BUTTON spur joins the main line at a T. In reverse the
+                # sensor bar can see just one side of that junction. Require
+                # the centre line as well as two consecutive branch frames;
+                # an isolated outer mark is not enough.
+                outer_confirm_count = (
+                    outer_confirm_count + 1
+                    if cleared_count >= JUNCTION_CLEAR
+                    and (candidate or (left and right) or wide_black)
+                    else 0
+                )
+                if outer_confirm_count >= JUNCTION_CONFIRM:
+                    print(f"\n{label}: return junction found.")
+                    return True
 
             # S1 has no road to detect on the CUBE1 return.  Do not let it
             # affect either junction detection or the approach speed.
@@ -916,14 +933,9 @@ def button_return(
             elif accept_s8_only or (not left and not right):
                 candidate_since = None
 
-            if state["position"] is not None:
-                speed = (
-                    RETURN_SLOW_SPEED if candidate_since is not None else RETURN_SPEED
-                )
-            else:
-                speed = (
-                    RETURN_SLOW_SPEED if candidate_since is not None else RETURN_SPEED
-                )
+            speed = (
+                RETURN_SLOW_SPEED if candidate_since is not None else RETURN_SPEED
+            )
             if not differential_reverse(state, speed, reverse_controller):
                 print(f"\n{label}: line lost too long while reversing.")
                 return False
@@ -932,7 +944,11 @@ def button_return(
                 f'\r{label} BACK {reverse_controller.mode} '
                 f'pos={state["position"]} axle={reverse_controller.last_axle_error} '
                 f'angle={reverse_controller.last_angle:+.1f} '
-                f'S1={int(left)} S8={int(right)}',
+                f'S1={int(left)} S8={int(right)} '
+                f'armed={int(cleared_count >= JUNCTION_CLEAR)} '
+                'N=[' + ' '.join(
+                    f'{value:.2f}' for value in state.get('normalized', [])
+                ) + ']',
                 end="", flush=True,
             )
             time.sleep(LOOP_DELAY)
@@ -951,7 +967,7 @@ def button_task(calibration, detector, sensor, bus, offset, board):
         print("\nB: initial turn/gyro check failed.")
         return False
 
-    if not reacquire_line(calibration):
+    if not button_depart_and_check_line(calibration):
         return False
 
     if not button_bumper_approach(calibration, sensor):
@@ -1560,7 +1576,7 @@ def main():
 
         calibration = line_tracker.load_calibration()
         if calibration is None:
-            print("No calibration found; run python calibrate.py.")
+            print("Calibration missing or sensor pins changed; run python calibrate.py.")
             return
 
         print("Waiting for all eight ADC callbacks...")
@@ -1575,7 +1591,18 @@ def main():
             print(f"Latest RAW values: {startup_state['raw']}")
             return
 
+        freshness = FreshFrames()
+        ready_deadline = time.monotonic() + 2.0
+        while not line_tracker.all_channels_fresh():
+            if time.monotonic() >= ready_deadline:
+                stop()
+                print("ERROR: ADC channels are stale or out of sync; motors remain stopped.")
+                print(f"Latest RAW values: {line_tracker.update(calibration)['raw']}")
+                return
+            time.sleep(ROUTE_LOOP_DELAY)
+
         startup_state = line_tracker.update(calibration)
+        freshness.accept(startup_state, time.monotonic())
         print(f"All eight ADC channels ready: {startup_state['raw']}")
         print(f"Initial line position: {startup_state['position']}")
 
@@ -1591,8 +1618,9 @@ def main():
         route_index = 0
         junction_count = 0
         candidate_count = 0
-        junction_gate = JunctionRearmGate()
-        junction_ignore_until = 0.0
+        clear_count = 0
+        latched = False
+        adc_paused = False
         acceleration_started = None
         straight_speed = {
             "current_speed": BASE_SPEED,
@@ -1602,22 +1630,43 @@ def main():
         }
 
         while True:
-            # EXACT same reading as the working standalone differential2.py.
             state = line_tracker.update(calibration)
+            if not freshness.accept(state, time.monotonic()):
+                # A repeated callback snapshot is harmless for a short time.
+                # Stop if any channel actually goes stale or a frame is mixed.
+                if not line_tracker.all_channels_fresh():
+                    if not adc_paused:
+                        stop()
+                        print(
+                            "\nADC STALE: motors stopped; waiting for all 8 "
+                            f"channels. RAW={state['raw']}"
+                        )
+                    adc_paused = True
+                    candidate_count = 0
+                    clear_count = 0
+                time.sleep(ROUTE_LOOP_DELAY)
+                continue
+            if adc_paused:
+                print("\nADC ready: all 8 channels fresh; route resumed.")
+                adc_paused = False
             position = state["position"]
             left, right, candidate = detector.read(state)
-            now = time.monotonic()
-            junction_gate.update(left, right, position)
+            if not left and not right:
+                clear_count += 1
+            else:
+                clear_count = 0
 
-            if (now >= junction_ignore_until
-                    and junction_gate.armed and candidate):
+            if clear_count >= ROUTE_JUNCTION_CLEAR:
+                latched = False
+
+            if not latched and candidate:
                 candidate_count += 1
             else:
                 candidate_count = 0
 
             if candidate_count >= JUNCTION_CONFIRM:
                 stop()
-                junction_gate.mark_junction()
+                latched = True
                 candidate_count = 0
                 junction_count += 1
 
@@ -1700,14 +1749,6 @@ def main():
                 straight_speed["previous_error"] = None
                 straight_speed["previous_time"] = None
                 straight_speed["straight_since"] = None
-                if cmd in (
-                    "L", "R", "L90", "R90", "BUTTON", "CHARGING",
-                    "FIREFIGHTER", "CUBE1", "COLOR",
-                ):
-                    junction_ignore_until = (
-                        time.monotonic() + POST_TURN_JUNCTION_IGNORE_SECONDS
-                    )
-                    candidate_count = 0
                 if route_index >= len(route):
                     stop()
                     print("\nAll ROUTE commands completed. Robot stopped.")
@@ -1753,7 +1794,7 @@ def main():
                     end="", flush=True,
                 )
 
-            time.sleep(LOOP_DELAY)
+            time.sleep(ROUTE_LOOP_DELAY)
 
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
