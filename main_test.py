@@ -207,7 +207,7 @@ ROUTE = [
     # "L",
     # "S",
     # "Q",
-    COLOR
+    "COLOR",
 
 
 ]
