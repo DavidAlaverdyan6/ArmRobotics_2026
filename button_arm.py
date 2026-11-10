@@ -168,7 +168,7 @@ def move_to_xyz_and_home(board, x, y, z):
 
     arm, newly_attached = get_shared_arm(board)
     home = dict(arm_web.START_ANGLES)
-    home["gripper"] = 170
+    home["gripper"] = 180
     arm_web.arm = arm
     if newly_attached:
         arm.write(**home)
@@ -208,8 +208,8 @@ def move_to_xyz_and_hold(
     if not all(math.isfinite(v) for v in (x, y, z, tool_pitch)):
         raise ValueError("XYZ coordinates and tool pitch must be finite.")
     gripper = float(gripper)
-    if not 0.0 <= gripper <= 170.0:
-        raise ValueError("Gripper angle must be between 0 and 170 degrees.")
+    if not 0.0 <= gripper <= 180.0:
+        raise ValueError("Gripper angle must be between 0 and 180 degrees.")
 
     import arm_web
     from roboarm import get_shared_arm

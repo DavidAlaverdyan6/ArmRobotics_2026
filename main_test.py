@@ -13,7 +13,7 @@ from navigation_core import FreshFrames
 from stm32_reset import STM32_RESET_GPIO, reset_stm32
 from sensors.vl53l0x_sensor import VL53L0XSensor
 
-PROGRAM_BUILD = "cube-speeds-130-150-2026-11-10.28"
+PROGRAM_BUILD = "gripper-full-range-fire-advance-2026-11-10.32"
 
 # Previously tested differential2 line-following speeds.
 SERIAL_PORT = "/dev/serial0"
@@ -45,14 +45,14 @@ JUNCTION_CENTER_MIN = 0.50
 JUNCTION_CONFIRM = 2
 JUNCTION_CLEAR = 3
 ROUTE_JUNCTION_CLEAR = 4
-POST_JUNCTION_ACCEL_SECONDS = 0.5
+POST_JUNCTION_ACCEL_SECONDS = 0.3
 SLOW_STRAIGHT_HOLD_SECONDS = 0.75
 SLOW_STRAIGHT_SPEED = 60
 SLOW_STRAIGHT_MAX_SPEED = 100
 STRAIGHT_MAX_SPEED = 255
-STRAIGHT_ACCEL_RATE = 180.0
+STRAIGHT_ACCEL_RATE = 500.0
 STRAIGHT_DECEL_RATE = 300.0
-STRAIGHT_CONFIRM_SECONDS = 0.25
+STRAIGHT_CONFIRM_SECONDS = 0.12
 STRAIGHT_POSITION_TOLERANCE = 0.35
 STRAIGHT_DERROR_LIMIT = 8.0
 
@@ -60,6 +60,10 @@ STRAIGHT_DERROR_LIMIT = 8.0
 REACQUIRE_TIMEOUT = 2.0
 REACQUIRE_TOLERANCE = 0.65
 REACQUIRE_CONFIRM = 4
+ROUTE_TURN_LINE_LOSS_SECONDS = 1.0
+ROUTE_TURN_REVERSE_SPEED = 80
+ROUTE_TURN_REVERSE_TIMEOUT = 5.0
+ROUTE_TURN_REVERSE_CONFIRM = 3
 
 I2C_BUS = 1
 MPU_ADDR = 0x68
@@ -92,6 +96,7 @@ BUTTON_BUMPER_RAM_SECONDS = 1.0
 BUTTON_BUMPER_APPROACH_TIMEOUT = 18.0
 BUTTON_BUMPER_SPEED = 180
 BUTTON_BUMPER_STATUS_SECONDS = 0.25
+BUTTON_RETURN_JUNCTION_DELAY = 0.5
 BUTTON_DEPART_SECONDS = 0.4
 BUTTON_FORWARD_MIN_PWM = 40
 
@@ -133,6 +138,7 @@ RETURN_FORWARD_TIME = 0.5
 FIRE_APPROACH_SPEED = 70
 FIRE_APPROACH_MAX_SPEED = 100
 FIRE_APPROACH_TIMEOUT = 12.0
+FIRE_FINAL_ADVANCE_SECONDS = 0.3
 FIRE_LINE_RECOVERY_SPEED = 80
 FIRE_LINE_RECOVERY_TIMEOUT = 5.0
 FIRE_LINE_RECOVERY_CONFIRM = 2
@@ -144,9 +150,9 @@ CUBE1_Y_MM = 0.0
 CUBE1_Z_MM = -140.0
 CUBE1_TOOL_PITCH_DEG = -10.0
 CUBE1_DROP_TIMEOUT = 20.0
-CUBE1_APPROACH_SPEED = 130
-CUBE1_APPROACH_MAX_SPEED = 150
-CUBE1_TURN_SPEED = 130
+CUBE1_APPROACH_SPEED = 180
+CUBE1_APPROACH_MAX_SPEED = 255
+CUBE1_TURN_SPEED = 90
 CUBE1_TURN_TIMEOUT = 4.0
 CUBE1_TURN_MIN_ANGLE = 45.0
 CUBE1_TURN_CLEAR_CONFIRM = 3
@@ -175,30 +181,33 @@ COLOR_MARKER_STABLE_FRAMES = 3
 #                   "FIREFIGHTER", "Q"]
 # The commented entries below are placeholders: edit them before launching.
 ROUTE = [
-    "BUTTON",
-    "L",
-    "R",
-    "L",
-    "CUBE1",
-    "SLOW",
-    "L",
-    "R",
-    "L",
-    "CHARGING",
-    "L90",
-    "L90",
-    "R",
-    "L",
-    "R",
-    "FIREFIGHTER",
-    "S",
-    "L",
-    "R",
-    "S",
-    "R",
-    "R",
-    "S",
-    "Q",
+    # "BUTTON",
+    # "L",
+    # "R",
+    # "L",
+    # "CUBE1",
+    # "SLOW",
+    # "L",
+    # "R",
+    # "L",
+    # "CHARGING",
+    # "L90",
+    # "R90",
+    # "R",
+    # "L",
+    # "R",
+    # "FIREFIGHTER",
+    # "S",
+    # "L",
+    # "R",
+    # "R",
+    # "S",
+    # "R",
+    # "S",
+    # "L",
+    # "S",
+    # "Q",
+    COLOR
 
 
 ]
@@ -683,10 +692,31 @@ def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE):
         time.sleep(0.02)
 
 
-def reacquire_line(calibration):
+def reverse_to_line_after_route_turn(calibration):
+    """Back up slowly until the tracker sees a line on consecutive frames."""
+    deadline = time.monotonic() + ROUTE_TURN_REVERSE_TIMEOUT
+    confirmed = 0
+    try:
+        while time.monotonic() < deadline:
+            state = line_tracker.update(calibration)
+            confirmed = confirmed + 1 if state["position"] is not None else 0
+            if confirmed >= ROUTE_TURN_REVERSE_CONFIRM:
+                print("\nROUTE TURN: line found while reversing.")
+                return True
+            line_follower.reverse_straight(ROUTE_TURN_REVERSE_SPEED)
+            time.sleep(ROUTE_LOOP_DELAY)
+        print("\nROUTE TURN: reverse recovery timed out; stopping.")
+        return False
+    finally:
+        stop()
+
+
+def reacquire_line(calibration, *, recover_after_line_loss=False):
     """Use the proven Main V2 differential2 centering after every turn."""
     deadline = time.monotonic() + REACQUIRE_TIMEOUT
     stable = 0
+    lost_since = None
+    recovery_attempted = False
 
     try:
         while time.monotonic() < deadline:
@@ -694,12 +724,44 @@ def reacquire_line(calibration):
             position = state["position"]
 
             if position is None:
-                line_follower.drive_straight(
-                    speed=MANEUVER_SPEED,
-                    max_speed=MANEUVER_MAX_SPEED,
-                )
+                now = time.monotonic()
+                if lost_since is None:
+                    lost_since = now
+                    if recover_after_line_loss:
+                        deadline = max(
+                            deadline,
+                            now + ROUTE_TURN_LINE_LOSS_SECONDS
+                            + ROUTE_LOOP_DELAY,
+                        )
+                if (
+                    recover_after_line_loss
+                    and now - lost_since >= ROUTE_TURN_LINE_LOSS_SECONDS
+                ):
+                    stop()
+                    if recovery_attempted:
+                        print("\nROUTE TURN: line lost again after recovery.")
+                        return False
+                    print(
+                        "\nROUTE TURN: line missing for 1 second; "
+                        "reversing slowly to find it."
+                    )
+                    if not reverse_to_line_after_route_turn(calibration):
+                        return False
+                    recovery_attempted = True
+                    lost_since = None
+                    stable = 0
+                    deadline = time.monotonic() + REACQUIRE_TIMEOUT
+                    continue
+                if recover_after_line_loss:
+                    stop()
+                else:
+                    line_follower.drive_straight(
+                        speed=MANEUVER_SPEED,
+                        max_speed=MANEUVER_MAX_SPEED,
+                    )
                 stable = 0
             else:
+                lost_since = None
                 differential_drive(
                     state,
                     speed=MANEUVER_SPEED,
@@ -715,7 +777,7 @@ def reacquire_line(calibration):
             time.sleep(ROUTE_LOOP_DELAY)
 
         print("\nLine not centered yet; returning control to route tracking.")
-        return True
+        return not recover_after_line_loss
 
     finally:
         stop()
@@ -751,7 +813,7 @@ def activate_arm_home(board):
 
     arm, _ = get_shared_arm(board)
     arm.write(**START_ANGLES)
-    print("ARM: active in base pose (90, 170, 180, 0, 170).")
+    print("ARM: active in base pose (90, 170, 180, 0, 180).")
 
 
 def button_depart_and_check_line(calibration):
@@ -898,17 +960,11 @@ def button_return(
             left, right, candidate = detector.read(state)
             now = time.monotonic()
 
-            values = state.get("normalized", [])
-            wide_black = (
-                len(values) == 8
-                and sum(value >= BLACK_ON for value in values) >= 4
-            )
-
             # During BUTTON reverse the line can sit on S7/S8 throughout.
             # That narrow edge line still means the starting junction has
             # cleared; requiring S8 to go white would never arm detection.
             if label == "BUTTON":
-                if not candidate and not (left and right) and not wide_black:
+                if not candidate:
                     cleared_count += 1
                 elif cleared_count < JUNCTION_CLEAR:
                     cleared_count = 0
@@ -942,12 +998,14 @@ def button_return(
             else:
                 # The BUTTON spur joins the main line at a T. In reverse the
                 # sensor bar can see just one side of that junction. Require
-                # the centre line as well as two consecutive branch frames;
-                # an isolated outer mark is not enough.
+                # the centre line and a supported outer branch for two frames.
+                # A broad straight stripe is not a junction. Also allow at
+                # least half a second of actual reversing before detection.
                 outer_confirm_count = (
                     outer_confirm_count + 1
                     if cleared_count >= JUNCTION_CLEAR
-                    and (candidate or (left and right) or wide_black)
+                    and candidate
+                    and now - start >= BUTTON_RETURN_JUNCTION_DELAY
                     else 0
                 )
                 if outer_confirm_count >= JUNCTION_CONFIRM:
@@ -970,18 +1028,15 @@ def button_return(
                 print(f"\n{label}: line lost too long while reversing.")
                 return False
 
-            if now - last_status >= 0.2:
+            if now - last_status >= 1.0:
+                position = state["position"]
+                position_text = (
+                    "None" if position is None else f"{position:+.3f}"
+                )
                 print(
-                    f'\r{label} BACK {reverse_controller.mode} '
-                    f'pos={state["position"]} '
-                    f'axle={reverse_controller.last_axle_error} '
-                    f'angle={reverse_controller.last_angle:+.1f} '
-                    f'PWM={reverse_controller.previous_pwm} '
+                    f'\r\033[2K{label} BACK pos={position_text} '
                     f'S1={int(left)} S8={int(right)} '
-                    f'armed={int(cleared_count >= JUNCTION_CLEAR)} '
-                    'N=[' + ' '.join(
-                        f'{value:.2f}' for value in state.get('normalized', [])
-                    ) + ']',
+                    f'armed={int(cleared_count >= JUNCTION_CLEAR)}',
                     end="", flush=True,
                 )
                 last_status = now
@@ -1477,6 +1532,9 @@ def firefighter_task(calibration, detector, bus, offset, board):
         else:
             _return_home(arm, START_ANGLES, AUTO_MAX_STEP_DEG, STEP_DELAY)
         time.sleep(0.6)
+        # Open before moving into the firefighting pose so the gripper cannot
+        # obstruct the water stream while the arm is being positioned.
+        arm.open_gripper()
         _return_home(arm, pose, AUTO_MAX_STEP_DEG, STEP_DELAY)
         time.sleep(0.3)
 
@@ -1501,7 +1559,18 @@ def firefighter_task(calibration, detector, bus, offset, board):
                         fire, arm, pose["base"]
                     )
                 if confirmed:
-                    print("\nF: flame confirmed for 0.5 seconds. Water ON.")
+                    print(
+                        "\nF: flame confirmed for 0.5 seconds; advancing "
+                        f"for {FIRE_FINAL_ADVANCE_SECONDS:g} seconds."
+                    )
+                    if not follow_for(
+                        calibration,
+                        FIRE_FINAL_ADVANCE_SECONDS,
+                        speed=FIRE_APPROACH_SPEED,
+                        max_speed=FIRE_APPROACH_MAX_SPEED,
+                    ):
+                        return False
+                    print("\nF: final advance complete. Water ON.")
                     fire.spray()
                     # Discard reports taken during spraying. Keep the input
                     # subscribed: there is no sensor power-control pin.
@@ -1728,6 +1797,7 @@ def main():
         latched = False
         adc_paused = False
         acceleration_started = None
+        last_position_status = 0.0
         straight_speed = {
             "current_speed": BASE_SPEED,
             "previous_error": None,
@@ -1852,10 +1922,14 @@ def main():
                                 cmd[0],
                                 angle_target=TURN_90_ANGLE,
                             )
-                        ok = ok and reacquire_line(calibration)
+                        ok = ok and reacquire_line(
+                            calibration, recover_after_line_loss=True
+                        )
                     else:
                         ok, _ = pivot(bus, offset, cmd)
-                        ok = ok and reacquire_line(calibration)
+                        ok = ok and reacquire_line(
+                            calibration, recover_after_line_loss=True
+                        )
                 else:
                     ok = follow_for(calibration, 0.5)
 
@@ -1882,12 +1956,6 @@ def main():
                 stop()
                 if acceleration_started is not None:
                     acceleration_started = time.monotonic()
-                print(
-                    '\rNO LINE: paused; route resumes when line returns. '
-                    f'RAW={state["raw"]} '
-                    f'CROSSING={crossing or "None"}',
-                    end="", flush=True,
-                )
             else:
                 if acceleration_started is None:
                     speed, max_speed = update_straight_speed(
@@ -1910,18 +1978,21 @@ def main():
                         straight_speed["previous_error"] = None
                         straight_speed["previous_time"] = None
                         straight_speed["straight_since"] = None
+
+            # Navigation still reads sensors every loop; only the terminal
+            # status is throttled. Keep it short enough not to wrap a TTY.
+            now = time.monotonic()
+            if now - last_position_status >= 1.0:
+                status = (
+                    "NO LINE: paused"
+                    if position is None else f"LINE pos={position:+.3f}"
+                )
                 print(
-                    f"\rLINE pos={position:+.3f} "
-                    f"S1={int(left)} S8={int(right)} "
-                    f"CROSSING={crossing or 'None'} "
-                    f"RAW={state['raw']} "
-                    "N=["
-                    + " ".join(
-                        f"{value:.2f}" for value in state["normalized"]
-                    )
-                    + "]",
+                    f"\r\033[2K{status} S1={int(left)} S8={int(right)} "
+                    f"CROSSING={crossing or 'None'}",
                     end="", flush=True,
                 )
+                last_position_status = now
 
             time.sleep(ROUTE_LOOP_DELAY)
 

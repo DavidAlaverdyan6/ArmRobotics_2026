@@ -74,7 +74,7 @@ class FireTests(unittest.TestCase):
             fire.wait_for_sample.side_effect = lambda *args, **kwargs: events.append('sample')
             arm = Mock()
             home = {'base': 90, 'shoulder': 180, 'elbow': 180,
-                    'wrist': 40, 'gripper': 170}
+                    'wrist': 40, 'gripper': 180}
             nav.stop = lambda: events.append('stop')
             nav.pivot = lambda bus, offset, direction, **kw: (
                 events.append(direction) or True, 1)
@@ -83,8 +83,11 @@ class FireTests(unittest.TestCase):
             nav.differential_drive = lambda *a, **kw: events.append('drive') or line_ok
             nav.line_tracker.update = Mock(return_value={'position': 0})
             nav.button_return = lambda *a, **kw: events.append('reverse') or True
-            nav.follow_for = lambda *a: events.append('forward') or True
+            nav.follow_for = lambda *a, **kw: events.append(
+                ('forward', a[1], kw)
+            ) or True
             nav.reacquire_line = lambda *a: events.append('reacquire') or True
+            arm.open_gripper.side_effect = lambda: events.append('open')
             move = Mock(side_effect=lambda arm, pose, *a: events.append(
                 'home' if pose == home else 'pose'))
             with patch.dict(sys.modules, {
@@ -100,6 +103,7 @@ class FireTests(unittest.TestCase):
                 )
             fire.off.assert_called_once()
             self.assertLess(events.index('L'), events.index('pose'))
+            self.assertLess(events.index('open'), events.index('pose'))
             self.assertLess(events.index('pose'), events.index('drive'))
             self.assertIn('sample', events[events.index('pose') + 1:events.index('drive')])
             if arm_reused:
@@ -108,6 +112,14 @@ class FireTests(unittest.TestCase):
             else:
                 arm.write.assert_called_once_with(**home)
             self.assertEqual(fire.spray.call_count, 2 if still_burning else 1)
+            final_advance = (
+                'forward', nav.FIRE_FINAL_ADVANCE_SECONDS, {
+                    'speed': nav.FIRE_APPROACH_SPEED,
+                    'max_speed': nav.FIRE_APPROACH_MAX_SPEED,
+                }
+            )
+            self.assertIn(final_advance, events)
+            self.assertLess(events.index(final_advance), events.index('water'))
             self.assertLess(events.index('home'), events.index('reverse'))
             self.assertLess(events.index('reverse'), events.index('R90'))
             self.assertIn('after', fire.wait_for_sample.call_args.kwargs)
@@ -120,7 +132,7 @@ class FireTests(unittest.TestCase):
         fire.wait_for_sample.side_effect = lambda *a, **kw: None
         arm = Mock()
         home = {'base': 90, 'shoulder': 180, 'elbow': 180,
-                'wrist': 40, 'gripper': 170}
+                'wrist': 40, 'gripper': 180}
         missing = {'position': None}
         found = {'position': 0.2}
         nav.line_tracker.update = Mock(side_effect=[
@@ -249,7 +261,7 @@ class FireTests(unittest.TestCase):
         )
         for actual, expected in zip(xyz, (300.0, 0.0, 50.0)):
             self.assertAlmostEqual(actual, expected, delta=0.1)
-        self.assertEqual(pose['gripper'], 170)
+        self.assertEqual(pose['gripper'], 0)
 
     def test_failed_confirmation_scans_minus_20_to_plus_20(self):
         fire = Mock()

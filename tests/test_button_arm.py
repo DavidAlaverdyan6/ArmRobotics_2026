@@ -13,7 +13,7 @@ class ButtonPathTests(unittest.TestCase):
             'telemetrix': types.SimpleNamespace(telemetrix=Mock())
         }):
             import arm_web
-        expected = (90, 170, 180, 0, 170)
+        expected = (90, 170, 180, 0, 180)
         self.assertEqual(
             tuple(arm_web.START_ANGLES[name] for name in (
                 'base', 'shoulder', 'elbow', 'wrist', 'gripper'

@@ -55,7 +55,7 @@ class Cube1TaskTests(unittest.TestCase):
         move_home = Mock()
         home = {
             "base": 90, "shoulder": 170, "elbow": 180,
-            "wrist": 0, "gripper": 170,
+            "wrist": 0, "gripper": 180,
         }
         with patch.dict(sys.modules, {
             "arm_web": types.SimpleNamespace(
@@ -334,13 +334,10 @@ class Cube1TaskTests(unittest.TestCase):
         heading.read.return_value = 45.0
         self.nav.Heading = Mock(return_value=heading)
         detector = Mock()
-        detector.read.side_effect = [
-            (False, False, False),
-            (False, False, False),
-            (False, False, False),
-            (True, True, True),
-            (True, True, True),
-        ]
+        detector.read.side_effect = (
+            [(False, False, False)] * 3
+            + [(True, True, True)] * 30
+        )
         with patch.object(
             self.nav.time, "monotonic", side_effect=lambda: clock[0]
         ), patch.object(

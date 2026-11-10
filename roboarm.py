@@ -52,7 +52,7 @@ class RoboArm:
                 getattr(self, name).write(angle)
 
     def close_gripper(self):
-        self.gripper.write(170)
+        self.gripper.write(180)
 
     def open_gripper(self):
         self.gripper.write(0)
