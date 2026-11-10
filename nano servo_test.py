@@ -2,6 +2,7 @@
 from telemetrix.telemetrix import Telemetrix
 from roboarm import RoboArm
 from arm_web import PORT
+from stm32_reset import reset_stm32
 
 JOINTS = ("base", "shoulder", "elbow", "wrist")
 STEP = 2
@@ -28,6 +29,7 @@ try:
     print("Stop main_qar2.py and arm_web.py before starting.")
     input("Press Enter when the robot controller is free...")
 
+    reset_stm32()
     board = Telemetrix(com_port=PORT)
     arm = RoboArm(board)
 

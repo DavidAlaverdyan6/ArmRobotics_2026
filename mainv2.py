@@ -8,6 +8,7 @@ from telemetrix import telemetrix
 
 import line_tracker
 import motors
+from stm32_reset import reset_stm32
 from sensors.vl53l0x_sensor import VL53L0XSensor
 
 # Previously tested differential2 line-following speeds.
@@ -815,6 +816,7 @@ def main():
     try:
         route = load_route()
         print(f"Automatic ROUTE loaded: {route}")
+        reset_stm32()
         # Use the same connection and ADC subscription order as ADC.py:
         # connect once, then immediately register all eight callbacks.
         board = telemetrix.Telemetrix(com_port=SERIAL_PORT)

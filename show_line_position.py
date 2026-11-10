@@ -3,6 +3,7 @@
 import time
 from telemetrix import telemetrix
 import line_tracker
+from stm32_reset import STM32_RESET_GPIO, reset_stm32
 
 
 SERIAL_PORT = "/dev/serial0"
@@ -59,6 +60,8 @@ def main():
 
     try:
         print("Connecting to STM32...")
+        print(f"Resetting STM32 through Raspberry Pi BCM{STM32_RESET_GPIO}...")
+        reset_stm32()
 
         board = telemetrix.Telemetrix(
             com_port=SERIAL_PORT

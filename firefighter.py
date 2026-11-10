@@ -38,7 +38,7 @@ def firefighting_pose():
         "shoulder": solution.shoulder,
         "elbow": solution.elbow,
         "wrist": solution.wrist,
-        "gripper": 180,
+        "gripper": 170,
     }
 
 

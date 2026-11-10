@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 from telemetrix import telemetrix
 from roboarm import RoboArm
+from stm32_reset import reset_stm32
 from arm_ik import (
     inverse_kinematics,
     forward_kinematics,
@@ -24,7 +25,7 @@ START_ANGLES = {
     "shoulder": 170.0,
     "elbow": 180.0,
     "wrist": 0.0,
-    "gripper": 180.0,
+    "gripper": 170.0,
 }
 
 JOINT_NAMES = ("base", "shoulder", "elbow", "wrist", "gripper")
@@ -255,7 +256,7 @@ const angles = {
     shoulder: 170,
     elbow: 180,
     wrist: 0,
-    gripper: 180
+    gripper: 170
 };
 
 let debounce = null;
@@ -1334,6 +1335,7 @@ def main():
 
     try:
         print("Connecting to controller...")
+        reset_stm32()
         board = telemetrix.Telemetrix(com_port=PORT)
 
         print("Initializing arm...")

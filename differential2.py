@@ -6,6 +6,7 @@ from telemetrix import telemetrix
 
 import line_tracker
 import motors
+from stm32_reset import reset_stm32
 
 
 PORT = "/dev/serial0"
@@ -32,6 +33,7 @@ def main():
     board = None
 
     try:
+        reset_stm32()
         board = telemetrix.Telemetrix(com_port=PORT)
 
         motors.initialize(board)

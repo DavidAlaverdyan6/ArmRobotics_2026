@@ -7,6 +7,7 @@ import numpy as np
 
 from picamera2 import Picamera2
 from telemetrix import telemetrix
+from stm32_reset import reset_stm32
 
 import robot_pin_config as pins
 
@@ -258,6 +259,7 @@ def main():
     try:
         print("Միանում եմ STM32-ին...")
 
+        reset_stm32()
         board = telemetrix.Telemetrix(
             com_port=SERIAL_PORT
         )

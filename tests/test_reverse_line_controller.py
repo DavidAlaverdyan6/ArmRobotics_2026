@@ -40,6 +40,29 @@ class ReverseLineControllerTests(unittest.TestCase):
             self.assertTrue(controller.drive({"position": None}, 130))
             self.assertFalse(controller.drive({"position": None}, 130))
 
+    def test_unbounded_line_loss_keeps_driving_for_cube1(self):
+        controller = self.nav.ReverseLineController(
+            StaticHeading(), line_loss_timeout=None
+        )
+        with patch.object(
+            self.nav.time, "monotonic", side_effect=[0.0, 100.0]
+        ):
+            self.assertTrue(controller.drive({"position": None}, 130))
+            self.assertTrue(controller.drive({"position": None}, 130))
+        self.assertEqual(self.nav.motors.set_speeds.call_count, 2)
+
+    def test_button_timeout_allows_longer_gyro_reacquisition(self):
+        controller = self.nav.ReverseLineController(
+            StaticHeading(),
+            line_loss_timeout=self.nav.BUTTON_REVERSE_LINE_LOSS_TIMEOUT,
+        )
+        with patch.object(
+            self.nav.time, "monotonic", side_effect=[0.0, 4.9, 5.1]
+        ):
+            self.assertTrue(controller.drive({"position": None}, 130))
+            self.assertTrue(controller.drive({"position": None}, 130))
+            self.assertFalse(controller.drive({"position": None}, 130))
+
 
 if __name__ == "__main__":
     unittest.main()

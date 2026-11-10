@@ -8,6 +8,7 @@ import smbus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from picamera2 import Picamera2
 from telemetrix import telemetrix
+from stm32_reset import reset_stm32
 from pins import PB9, PB8, PB7, PB6
 
 # ============================================================
@@ -265,6 +266,7 @@ web_thread.start()
 
 print("Connecting to STM32...")
 
+reset_stm32()
 board = telemetrix.Telemetrix(
     com_port="/dev/serial0"
 )

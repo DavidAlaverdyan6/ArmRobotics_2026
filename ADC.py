@@ -1,6 +1,7 @@
 import time
 
 from telemetrix import telemetrix
+from stm32_reset import reset_stm32
 
 from pins import (
     PA0,
@@ -63,6 +64,7 @@ def make_callback(index):
 
 print("Connecting to STM32...")
 
+reset_stm32()
 board = telemetrix.Telemetrix(
     com_port="/dev/serial0"
 )

@@ -4,6 +4,7 @@ import time
 
 from telemetrix import telemetrix
 import pins
+from stm32_reset import reset_stm32
 
 
 SERIAL_PORT = "/dev/serial0"
@@ -43,6 +44,7 @@ def make_callback(index):
     return callback
 
 
+reset_stm32()
 board = telemetrix.Telemetrix(SERIAL_PORT)
 
 for i, pin in enumerate(SENSOR_PINS):

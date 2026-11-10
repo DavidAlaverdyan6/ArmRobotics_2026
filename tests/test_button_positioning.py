@@ -79,7 +79,7 @@ class ButtonBumperTests(unittest.TestCase):
         arm = Mock()
         home = {
             "base": 90, "shoulder": 170, "elbow": 180,
-            "wrist": 0, "gripper": 180,
+            "wrist": 0, "gripper": 170,
         }
         with patch.dict(sys.modules, {
             "arm_web": types.SimpleNamespace(START_ANGLES=home),
@@ -97,6 +97,58 @@ class ButtonBumperTests(unittest.TestCase):
             "normalized": [0.9, 0.2, 0, 0.8, 0.8, 0, 0, 0],
         }
         self.assertFalse(detector.read(patch_state)[2])
+
+    def test_junction_rearms_only_after_stable_centered_clear_line(self):
+        gate = self.nav.JunctionRearmGate()
+        gate.mark_junction()
+
+        gate.update(False, False, 0.8)
+        gate.update(False, False, 0.0)
+        gate.update(False, False, 0.0)
+        self.assertFalse(gate.armed)
+
+        gate.update(False, False, 0.0)
+        self.assertTrue(gate.armed)
+
+    def test_reacquire_uses_aggressive_low_speed_steering(self):
+        self.nav.line_follower.steering_correction = Mock(return_value=40)
+        self.nav.motors.set_speeds = Mock()
+
+        self.assertTrue(self.nav.aggressive_reacquire_drive({"position": 1.0}))
+
+        self.nav.motors.set_speeds.assert_called_once_with(144, 16)
+
+    def test_button_finishes_with_the_tested_r90_turn(self):
+        self.nav.pivot = Mock(return_value=(True, 1))
+        self.nav.pivot_90 = Mock(return_value=(True, None))
+        self.nav.reacquire_line = Mock(return_value=True)
+        self.nav.button_bumper_approach = Mock(return_value=True)
+        self.nav.button_return = Mock(return_value=True)
+        self.nav.follow_for = Mock(return_value=True)
+
+        bus = Mock()
+        self.assertTrue(self.nav.button_task(
+            None, Mock(), Mock(), bus, 12.0, Mock()
+        ))
+
+        self.nav.pivot.assert_called_once_with(bus, 12.0, "L")
+        self.nav.button_return.assert_called_once_with(
+            None,
+            unittest.mock.ANY,
+            bus,
+            12.0,
+            1,
+            line_loss_timeout=self.nav.BUTTON_REVERSE_LINE_LOSS_TIMEOUT,
+        )
+        self.nav.follow_for.assert_called_once_with(
+            None, self.nav.RETURN_FORWARD_TIME
+        )
+        self.nav.pivot_90.assert_called_once_with(
+            unittest.mock.ANY,
+            12.0,
+            "R",
+            angle_target=self.nav.TURN_90_ANGLE,
+        )
 
 
 if __name__ == "__main__":

@@ -49,12 +49,12 @@ class Cube1TaskTests(unittest.TestCase):
             gripper=0.0,
         )
 
-    def test_arm_folds_home_before_reverse(self):
+    def test_arm_folds_home_before_final_turn(self):
         arm = Mock()
         move_home = Mock()
         home = {
             "base": 90, "shoulder": 170, "elbow": 180,
-            "wrist": 0, "gripper": 180,
+            "wrist": 0, "gripper": 170,
         }
         with patch.dict(sys.modules, {
             "arm_web": types.SimpleNamespace(
@@ -68,13 +68,9 @@ class Cube1TaskTests(unittest.TestCase):
             self.assertTrue(self.nav.cube1_fold_arm(Mock()))
         move_home.assert_called_once_with(arm, home, 2, 0.03)
 
-    def test_crosses_junction_before_accepting_line_loss(self):
+    def test_cube_detection_pause_then_junction_stops_before_crossing(self):
         centered = {"position": 0.0}
-        no_line = {"position": None}
-        # Line loss before the junction is ignored; loss after it is the drop.
-        self.nav.line_tracker.update = Mock(side_effect=[
-            no_line, centered, centered, centered, centered, no_line,
-        ])
+        self.nav.line_tracker.update = Mock(return_value=centered)
         detector = Mock()
         detector.read.side_effect = [
             (False, False, False),
@@ -82,27 +78,24 @@ class Cube1TaskTests(unittest.TestCase):
             (False, False, False),
             (True, True, True),
             (True, True, True),
-            (False, False, False),
         ]
-        self.nav.follow_for = Mock(return_value=True)
+        sensor = Mock()
+        sensor.detected.return_value = True
         self.nav.differential_drive = Mock()
         with patch.object(self.nav.time, "sleep"):
-            self.assertTrue(self.nav.cube1_cross_junction_until_drop(
-                None, detector
-            ))
-        self.nav.follow_for.assert_called_once_with(
-            None,
-            self.nav.CUBE1_JUNCTION_CROSS_SECONDS,
-            speed=self.nav.MANEUVER_SPEED,
-            max_speed=self.nav.MANEUVER_MAX_SPEED,
+            self.assertEqual(
+                self.nav.cube1_carry_until_drop(None, detector, sensor),
+                "junction",
+            )
+        self.nav.differential_drive.assert_called_with(
+            centered,
+            speed=self.nav.CUBE1_APPROACH_SPEED,
+            max_speed=self.nav.CUBE1_APPROACH_MAX_SPEED,
         )
 
-    def test_line_loss_after_second_junction_is_virtual_cube_drop(self):
+    def test_next_junction_stops_even_before_cube_detection(self):
         centered = {"position": 0.0}
-        no_line = {"position": None}
-        self.nav.line_tracker.update = Mock(side_effect=[
-            centered, centered, centered, centered, centered, no_line,
-        ])
+        self.nav.line_tracker.update = Mock(return_value=centered)
         detector = Mock()
         detector.read.side_effect = [
             (False, False, False),
@@ -111,12 +104,113 @@ class Cube1TaskTests(unittest.TestCase):
             (True, True, True),
             (True, True, True),
         ]
-        self.nav.follow_for = Mock(return_value=True)
+        sensor = Mock()
+        sensor.detected.return_value = False
         self.nav.differential_drive = Mock()
         with patch.object(self.nav.time, "sleep"):
-            self.assertTrue(self.nav.cube1_cross_junction_until_drop(
-                None, detector
-            ))
+            self.assertEqual(
+                self.nav.cube1_carry_until_drop(None, detector, sensor),
+                "junction",
+            )
+
+    def test_cube_loss_is_alternate_transport_endpoint(self):
+        centered = {"position": 0.0}
+        self.nav.line_tracker.update = Mock(return_value=centered)
+        detector = Mock()
+        detector.read.return_value = (False, False, False)
+        sensor = Mock()
+        sensor.detected.side_effect = [
+            True, True, True, False, False, False,
+        ]
+        self.nav.differential_drive = Mock()
+        with patch.object(self.nav.time, "sleep"):
+            self.assertEqual(
+                self.nav.cube1_carry_until_drop(None, detector, sensor),
+                "cube lost",
+            )
+
+    def test_brief_line_dropout_does_not_abort_cube_search(self):
+        centered = {"position": 0.0}
+        missing = {"position": None}
+        self.nav.line_tracker.update = Mock(side_effect=[
+            centered, centered, centered, missing, missing, centered,
+        ])
+        detector = Mock()
+        detector.read.return_value = (False, False, False)
+        sensor = Mock()
+        sensor.detected.side_effect = [
+            True, True, True, False, False, False,
+        ]
+        self.nav.differential_drive = Mock()
+        with patch.object(self.nav.time, "sleep"):
+            self.assertEqual(
+                self.nav.cube1_carry_until_drop(None, detector, sensor),
+                "cube lost",
+            )
+        self.assertEqual(self.nav.line_follower.drive_straight.call_count, 2)
+
+    def test_sustained_line_loss_stops_cube_search(self):
+        missing = {"position": None}
+        self.nav.line_tracker.update = Mock(return_value=missing)
+        detector = Mock()
+        detector.read.return_value = (False, False, False)
+        sensor = Mock()
+        sensor.detected.return_value = False
+        with patch.object(self.nav.time, "sleep"):
+            self.assertIsNone(
+                self.nav.cube1_carry_until_drop(None, detector, sensor)
+            )
+        self.assertEqual(
+            self.nav.line_follower.drive_straight.call_count,
+            self.nav.CUBE1_LINE_LOSS_CONFIRM - 1,
+        )
+
+    def test_final_push_reports_cube_still_present(self):
+        clock = [0.0]
+        self.nav.line_tracker.update = Mock(return_value={"position": 0.0})
+        self.nav.differential_drive = Mock()
+        sensor = Mock()
+        sensor.detected.return_value = True
+        with patch.object(
+            self.nav.time, "monotonic", side_effect=lambda: clock[0]
+        ), patch.object(
+            self.nav.time, "sleep",
+            side_effect=lambda seconds: clock.__setitem__(
+                0, clock[0] + seconds
+            ),
+        ):
+            self.assertTrue(
+                self.nav.cube1_push_past_junction(None, sensor)
+            )
+        self.assertTrue(self.nav.differential_drive.called)
+
+    def test_final_push_completes_full_time_when_cube_drops(self):
+        clock = [0.0]
+        self.nav.line_tracker.update = Mock(return_value={"position": 0.0})
+        self.nav.differential_drive = Mock()
+        sensor = Mock()
+        sensor.detected.side_effect = [False, False, False]
+        with patch.object(
+            self.nav.time, "monotonic", side_effect=lambda: clock[0]
+        ), patch.object(
+            self.nav.time, "sleep",
+            side_effect=lambda seconds: clock.__setitem__(
+                0, clock[0] + seconds
+            ),
+        ):
+            self.assertFalse(
+                self.nav.cube1_push_past_junction(None, sensor)
+            )
+        self.assertGreaterEqual(clock[0], self.nav.TURN_90_FORWARD_TIME)
+        self.assertEqual(sensor.detected.call_count, 3)
+        self.assertTrue(self.nav.differential_drive.called)
+        for drive_call in self.nav.differential_drive.call_args_list:
+            self.assertEqual(
+                drive_call.kwargs["speed"], self.nav.MANEUVER_SPEED
+            )
+            self.assertEqual(
+                drive_call.kwargs["max_speed"], self.nav.MANEUVER_MAX_SPEED
+            )
 
     def test_return_accepts_only_s8_for_cube1(self):
         clock = [0.0]
@@ -192,63 +286,120 @@ class Cube1TaskTests(unittest.TestCase):
             self.assertEqual(called_speed, self.nav.RETURN_SPEED)
             self.assertIsInstance(controller, self.nav.ReverseLineController)
 
-    def test_complete_task_uses_r90_then_button_style_final_turn(self):
+    def test_junction_endpoint_crosses_then_uses_final_r90(self):
         events = []
         self.nav.cube1_arm_action = Mock(
             side_effect=lambda *args: events.append("arm") or True
         )
-        self.nav.cube1_cross_junction_until_drop = Mock(
-            side_effect=lambda *args: events.append("drop") or True
+        self.nav.cube1_carry_until_drop = Mock(
+            side_effect=lambda *args: events.append("drop") or "junction"
         )
-        self.nav.cube1_fold_arm = Mock(
-            side_effect=lambda *args: events.append("fold") or True
-        )
-        self.nav.reacquire_line = Mock(
-            side_effect=lambda *args: events.append("reacquire") or True
+        self.nav.cube1_push_past_junction = Mock(
+            side_effect=lambda *args: events.append("push") or True
         )
         self.nav.button_return = Mock(
             side_effect=lambda *args, **kwargs:
             events.append("reverse") or True
         )
-        self.nav.follow_for = Mock(return_value=True)
+        self.nav.cube1_fold_arm = Mock(
+            side_effect=lambda *args, **kwargs: events.append("fold") or True
+        )
+        self.nav.reacquire_line = Mock(
+            side_effect=lambda *args: events.append("reacquire") or True
+        )
+        self.nav.follow_for = Mock(
+            side_effect=lambda *args, **kwargs:
+            events.append("forward") or True
+        )
         self.nav.pivot_90 = Mock(
             side_effect=lambda *args, **kwargs:
             events.append("r90") or (True, -1)
         )
         self.nav.pivot = Mock(return_value=(True, None))
 
-        with patch.object(self.nav.time, "sleep"):
+        cube_sensor = Mock()
+        with patch.object(self.nav.time, "sleep"), patch.dict(sys.modules, {
+            "firefighter": types.SimpleNamespace(
+                Firefighter=Mock(return_value=cube_sensor)
+            ),
+        }):
             self.assertTrue(self.nav.cube1_task(
                 None, Mock(), Mock(), 12.0, Mock()
             ))
+        cube_sensor.initialize.assert_called_once_with()
+        cube_sensor.wait_for_sample.assert_called_once()
+        self.assertIn("after", cube_sensor.wait_for_sample.call_args.kwargs)
+        self.assertLess(events.index("arm"), events.index("drop"))
 
-        self.nav.pivot_90.assert_called_once_with(
-            unittest.mock.ANY,
-            12.0,
-            "R",
-            angle_target=self.nav.TURN_90_ANGLE,
-        )
-        self.nav.pivot.assert_called_once_with(
-            unittest.mock.ANY,
-            12.0,
-            "R",
-            angle_target=self.nav.BUTTON_FINAL_RIGHT_ANGLE,
-        )
-        self.assertEqual(self.nav.follow_for.call_args_list[0], call(
+        self.assertEqual(self.nav.pivot_90.call_count, 2)
+        for pivot_call in self.nav.pivot_90.call_args_list:
+            self.assertEqual(pivot_call, call(
+                unittest.mock.ANY,
+                12.0,
+                "R",
+                angle_target=self.nav.TURN_90_ANGLE,
+            ))
+        self.nav.pivot.assert_not_called()
+        initial_forward = call(
             None,
             self.nav.TURN_90_FORWARD_TIME,
             speed=self.nav.TURN_90_FORWARD_SPEED,
             max_speed=self.nav.TURN_90_FORWARD_MAX_SPEED,
-        ))
+        )
+        self.assertEqual(
+            self.nav.follow_for.call_args_list,
+            [
+                initial_forward,
+                call(None, self.nav.RETURN_FORWARD_TIME),
+            ],
+        )
         self.assertLess(events.index("r90"), events.index("reacquire"))
         self.assertLess(events.index("reacquire"), events.index("arm"))
-        self.nav.button_return.assert_called_once()
-        self.assertLess(events.index("drop"), events.index("fold"))
+        self.assertLess(events.index("drop"), events.index("push"))
+        self.assertLess(events.index("push"), events.index("fold"))
         self.assertLess(events.index("fold"), events.index("reverse"))
-        self.assertEqual(
-            self.nav.button_return.call_args.kwargs["label"], "CUBE1"
+        self.assertLess(events.index("fold"), events.index("forward", 1))
+        self.nav.cube1_fold_arm.assert_called_once_with(
+            unittest.mock.ANY, reason="junction"
         )
-        self.assertTrue(self.nav.button_return.call_args.kwargs["accept_s8_only"])
+        self.nav.button_return.assert_called_once_with(
+            None,
+            unittest.mock.ANY,
+            unittest.mock.ANY,
+            12.0,
+            -1,
+            label="CUBE1",
+            accept_s8_only=True,
+            line_loss_timeout=None,
+        )
+
+    def test_cube_loss_keeps_existing_final_80_degree_turn(self):
+        self.nav.cube1_arm_action = Mock(return_value=True)
+        self.nav.cube1_carry_until_drop = Mock(return_value="cube lost")
+        self.nav.cube1_fold_arm = Mock(return_value=True)
+        self.nav.reacquire_line = Mock(return_value=True)
+        self.nav.follow_for = Mock(return_value=True)
+        self.nav.pivot_90 = Mock(return_value=(True, -1))
+        self.nav.pivot = Mock(return_value=(True, None))
+
+        cube_sensor = Mock()
+        with patch.object(self.nav.time, "sleep"), patch.dict(sys.modules, {
+            "firefighter": types.SimpleNamespace(
+                Firefighter=Mock(return_value=cube_sensor)
+            ),
+        }):
+            self.assertTrue(self.nav.cube1_task(
+                None, Mock(), Mock(), 12.0, Mock()
+            ))
+
+        self.assertEqual(self.nav.follow_for.call_count, 1)
+        self.assertEqual(self.nav.pivot_90.call_count, 1)
+        self.nav.pivot.assert_called_once_with(
+            unittest.mock.ANY,
+            12.0,
+            "R",
+            angle_target=self.nav.CUBE_LOST_FINAL_RIGHT_ANGLE,
+        )
 
 
 if __name__ == "__main__":

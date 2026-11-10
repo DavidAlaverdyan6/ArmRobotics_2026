@@ -15,10 +15,12 @@ def main(argv=None):
     from telemetrix import telemetrix
     import smbus
     import motors
+    from stm32_reset import reset_stm32
     from main import (SERIAL_PORT, I2C_BUS, gyro_setup, gyro_calibrate,
                       pivot)
     board = bus = None
     try:
+        reset_stm32()
         board = telemetrix.Telemetrix(com_port=SERIAL_PORT)
         motors.initialize(board)
         motors.enable_guard()
