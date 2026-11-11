@@ -1,6 +1,7 @@
 
 import json
 import math
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -8,15 +9,11 @@ from urllib.parse import urlparse
 
 from telemetrix import telemetrix
 from roboarm import RoboArm
+from stm32_reset import reset_stm32
 from arm_ik import (
     inverse_kinematics,
     forward_kinematics,
     IKError,
-    HOME_BASE,
-    HOME_SHOULDER,
-    HOME_ELBOW,
-    HOME_WRIST,
-    HOME_GRIPPER,
 )
 
 PORT = "/dev/serial0"
@@ -24,11 +21,11 @@ WEB_HOST = "0.0.0.0"
 WEB_PORT = 8080
 
 START_ANGLES = {
-    "base": HOME_BASE,
-    "shoulder": HOME_SHOULDER,
-    "elbow": HOME_ELBOW,
-    "wrist": 40.0,
-    "gripper": HOME_GRIPPER,
+    "base": 90.0,
+    "shoulder": 170.0,
+    "elbow": 180.0,
+    "wrist": 0.0,
+    "gripper": 180.0,
 }
 
 JOINT_NAMES = ("base", "shoulder", "elbow", "wrist", "gripper")
@@ -42,6 +39,7 @@ board = None
 arm = None
 arm_lock = threading.Lock()
 moving = False
+stop_requested = threading.Event()
 
 
 HTML = r"""
@@ -254,10 +252,10 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 const names = ["base", "shoulder", "elbow", "wrist", "gripper"];
 
 const angles = {
-    base: 94,
-    shoulder: 180,
+    base: 90,
+    shoulder: 170,
     elbow: 180,
-    wrist: 40,
+    wrist: 0,
     gripper: 180
 };
 
@@ -606,7 +604,7 @@ const HOME_WRIST_PITCH_DEG = 0;
 const WRIST_SCALE = 90 / 124;
 
 function armPoints(a) {
-    const yaw = (a.base - 94) * Math.PI / 180;
+    const yaw = (a.base - 90) * Math.PI / 180;
     const shoulder = (HOME_SHOULDER_DEG + (a.shoulder - 180)) * Math.PI / 180;
     const elbow = shoulder + (HOME_ELBOW_BEND_DEG - (a.elbow - 180)) * Math.PI / 180;
     const wrist = elbow + (HOME_WRIST_PITCH_DEG - (HOME_SHOULDER_DEG + HOME_ELBOW_BEND_DEG) + (a.wrist - 20) * WRIST_SCALE) * Math.PI / 180;
@@ -1054,6 +1052,84 @@ def execute_path(path):
             moving = False
 
 
+def execute_button_cycle(target, hold_seconds=0.4):
+    """Preflight, press, retrace, then return to the configured base pose."""
+    global moving
+
+    import button_arm
+
+    x, y, z = (float(target[name]) for name in ("x", "y", "z"))
+    if not all(math.isfinite(value) for value in (x, y, z)):
+        raise ValueError("Button target must contain finite XYZ values.")
+    if not (280 <= x <= 400 and -100 <= y <= 100 and -120 <= z <= 40):
+        raise ValueError("Adaptive button target is outside the bounded press workspace.")
+    hold_seconds = float(hold_seconds)
+    if not 0.2 <= hold_seconds <= 1.0:
+        raise ValueError("Button hold must be between 0.2 and 1.0 seconds.")
+
+    with arm_lock:
+        if moving:
+            raise RuntimeError("Arm is already moving.")
+        stop_requested.clear()
+        moving = True
+        try:
+            start_angles = get_current_angles()
+            paths = button_arm.plan_button_paths(
+                sys.modules[__name__], x, y, z
+            )
+            outbound = list(paths[0]) + list(paths[1])
+            inbound = (
+                list(reversed(paths[1])) +
+                [paths[0][-1]] +
+                list(reversed(paths[0])) +
+                [{name: start_angles[name] for name in IK_JOINTS}]
+            )
+            home_steps = max(1, math.ceil(max(
+                abs(START_ANGLES[name] - start_angles[name])
+                for name in IK_JOINTS
+            ) / AUTO_MAX_STEP_DEG))
+            for index in range(1, home_steps + 1):
+                t = index / home_steps
+                smooth = t*t*(3 - 2*t)
+                inbound.append({
+                    name: round(start_angles[name] +
+                                (START_ANGLES[name] - start_angles[name]) * smooth, 2)
+                    for name in IK_JOINTS
+                })
+            inbound.append({'gripper': START_ANGLES['gripper']})
+        except Exception:
+            moving = False
+            raise
+
+    try:
+        for angles in outbound:
+            if stop_requested.is_set():
+                raise InterruptedError("Emergency stop requested.")
+            with arm_lock:
+                if stop_requested.is_set():
+                    raise InterruptedError("Emergency stop requested.")
+                arm.write(**angles)
+            time.sleep(STEP_DELAY)
+        if stop_requested.wait(hold_seconds):
+            raise InterruptedError("Emergency stop requested.")
+        for angles in inbound:
+            if stop_requested.is_set():
+                raise InterruptedError("Emergency stop requested.")
+            with arm_lock:
+                if stop_requested.is_set():
+                    raise InterruptedError("Emergency stop requested.")
+                arm.write(**angles)
+            time.sleep(STEP_DELAY)
+    finally:
+        with arm_lock:
+            moving = False
+
+    return {
+        "target": {"x": x, "y": y, "z": z},
+        "returned_angles": get_current_angles(),
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     def send_json(self, status, payload):
         body = json.dumps(payload).encode("utf-8")
@@ -1083,6 +1159,8 @@ class Handler(BaseHTTPRequestHandler):
                 with arm_lock:
                     self.send_json(200, {
                         "connected": True,
+                        "capabilities": ["button-press-v2", "stop-v1"],
+                        "moving": moving,
                         "angles": get_current_angles(),
                         "xyz": get_current_xyz(),
                         "tool_pitch": get_current_tool_pitch(),
@@ -1111,6 +1189,23 @@ class Handler(BaseHTTPRequestHandler):
 
             if arm is None:
                 self.send_json(503, {"error": "Robot is not connected."})
+                return
+
+            if path == "/api/stop":
+                stop_requested.set()
+                self.send_json(200, {"ok": True, "stop_requested": True})
+                return
+
+            if path == "/api/button-press":
+                try:
+                    result = execute_button_cycle(
+                        data,
+                        data.get("hold_seconds", 0.4),
+                    )
+                except InterruptedError as error:
+                    self.send_json(409, {"error": str(error), "stopped": True})
+                    return
+                self.send_json(200, {"ok": True, **result})
                 return
 
             if path == "/api/servo":
@@ -1240,6 +1335,7 @@ def main():
 
     try:
         print("Connecting to controller...")
+        reset_stm32()
         board = telemetrix.Telemetrix(com_port=PORT)
 
         print("Initializing arm...")

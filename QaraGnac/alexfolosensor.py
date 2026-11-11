@@ -1,5 +1,6 @@
 import time
 from telemetrix.telemetrix import Telemetrix
+from stm32_reset import reset_stm32
 
 import line_tracker
 import robot_pin_config as pins
@@ -109,6 +110,7 @@ def main():
     try:
         print("Connecting to STM32...")
 
+        reset_stm32()
         board = Telemetrix(com_port=SERIAL_PORT)
         time.sleep(2)
 

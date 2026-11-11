@@ -6,6 +6,7 @@ from telemetrix import telemetrix
 
 import line_tracker
 import motors
+from stm32_reset import reset_stm32
 
 
 PORT = "/dev/serial0"
@@ -19,7 +20,7 @@ KP = 30.0
 
 # Your existing sensor weights are [-3, -2, -1, 0, 1, 2, 3, 4].
 # Tested centered-line position from show_line_position.py: about +0.08.
-TARGET_POSITION = 0.08
+TARGET_POSITION = 0.5
 
 LOOP_DELAY = 0.04
 
@@ -32,6 +33,7 @@ def main():
     board = None
 
     try:
+        reset_stm32()
         board = telemetrix.Telemetrix(com_port=PORT)
 
         motors.initialize(board)

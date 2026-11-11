@@ -143,7 +143,10 @@ def plan_button_paths(arm_web, x, y, z):
             target = {
                 "x": tx, "y": ty, "z": tz, "tool_pitch": BUTTON_TOOL_PITCH,
             }
-            path = (arm_web.plan_locked_pitch_path(target) if index == 0
+            # The configured observation/start pose is intentionally tilted.
+            # First move smoothly into the horizontal staging pose; only the
+            # subsequent press transition must preserve horizontal pitch.
+            path = (arm_web.plan_target_pitch_path(target) if index == 0
                     else _plan_early_z_press_path(arm_web, target))
             paths.append(path)
             for name, angle in path[-1].items():
@@ -188,4 +191,60 @@ def move_to_xyz_and_home(board, x, y, z):
                       arm_web.STEP_DELAY)
     _return_home(arm, home, arm_web.AUTO_MAX_STEP_DEG, arm_web.STEP_DELAY)
     print("ARM: home commanded.")
+    return True
+
+
+def move_to_xyz_and_hold(
+    board, x, y, z, tool_pitch=0.0, gripper=0,
+    open_before_move=False,
+):
+    """Move to one checked XYZ/pitch pose and stay there.
+
+    Unlike the button cycle this does not return home. The complete final
+    pose is solved before any joint moves. By default the gripper is commanded
+    at the target; ``open_before_move`` commands it before the coordinate path.
+    """
+    x, y, z, tool_pitch = map(float, (x, y, z, tool_pitch))
+    if not all(math.isfinite(v) for v in (x, y, z, tool_pitch)):
+        raise ValueError("XYZ coordinates and tool pitch must be finite.")
+    gripper = float(gripper)
+    if not 0.0 <= gripper <= 180.0:
+        raise ValueError("Gripper angle must be between 0 and 180 degrees.")
+
+    import arm_web
+    from roboarm import get_shared_arm
+
+    arm, newly_attached = get_shared_arm(board)
+    home = dict(arm_web.START_ANGLES)
+    if open_before_move:
+        home["gripper"] = gripper
+    arm_web.arm = arm
+    if newly_attached:
+        arm.write(**home)
+    else:
+        _return_home(
+            arm, home, arm_web.AUTO_MAX_STEP_DEG, arm_web.STEP_DELAY
+        )
+    time.sleep(0.6)
+    if open_before_move:
+        arm.write(gripper=gripper)
+
+    path = arm_web.plan_target_pitch_path({
+        "x": x,
+        "y": y,
+        "z": z,
+        "tool_pitch": tool_pitch,
+    })
+    target = path[-1]
+    print(
+        "ARM: planned servos "
+        f"base={target['base']:.1f}, shoulder={target['shoulder']:.1f}, "
+        f"elbow={target['elbow']:.1f}, wrist={target['wrist']:.1f}."
+    )
+    _execute_plan(arm, path, arm_web.STEP_DELAY)
+    arm.write(gripper=gripper)
+    print(
+        f"ARM: holding ({x:g}, {y:g}, {z:g}) mm at "
+        f"{tool_pitch:+g} degrees; gripper={gripper:g}."
+    )
     return True

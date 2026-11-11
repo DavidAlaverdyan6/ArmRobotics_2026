@@ -2,8 +2,10 @@ import time
 
 from telemetrix import telemetrix
 from vl53l0x import VL53L0X
+from stm32_reset import reset_stm32
 
 
+reset_stm32()
 board = telemetrix.Telemetrix()
 
 sensor = None

@@ -13,13 +13,19 @@ def load_navigation():
     # Execute the navigation module with only its hardware imports stubbed.
     stubs = {name: types.ModuleType(name) for name in
              ('smbus', 'telemetrix', 'motors', 'line_tracker',
-              'sensors.vl53l0x_sensor')}
+              'sensors.vl53l0x_sensor', 'led', 'robot_pin_config')}
     stubs['telemetrix'].telemetrix = Mock()
+    stubs['line_tracker'].LineTrackingEngine = Mock(return_value=Mock())
+    stubs['line_tracker'].CENTER_POSITION = 0.0
+    stubs['led'].RGBLED = Mock(return_value=Mock())
+    stubs['robot_pin_config'].LED_RED = 17
+    stubs['robot_pin_config'].LED_GREEN = 27
+    stubs['robot_pin_config'].LED_BLUE = 22
     stubs['sensors.vl53l0x_sensor'].VL53L0XSensor = Mock()
     with patch.dict(sys.modules, stubs):
         import importlib.util
         spec = importlib.util.spec_from_file_location('navigation_test',
-            Path(__file__).resolve().parents[1] / 'main_ggs_interactive.py')
+            Path(__file__).resolve().parents[1] / 'main_test.py')
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     return module
@@ -72,11 +78,16 @@ class FireTests(unittest.TestCase):
             nav.stop = lambda: events.append('stop')
             nav.pivot = lambda bus, offset, direction, **kw: (
                 events.append(direction) or True, 1)
+            nav.pivot_90 = lambda bus, offset, direction, **kw: (
+                events.append(direction + '90') or True, None)
             nav.differential_drive = lambda *a, **kw: events.append('drive') or line_ok
             nav.line_tracker.update = Mock(return_value={'position': 0})
-            nav.button_return = lambda *a: events.append('reverse') or True
-            nav.follow_for = lambda *a: events.append('forward') or True
+            nav.button_return = lambda *a, **kw: events.append('reverse') or True
+            nav.follow_for = lambda *a, **kw: events.append(
+                ('forward', a[1], kw)
+            ) or True
             nav.reacquire_line = lambda *a: events.append('reacquire') or True
+            arm.open_gripper.side_effect = lambda: events.append('open')
             move = Mock(side_effect=lambda arm, pose, *a: events.append(
                 'home' if pose == home else 'pose'))
             with patch.dict(sys.modules, {
@@ -87,9 +98,12 @@ class FireTests(unittest.TestCase):
                 'button_arm': types.SimpleNamespace(_return_home=move),
             }), patch.object(hardware, 'Firefighter', return_value=fire), \
                  patch.object(nav.time, 'sleep'):
-                self.assertEqual(nav.firefighter_task(None, None, None, 0, Mock()), line_ok)
+                self.assertTrue(
+                    nav.firefighter_task(None, None, None, 0, Mock())
+                )
             fire.off.assert_called_once()
             self.assertLess(events.index('L'), events.index('pose'))
+            self.assertLess(events.index('open'), events.index('pose'))
             self.assertLess(events.index('pose'), events.index('drive'))
             self.assertIn('sample', events[events.index('pose') + 1:events.index('drive')])
             if arm_reused:
@@ -97,14 +111,117 @@ class FireTests(unittest.TestCase):
                 arm.write.assert_not_called()
             else:
                 arm.write.assert_called_once_with(**home)
-            if line_ok:
-                self.assertEqual(fire.spray.call_count, 2 if still_burning else 1)
-                self.assertLess(events.index('home'), events.index('reverse'))
-                self.assertLess(events.index('reverse'), events.index('R'))
-                self.assertIn('after', fire.wait_for_sample.call_args.kwargs)
-            else:
-                fire.spray.assert_not_called()
-                self.assertNotIn('reverse', events)
+            self.assertEqual(fire.spray.call_count, 2 if still_burning else 1)
+            final_advance = (
+                'forward', nav.FIRE_FINAL_ADVANCE_SECONDS, {
+                    'speed': nav.FIRE_APPROACH_SPEED,
+                    'max_speed': nav.FIRE_APPROACH_MAX_SPEED,
+                }
+            )
+            self.assertIn(final_advance, events)
+            self.assertLess(events.index(final_advance), events.index('water'))
+            self.assertLess(events.index('home'), events.index('reverse'))
+            self.assertLess(events.index('reverse'), events.index('R90'))
+            self.assertIn('after', fire.wait_for_sample.call_args.kwargs)
+
+    def test_line_loss_reverses_until_found_then_uses_normal_return(self):
+        nav = load_navigation()
+        events = []
+        fire = Mock()
+        fire.detected.return_value = False
+        fire.wait_for_sample.side_effect = lambda *a, **kw: None
+        arm = Mock()
+        home = {'base': 90, 'shoulder': 180, 'elbow': 180,
+                'wrist': 40, 'gripper': 180}
+        missing = {'position': None}
+        found = {'position': 0.2}
+        nav.line_tracker.update = Mock(side_effect=[
+            missing, missing, found, found,
+        ])
+        nav.stop = Mock(side_effect=lambda: events.append('stop'))
+        nav.line_follower.reverse_straight = Mock(
+            side_effect=lambda speed: events.append(('recover', speed))
+        )
+        nav.pivot = Mock(return_value=(True, 1))
+        nav.pivot_90 = Mock(return_value=(True, None))
+        nav.button_return = Mock(
+            side_effect=lambda *a, **kw: events.append('return') or True
+        )
+        nav.follow_for = Mock(return_value=True)
+        nav.reacquire_line = Mock(return_value=True)
+        move = Mock()
+
+        with patch.dict(sys.modules, {
+            'roboarm': types.SimpleNamespace(
+                get_shared_arm=Mock(return_value=(arm, False))),
+            'arm_web': types.SimpleNamespace(
+                START_ANGLES=home, AUTO_MAX_STEP_DEG=2, STEP_DELAY=0.03),
+            'button_arm': types.SimpleNamespace(_return_home=move),
+        }), patch.object(hardware, 'Firefighter', return_value=fire), \
+             patch.object(nav.time, 'sleep'):
+            self.assertTrue(
+                nav.firefighter_task(None, Mock(), Mock(), 0, Mock())
+            )
+
+        self.assertEqual(
+            nav.line_follower.reverse_straight.call_count, 2
+        )
+        nav.line_follower.reverse_straight.assert_called_with(
+            nav.FIRE_LINE_RECOVERY_SPEED
+        )
+        nav.button_return.assert_called_once()
+        return_kwargs = nav.button_return.call_args.kwargs
+        self.assertEqual(return_kwargs['label'], 'FIREFIGHTER')
+        self.assertTrue(return_kwargs['accept_any_junction'])
+        self.assertEqual(
+            return_kwargs['max_return_time'], nav.FIRE_RETURN_MAX_TIME
+        )
+        self.assertEqual(
+            return_kwargs['line_loss_timeout'],
+            nav.BUTTON_REVERSE_LINE_LOSS_TIMEOUT,
+        )
+        nav.pivot_90.assert_called_once_with(
+            unittest.mock.ANY,
+            0,
+            'R',
+            angle_target=nav.TURN_90_ANGLE,
+        )
+        fire.spray.assert_not_called()
+        self.assertLess(events.index(
+            ('recover', nav.FIRE_LINE_RECOVERY_SPEED)
+        ), events.index('return'))
+
+    def test_fire_return_accepts_confirmed_one_sided_junction(self):
+        nav = load_navigation()
+        clock = [0.0]
+        nav.line_tracker.update = Mock(return_value={'position': 0.0})
+        nav.differential_reverse = Mock(return_value=True)
+        detector = Mock()
+        detector.read.side_effect = [
+            (False, False, False),
+            (False, False, False),
+            (False, False, False),
+            (True, False, False),
+            (True, False, False),
+        ]
+
+        with patch.object(
+            nav.time, 'monotonic', side_effect=lambda: clock[0]
+        ), patch.object(
+            nav.time, 'sleep',
+            side_effect=lambda seconds: clock.__setitem__(
+                0, clock[0] + seconds
+            ),
+        ):
+            self.assertTrue(nav.button_return(
+                None,
+                detector,
+                Mock(),
+                0.0,
+                1,
+                label='FIREFIGHTER',
+                accept_any_junction=True,
+            ))
 
     def test_confirmation_and_fresh_post_spray_reading(self):
         fire = hardware.Firefighter(Mock())
@@ -116,7 +233,9 @@ class FireTests(unittest.TestCase):
              patch.object(hardware.time, 'sleep', side_effect=sleep):
             fire.sample = (2500, 0.0)
             self.assertTrue(fire.confirm_flame())
-            self.assertGreaterEqual(clock[0], 1.0)
+            self.assertGreaterEqual(
+                clock[0], hardware.FLAME_CONFIRM_SECONDS
+            )
             now = clock[0]
             fire.wait_for_sample(after=now)
             self.assertGreater(fire.sample[1], now)
@@ -134,21 +253,76 @@ class FireTests(unittest.TestCase):
             self.assertGreaterEqual(clock[0] - start, 3.0)
 
     def test_firefighting_pose(self):
-        self.assertEqual(hardware.firefighting_pose(), {
-            'base': 90,
-            'shoulder': 90,
-            'elbow': 160,
-            'wrist': 70,
-            'gripper': 180,
-        })
+        from arm_ik import forward_kinematics
+
+        pose = hardware.firefighting_pose()
+        xyz = forward_kinematics(
+            pose['base'], pose['shoulder'], pose['elbow'], pose['wrist']
+        )
+        for actual, expected in zip(xyz, (300.0, 0.0, 50.0)):
+            self.assertAlmostEqual(actual, expected, delta=0.1)
+        self.assertEqual(pose['gripper'], 0)
+
+    def test_failed_confirmation_scans_minus_20_to_plus_20(self):
+        fire = Mock()
+        fire.detected.return_value = False
+        arm = Mock()
+        with patch.object(hardware.time, 'sleep'):
+            self.assertFalse(
+                hardware.scan_for_confirmed_flame(fire, arm, 90.0)
+            )
+
+        commanded = [call.kwargs['base'] for call in arm.write.call_args_list]
+        self.assertEqual(commanded[0], 88.0)
+        self.assertIn(70.0, commanded)
+        self.assertIn(110.0, commanded)
+        self.assertEqual(commanded[-1], 90.0)
+        fire.confirm_flame.assert_not_called()
+
+    def test_scan_stops_when_flame_is_confirmed(self):
+        fire = Mock()
+        fire.detected.return_value = True
+        fire.confirm_flame.side_effect = [False, True]
+        arm = Mock()
+        with patch.object(hardware.time, 'sleep'):
+            self.assertTrue(
+                hardware.scan_for_confirmed_flame(fire, arm, 90.0)
+            )
+
+        self.assertEqual(
+            [call.kwargs['base'] for call in arm.write.call_args_list],
+            [88.0, 86.0],
+        )
 
     def test_route_commands(self):
         nav = load_navigation()
-        nav.ROUTE = ['F', 'C', 'Q']
-        self.assertEqual(nav.load_route(), nav.ROUTE)
+        nav.ROUTE = ['Firefighter', 'charging', 'Cube1', 'slow', 'Q']
+        expected = ['FIREFIGHTER', 'CHARGING', 'CUBE1', 'SLOW', 'Q']
+        self.assertEqual(nav.load_route(), expected)
         nav.ROUTE = ['P', 'Q']
         with self.assertRaises(ValueError):
             nav.load_route()
+
+    def test_slow_straight_holds_low_speed_before_ramping(self):
+        nav = load_navigation()
+        self.assertEqual(
+            nav.post_junction_drive_limits(0.0, slow=True),
+            (nav.SLOW_STRAIGHT_SPEED, nav.SLOW_STRAIGHT_MAX_SPEED),
+        )
+        self.assertEqual(
+            nav.post_junction_drive_limits(
+                nav.SLOW_STRAIGHT_HOLD_SECONDS - 0.01, slow=True
+            ),
+            (nav.SLOW_STRAIGHT_SPEED, nav.SLOW_STRAIGHT_MAX_SPEED),
+        )
+        self.assertEqual(
+            nav.post_junction_drive_limits(
+                nav.SLOW_STRAIGHT_HOLD_SECONDS
+                + nav.POST_JUNCTION_ACCEL_SECONDS,
+                slow=True,
+            ),
+            (nav.BASE_SPEED, nav.MAX_SPEED),
+        )
 
 
 if __name__ == '__main__':

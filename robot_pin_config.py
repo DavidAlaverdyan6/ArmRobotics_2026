@@ -3,7 +3,7 @@
 
 from pins import (
     PA0, PA1, PA2, PA3, PA4, PA5, PA6, PA7, PA8,
-    PA12, PB0, PB5, PB6, PB7, PB8, PB9, PB12, PB13, PB14, PB15,
+    PA11, PB0, PB5, PB6, PB7, PB8, PB9, PB12, PB13, PB14, PB15,
     PC13, PC15,
 )
 
@@ -16,6 +16,7 @@ line_l4 = PA3
 line_r1 = PA4
 line_r2 = PA5
 line_r3 = PA6
+# The eighth line sensor is on PA7; PB0 serves the optical task sensor.
 line_r4 = PA7
 
 LINE_SENSORS = (
@@ -44,7 +45,7 @@ SERVOS = (servopan, servotilt, servo3, servo4, servo_gripper)
 
 # ── Other hardware ──
 fire_sensor = PB0
-pump = PB5
+pump = PA11
 
 LED_RED = 17
 LED_GREEN = 27

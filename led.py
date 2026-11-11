@@ -38,6 +38,10 @@ class RGBLED:
     def yellow(self):
         self.set_color(red=True, green=True)
 
+    def orange(self):
+        # RGB orange: full red with a reduced green component.
+        self.led.color = (1.0, 0.3, 0.0)
+
     def cyan(self):
         self.set_color(green=True, blue=True)
 

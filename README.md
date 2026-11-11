@@ -1,78 +1,55 @@
 # ArmRobotics 2026
 
-Исходники робота: https://github.com/DavidAlaverdyan6/ArmRobotics_2026
+# Setup guide:
 
-## Окружение Raspberry Pi OS / Python 3.11
+  1. Clone the repo
+  2. Create a virtual environment: `python -m venv venv`
+  3. Activate it: `source venv/bin/activate`
 
-```bash
-sudo apt update
-sudo apt install --no-install-recommends python3-venv python3-dev build-essential python3-picamera2 python3-libcamera python3-rpi-lgpio python3-pyqt5 python3-opengl i2c-tools
-cd ~/ArmRobotics
-python3 -m venv --system-site-packages venv
-source venv/bin/activate
-python -m pip install -r requirements.txt
-```
+## Main robot program
 
-`--system-site-packages` открывает доступ к системным Picamera2, libcamera,
-Qt и GPIO. `board` и `busio` устанавливаются вместе с Adafruit Blinka;
-отдельный пакет с именем `board` не нужен. NumPy ограничен версией 1.x
-для совместимости с системными расширениями камеры.
+Robot navigation and tasks run from one program:
 
-Для запуска скриптов из вложенных папок зарегистрируйте корень проекта:
+    source venv/bin/activate
+    python main_test.py
 
-```bash
-python -c 'from pathlib import Path; import sysconfig; (Path(sysconfig.get_path("purelib")) / "armrobotics.pth").write_text(str(Path.cwd()) + "\n")'
-```
+At startup the program hardware-resets the STM32 before opening Telemetrix.
+Connect Raspberry Pi BCM23 (physical pin 16) through a 1 kOhm series resistor
+to the STM32 pad marked `R` or `NRST`, and connect a Raspberry Pi ground pin to
+STM32 ground. The reset code only pulls NRST low and then releases it; it never
+drives the reset line high.
 
-В подготовленном здесь `venv` библиотеки и этот путь уже установлены.
+Edit `ROUTE` near the top of `main_test.py` before launch. Movement commands
+remain `L`, `R`, `S`, `L90`, and `R90`. Named tasks are `BUTTON`, `CHARGING`,
+`FIREFIGHTER`, `CUBE1`, and `COLOR`.
 
-## Интерфейсы нового Raspberry Pi
+## Color marker
 
-Запустите на самом Raspberry Pi, где доступна запись в `/boot/firmware`:
+Add `"COLOR"` to `ROUTE` to stop at a junction and run the camera detector.
+It uses the channel thresholds from Daniel's archived detector, draws a box
+around each red, yellow, green, or blue object, and selects the largest marker
+after three stable frames. The matching color is shown through `led.py` for
+two seconds. Detection is implemented separately in
+`color_marker_detector.py`; `main_test.py` launches the integrated route program.
 
-```bash
-sudo raspi-config nonint do_i2c 0
-sudo raspi-config nonint do_serial_cons 1
-sudo raspi-config nonint do_serial_hw 0
-```
+## CUBE1
 
-После изменения загрузочных настроек перезагрузите Raspberry Pi.
-Команды включают I2C и UART и отключают системную консоль на UART,
-используемом роботом. Эти настройки уже применены. I2C доступен как `/dev/i2c-1`; для появления
-`/dev/serial0` требуется перезагрузка. Резервные копии прежних настроек:
-`/boot/firmware/config.txt.armrobotics.bak` и
-`/boot/firmware/cmdline.txt.armrobotics.bak`.
+`CUBE1` does not use a camera. It moves the open gripper tip to
+`X=360, Y=0, Z=-150` mm with a fixed final pitch of `-20°`, then follows the
+line slowly while reading the same PB0 optical sensor used by `FIREFIGHTER`.
+Three active readings confirm the cube. The robot stops for 0.5 second and
+then resumes slow line following.
 
-Пользователь должен входить в группы `dialout`, `i2c`, `gpio`, `video`,
-`render`. У `admin` эти группы уже есть. Камера OV5647 обнаруживается libcamera.
-После нового входа проверьте `id` и наличие `/dev/serial0`, `/dev/i2c-1`.
-Графические примеры камеры требуют рабочего стола.
+Transport ends on the first of two confirmed events: three inactive cube
+sensor readings, or the next junction is detected. At a junction, the robot
+continues forward for 0.5 second using the same approach as an `R90` command,
+then folds the arm into the standard home pose `(90, 170, 180, 0, 170)` and
+performs a final `R90`. If cube loss ends transport first, the original 80°
+right pivot is retained. The PB0 threshold and polarity remain shared with
+`FIREFIGHTER` in `firefighter.py`.
 
-## Запуск существующих скриптов
-
-```bash
-cd ~/ArmRobotics
-source venv/bin/activate
-python main_ggs_interactive.py
-```
-
-Для веб-интерфейса манипулятора: `python arm_web.py`, затем откройте
-`http://<адрес-Raspberry-Pi>:8080`. Запускайте один сценарий управления
-контроллером одновременно. Сценарии могут сразу двигать моторы и сервоприводы.
-
-Код ожидает калибровку в `~/ArmRobotics/linetracker/calibration.json`.
-Прошивка контроллера находится в `Telemetrix4Arduino-master/`.
-Установка Python-библиотеки Telemetrix не прошивает STM32.
-
-## Особые файлы старых экспериментов
-
-В текущей версии репозитория отсутствуют:
-
-- специальный драйвер `VL53L0X` с транспортом Telemetrix для
-  `Test_scripts/stmvl53_test.py`; соседний `vl53l0x.py` — отдельный
-  диагностический скрипт для I2C Raspberry Pi;
-- `/usr/share/libcamera/ipa/rpi/vc4/ov5647_dw9714.json`, используемый
-  `Test_scripts/camera_af.py`. Нужен профиль от поставщика камеры/объектива.
-
-Основной сценарий использует установленный драйвер Adafruit VL53L0X.
-Исходные Python-скрипты оставлены без изменений.
+During `FIREFIGHTER`, losing the line before a flame is confirmed immediately
+stops the approach and cancels spraying. The robot reverses slowly until the
+line is confirmed again, folds the arm, and then uses the same line-following
+return and final right turn as the button task. Recovery is bounded by a
+three-second timeout; failure leaves the chassis stopped.

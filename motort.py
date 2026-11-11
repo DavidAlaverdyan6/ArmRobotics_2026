@@ -1,7 +1,9 @@
 import time
 from telemetrix import telemetrix
 import motors
+from stm32_reset import reset_stm32
 
+reset_stm32()
 board = telemetrix.Telemetrix("/dev/serial0")
 
 try:

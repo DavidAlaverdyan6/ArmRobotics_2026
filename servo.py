@@ -1,9 +1,11 @@
 import time
 from telemetrix import telemetrix
 from pins import PB13
+from stm32_reset import reset_stm32
 
 print("Connecting to STM32...")
 
+reset_stm32()
 board = telemetrix.Telemetrix(
     com_port="/dev/serial0"
 )
