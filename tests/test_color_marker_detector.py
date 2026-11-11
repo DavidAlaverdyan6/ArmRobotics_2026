@@ -144,7 +144,7 @@ class SharedCameraTests(unittest.TestCase):
             ) as response:
                 label = response.read().decode()
             self.assertIn(b"/stream.mjpg", page)
-            self.assertIn(b"/task.jpg", page)
+            self.assertIn(b"/task-stream.mjpg", page)
             self.assertTrue(task_jpeg.startswith(b"\xff\xd8"))
             self.assertEqual(label, "COLOR detected RED")
         finally:

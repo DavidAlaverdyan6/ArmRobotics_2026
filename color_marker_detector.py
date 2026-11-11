@@ -44,6 +44,7 @@ class ColorPreviewServer:
         self._frame = None
         self._sequence = 0
         self._task_frame = self._make_placeholder()
+        self._task_sequence = 0
         self._task_label = "No completed camera task yet"
         self._closed = False
         self._httpd = None
@@ -90,12 +91,11 @@ class ColorPreviewServer:
                         '<h1>Robot cameras</h1><div class="grid">'
                         '<div class="panel"><h2>Live camera</h2>'
                         '<img src="/stream.mjpg"></div>'
-                        '<div class="panel"><h2>Last task frame</h2>'
+                        '<div class="panel"><h2>Task camera</h2>'
                         '<div id="taskLabel">Waiting for a completed task</div>'
-                        '<img id="taskFrame" src="/task.jpg"></div></div>'
+                        '<img id="taskFrame" src="/task-stream.mjpg"></div></div>'
                         '<script>async function refreshTask(){'
-                        'document.getElementById("taskFrame").src='
-                        '"/task.jpg?t="+Date.now();try{const r=await fetch('
+                        'try{const r=await fetch('
                         '"/task-label?t="+Date.now());document.getElementById('
                         '"taskLabel").textContent=await r.text()}catch(e){}}'
                         'setInterval(refreshTask,1000);refreshTask();</script>'
@@ -127,9 +127,10 @@ class ColorPreviewServer:
                     self.end_headers()
                     self.wfile.write(label)
                     return
-                if path != "/stream.mjpg":
+                if path not in ("/stream.mjpg", "/task-stream.mjpg"):
                     self.send_error(404)
                     return
+                task_stream = path == "/task-stream.mjpg"
                 self.send_response(200)
                 self.send_header("Cache-Control", "no-cache, private")
                 self.send_header(
@@ -138,20 +139,28 @@ class ColorPreviewServer:
                 )
                 self.end_headers()
                 last_sequence = -1
-                with preview._condition:
-                    preview._clients += 1
+                if not task_stream:
+                    with preview._condition:
+                        preview._clients += 1
                 try:
                     while True:
                         with preview._condition:
                             preview._condition.wait_for(
-                                lambda: preview._sequence != last_sequence
+                                lambda: (
+                                    preview._task_sequence
+                                    if task_stream else preview._sequence
+                                ) != last_sequence
                                 or preview._closed,
                                 timeout=1.0,
                             )
                             if preview._closed:
                                 return
-                            frame = preview._frame
-                            last_sequence = preview._sequence
+                            if task_stream:
+                                frame = preview._task_frame
+                                last_sequence = preview._task_sequence
+                            else:
+                                frame = preview._frame
+                                last_sequence = preview._sequence
                         if frame is None:
                             continue
                         self.wfile.write(b"--FRAME\r\n")
@@ -164,8 +173,9 @@ class ColorPreviewServer:
                 except (BrokenPipeError, ConnectionResetError):
                     return
                 finally:
-                    with preview._condition:
-                        preview._clients -= 1
+                    if not task_stream:
+                        with preview._condition:
+                            preview._clients -= 1
 
             def log_message(self, _format, *args):
                 return
@@ -206,7 +216,9 @@ class ColorPreviewServer:
             return False
         with self._condition:
             self._task_frame = encoded.tobytes()
+            self._task_sequence += 1
             self._task_label = str(label)
+            self._condition.notify_all()
         return True
 
     def stop(self):
@@ -391,6 +403,10 @@ class ColorMarkerDetector:
         b = frame[:, :, 0].astype(np.uint16)
         g = frame[:, :, 1].astype(np.uint16)
         r = frame[:, :, 2].astype(np.uint16)
+        hsv = cv2.cvtColor(frame[:, :, :3], cv2.COLOR_BGR2HSV)
+        hue = hsv[:, :, 0]
+        saturation = hsv[:, :, 1]
+        value = hsv[:, :, 2]
         color_map = np.zeros(frame.shape[:2], dtype=np.uint8)
 
         max_channel = np.maximum(np.maximum(r, g), b)
@@ -413,7 +429,24 @@ class ColorMarkerDetector:
         green = valid & (g * 100 > r * 115) & (g * 100 > b * 120)
         color_map[green] = self.GREEN
 
-        blue = valid & (b * 100 > r * 125) & (b * 100 > g * 115)
+        # Blue tape in the live camera reaches B>=113 with at least 23 levels
+        # of separation from the next channel. Dark/black material produced
+        # only B=60..99 and 10..18 levels of separation, so reject that noise
+        # while retaining a margin below the observed blue range.
+        blue = (
+            valid
+            # The camera's white balance makes white floor and black tape
+            # look blue in raw BGR ratios. Keep actual saturated blue/cyan
+            # light, while rejecting the low-saturation blue cast.
+            & (hue >= 95)
+            & (hue <= 135)
+            & (saturation >= 120)
+            & (value >= 80)
+            & (b >= 100)
+            & (b - np.maximum(r, g) >= 20)
+            & (b * 100 > r * 125)
+            & (b * 100 > g * 115)
+        )
         color_map[blue] = self.BLUE
         return color_map
 
@@ -450,6 +483,9 @@ class ColorMarkerDetector:
                 "area": int(area),
             })
 
+        # The caller treats the first object as the strongest detection.
+        # OpenCV's contour order is spatial/arbitrary, not size based.
+        objects.sort(key=lambda obj: obj["area"], reverse=True)
         return objects
 
     def draw_objects(

@@ -13,7 +13,7 @@ from navigation_core import FreshFrames
 from stm32_reset import STM32_RESET_GPIO, reset_stm32
 from sensors.vl53l0x_sensor import VL53L0XSensor
 
-PROGRAM_BUILD = "live-and-task-camera-page-2026-11-11.42"
+PROGRAM_BUILD = "hsv-blue-light-filter-2026-11-11.43"
 
 # Previously tested differential2 line-following speeds.
 SERIAL_PORT = "/dev/serial0"
@@ -186,6 +186,8 @@ CUBE1_SENSOR_CONFIRM = 3
 CUBE1_LINE_LOSS_CONFIRM = 5
 
 # COLOR: stop, find a stable colored marker, and show that color on the RGB LED.
+# Pixel classification (including the saturated-blue filter that rejects the
+# blue cast from white floor and black tape) lives in color_marker_detector.py.
 COLOR_MARKER_TIMEOUT = 10.0
 COLOR_MARKER_HOLD_SECONDS = 1.0
 COLOR_MARKER_MIN_AREA = 700
@@ -208,33 +210,33 @@ COLOR_LED_HOLD = None
 #                   "FIREFIGHTER", "Q"]
 # The commented entries below are placeholders: edit them before launching.
 ROUTE = [
-    "BUTTON",
-    "L",
-    "R",
-    "L",
-    "CUBE1",
-    "SLOW",
-    "L",
-    "R",
-    "L",
-    "CHARGING",
-    "L90SLOW",
-    "R90",
+    # "BUTTON",
+    # "L",
+    # "R",
+    # "L",
+    # "CUBE1",
+    # "SLOW",
+    # "L",
+    # "R",
+    # "L",
+    # "CHARGING",
+    # "L90SLOW",
+    # "R90",
     "COLOR",
-    "L",
-    "R",
-    "FIREFIGHTER",
-    "S",
-    "L",
-    "R",
-    "R",
-    "S",
-    "R",
-    "S",
-    "L",
-    "L",
-    "S",
-    "Q",
+    # "L",
+    # "R",
+    # "FIREFIGHTER",
+    # "S",
+    # "L",
+    # "R",
+    # "R",
+    # "S",
+    # "R",
+    # "S",
+    # "L",
+    # "L",
+    # "S",
+    # "Q",
 
 
 
