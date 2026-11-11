@@ -5,6 +5,7 @@ import busio
 import adafruit_vl53l0x
 
 DISTANCE_OFFSET_MM = 25
+FAST_TIMING_BUDGET_US = 20_000
 
 
 class VL53L0XSensor:
@@ -20,6 +21,10 @@ class VL53L0XSensor:
         self.i2c = busio.I2C(board.SCL, board.SDA)
         try:
             self.sensor = adafruit_vl53l0x.VL53L0X(self.i2c)
+            # The driver permits 20 ms as its minimum timing budget. Continuous
+            # mode avoids restarting a single measurement for every read.
+            self.sensor.measurement_timing_budget = FAST_TIMING_BUDGET_US
+            self.sensor.start_continuous()
         except Exception:
             self.close()
             raise
@@ -40,6 +45,11 @@ class VL53L0XSensor:
         return int(self.sensor.range)
 
     def close(self):
+        if self.sensor is not None:
+            try:
+                self.sensor.stop_continuous()
+            except (AttributeError, OSError, RuntimeError):
+                pass
         self.sensor = None
 
         if self.i2c is not None:

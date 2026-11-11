@@ -99,6 +99,85 @@ class ButtonBumperTests(unittest.TestCase):
         }
         self.assertFalse(detector.read(patch_state)[2])
 
+    def test_fast_route_junction_requires_full_black_branch_and_center(self):
+        nav = self.nav
+        complete = {
+            "position": 0.0,
+            "normalized": [0, 0, 0, 0.9, 0.9, 0, 0.8, 0.96],
+        }
+        incomplete = {
+            "position": 0.0,
+            "normalized": [0, 0, 0, 0.9, 0.9, 0, 0.55, 0.96],
+        }
+        self.assertTrue(nav.strong_route_junction(complete))
+        self.assertFalse(nav.strong_route_junction(incomplete))
+
+    def test_route_recovery_requires_three_fresh_line_frames(self):
+        nav = self.nav
+        nav.stop = Mock()
+        clock = [0.0]
+        positions_and_ids = [
+            (None, 1), (0.1, 2), (0.1, 2), (0.1, 3), (0.1, 4),
+        ]
+        states = [
+            {
+                "position": position,
+                "sample_ids": [sample_id] * 8,
+                "sample_times": [0.0] * 8,
+            }
+            for position, sample_id in positions_and_ids
+        ]
+        nav.line_tracker.update = Mock(side_effect=states)
+        nav.line_tracker.all_channels_fresh = Mock(return_value=True)
+        nav.line_follower.reverse_straight = Mock()
+        with patch.object(
+            nav.time, "monotonic", side_effect=lambda: clock[0]
+        ), patch.object(
+            nav.time, "sleep",
+            side_effect=lambda seconds: clock.__setitem__(
+                0, clock[0] + seconds
+            ),
+        ):
+            self.assertTrue(
+                nav.reverse_to_line_on_route(None, nav.FreshFrames())
+            )
+        self.assertEqual(nav.line_tracker.update.call_count, 5)
+        self.assertEqual(
+            nav.line_follower.reverse_straight.call_count, 4
+        )
+        nav.line_follower.reverse_straight.assert_any_call(80)
+
+    def test_route_recovery_stops_after_five_seconds(self):
+        nav = self.nav
+        nav.stop = Mock()
+        clock = [0.0]
+        sample_id = [0]
+
+        def missing_state(_calibration):
+            sample_id[0] += 1
+            return {
+                "position": None,
+                "sample_ids": [sample_id[0]] * 8,
+                "sample_times": [clock[0]] * 8,
+            }
+
+        nav.line_tracker.update = Mock(side_effect=missing_state)
+        nav.line_tracker.all_channels_fresh = Mock(return_value=True)
+        nav.line_follower.reverse_straight = Mock()
+        with patch.object(
+            nav.time, "monotonic", side_effect=lambda: clock[0]
+        ), patch.object(
+            nav.time, "sleep",
+            side_effect=lambda seconds: clock.__setitem__(
+                0, clock[0] + seconds
+            ),
+        ):
+            self.assertFalse(
+                nav.reverse_to_line_on_route(None, nav.FreshFrames())
+            )
+        self.assertGreaterEqual(clock[0], 5.0)
+        nav.stop.assert_called()
+
     def test_gray_side_mark_does_not_count_as_a_junction(self):
         detector = self.nav.JunctionDetector()
         gray_side = {
@@ -249,6 +328,38 @@ class ButtonBumperTests(unittest.TestCase):
             ))
 
         self.assertGreater(clock[0], nav.BUTTON_RETURN_JUNCTION_DELAY)
+
+    def test_button_return_rejects_small_early_black_patch(self):
+        nav = self.nav
+        clock = [0.0]
+        narrow = {
+            "position": 0.0,
+            "normalized": [0, 0, 0, 0.9, 0.9, 0, 0, 0],
+        }
+        patch_state = {
+            "position": 1.0,
+            # Outer branch plus only one central sensor: not the main T-line.
+            "normalized": [0, 0, 0, 0, 0.9, 0, 0.95, 0.95],
+        }
+        nav.line_tracker.update = Mock(
+            side_effect=[narrow] * 4 + [patch_state] * 30
+        )
+        nav.differential_reverse = Mock(return_value=True)
+        detector = Mock()
+        detector.read.side_effect = lambda state: (
+            False, state is patch_state, state is patch_state
+        )
+        with patch.object(
+            nav.time, "monotonic", side_effect=lambda: clock[0]
+        ), patch.object(
+            nav.time, "sleep",
+            side_effect=lambda seconds: clock.__setitem__(
+                0, clock[0] + seconds
+            ),
+        ):
+            self.assertFalse(nav.button_return(
+                None, detector, Mock(), 0.0, 1, max_return_time=0.6
+            ))
 
     def test_button_departure_is_straight_then_checks_line(self):
         nav = self.nav

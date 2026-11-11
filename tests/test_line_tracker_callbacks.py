@@ -44,6 +44,7 @@ class LineTrackerCallbackTests(unittest.TestCase):
             try:
                 old = {
                     "white": [3000] * 8,
+                    "gray": [3300] * 8,
                     "black": [3900] * 8,
                 }
                 line_tracker.save_calibration(old)
@@ -115,6 +116,41 @@ class LineTrackerCallbackTests(unittest.TestCase):
             line_tracker.calculate_position(tape_with_gray_branch),
             line_tracker.calculate_position(tape),
         )
+
+    def test_general_normalization_uses_white_and_black_only(self):
+        calibration = {
+            "white": [3500] * 8,
+            "gray": [3200] * 8,
+            "black": [3900] * 8,
+        }
+        self.assertEqual(
+            line_tracker.normalize_sensor(0, 3200, calibration), 0.0
+        )
+        self.assertEqual(
+            line_tracker.normalize_sensor(0, 3500, calibration), 0.0
+        )
+        self.assertAlmostEqual(
+            line_tracker.normalize_sensor(0, 3900, calibration), 1.0
+        )
+        self.assertAlmostEqual(
+            line_tracker.normalize_sensor(0, 3700, calibration), 0.5
+        )
+
+    def test_update_does_not_apply_a_global_gray_filter(self):
+        board = FakeBoard()
+        line_tracker.initialize(board)
+        calibration = {
+            "white": [3100] * 8,
+            "gray": [3650] * 8,
+            "black": [3900] * 8,
+        }
+        for pin, callback in board.inputs:
+            callback([0, pin, 3650])
+
+        state = line_tracker.update(calibration)
+
+        self.assertTrue(all(value > 0 for value in state["normalized"]))
+        self.assertIsNotNone(state["position"])
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ from navigation_core import FreshFrames
 from stm32_reset import STM32_RESET_GPIO, reset_stm32
 from sensors.vl53l0x_sensor import VL53L0XSensor
 
-PROGRAM_BUILD = "gripper-full-range-fire-advance-2026-11-10.32"
+PROGRAM_BUILD = "live-and-task-camera-page-2026-11-11.42"
 
 # Previously tested differential2 line-following speeds.
 SERIAL_PORT = "/dev/serial0"
@@ -29,6 +29,11 @@ TARGET_POSITION = line_tracker.CENTER_POSITION
 # only by route line-following and post-turn reacquisition below.
 LOOP_DELAY = 0.02
 ROUTE_LOOP_DELAY = 0.04
+ROUTE_JUNCTION_POLL_DELAY = 0.01
+ROUTE_LINE_LOSS_CONFIRM = 3
+ROUTE_LINE_REVERSE_SPEED = 80
+ROUTE_LINE_REVERSE_TIMEOUT = 5.0
+ROUTE_LINE_REVERSE_CONFIRM = 3
 
 # Line-strength limits reused by the button positioning task.
 START_CENTER_BLACK_MIN = 0.30
@@ -43,6 +48,9 @@ JUNCTION_SIDE_SUPPORT_ON = 0.75
 JUNCTION_SIDE_SUPPORT_OFF = 0.55
 JUNCTION_CENTER_MIN = 0.50
 JUNCTION_CONFIRM = 2
+ROUTE_FAST_EDGE_BLACK_MIN = 0.90
+ROUTE_FAST_SIDE_BLACK_MIN = 0.75
+ROUTE_FAST_CENTER_BLACK_MIN = 0.70
 JUNCTION_CLEAR = 3
 ROUTE_JUNCTION_CLEAR = 4
 POST_JUNCTION_ACCEL_SECONDS = 0.3
@@ -82,6 +90,10 @@ TURN_ANGLE = 75.0
 TURN_90_ANGLE = 90.0
 TURN_PWM_FAST = 255
 TURN_PWM_SLOW = 90
+SLOW_90_PWM_FAST = 110
+SLOW_90_PWM_SLOW = 70
+SLOW_90_REVERSE_SECONDS = 0.15
+SLOW_90_REVERSE_SPEED = 80
 # main_old's uncalibrated alignment PWM and 0.50 s travel.
 # Keep this independent of BASE_SPEED and MANEUVER_SPEED.
 TURN_90_FORWARD_SPEED = 80
@@ -97,6 +109,9 @@ BUTTON_BUMPER_APPROACH_TIMEOUT = 18.0
 BUTTON_BUMPER_SPEED = 180
 BUTTON_BUMPER_STATUS_SECONDS = 0.25
 BUTTON_RETURN_JUNCTION_DELAY = 0.5
+BUTTON_RETURN_JUNCTION_CONFIRM = 4
+BUTTON_RETURN_CENTER_BLACK_MIN = 0.70
+BUTTON_RETURN_CENTER_SENSOR_COUNT = 2
 BUTTON_DEPART_SECONDS = 0.4
 BUTTON_FORWARD_MIN_PWM = 40
 
@@ -142,6 +157,7 @@ FIRE_FINAL_ADVANCE_SECONDS = 0.3
 FIRE_LINE_RECOVERY_SPEED = 80
 FIRE_LINE_RECOVERY_TIMEOUT = 5.0
 FIRE_LINE_RECOVERY_CONFIRM = 2
+FIRE_LINE_BLACKNESS_MIN = 0.75
 FIRE_RETURN_MAX_TIME = 40.0
 
 # CUBE1: arm stays at this XYZ with the gripper open while the chassis moves.
@@ -154,11 +170,14 @@ CUBE1_APPROACH_SPEED = 180
 CUBE1_APPROACH_MAX_SPEED = 255
 CUBE1_TURN_SPEED = 90
 CUBE1_TURN_TIMEOUT = 4.0
-CUBE1_TURN_MIN_ANGLE = 45.0
+CUBE1_TURN_MIN_ANGLE = 60.0
+CUBE1_TURN_MAX_ANGLE = 90.0
 CUBE1_TURN_CLEAR_CONFIRM = 3
 CUBE1_TURN_LINE_CONFIRM = 3
 CUBE1_LASER_MIN_DISTANCE_MM = 140.0
 CUBE1_LASER_MAX_DISTANCE_MM = 160.0
+CUBE1_LASER_CONFIRM = 3
+CUBE1_LASER_CONFIRM_WINDOW = 0.2
 CUBE1_DROP_PUSH_SPEED = 130
 CUBE1_DROP_PUSH_MAX_SPEED = 150
 CUBE1_DROP_PUSH_TIMEOUT = 3.0
@@ -168,9 +187,17 @@ CUBE1_LINE_LOSS_CONFIRM = 5
 
 # COLOR: stop, find a stable colored marker, and show that color on the RGB LED.
 COLOR_MARKER_TIMEOUT = 10.0
-COLOR_MARKER_HOLD_SECONDS = 2.0
-COLOR_MARKER_MIN_AREA = 10_000
+COLOR_MARKER_HOLD_SECONDS = 1.0
+COLOR_MARKER_MIN_AREA = 700
 COLOR_MARKER_STABLE_FRAMES = 3
+COLOR_ARM_ANGLES = {
+    "base": 90.0,
+    "shoulder": 160.0,
+    "elbow": 180.0,
+    "wrist": 0.0,
+    "gripper": 0.0,
+}
+COLOR_LED_HOLD = None
 
 # Automatic route: one entry for each detected junction, in order.
 # L/R/S/SLOW and L90/R90 are movement commands. SLOW goes straight without
@@ -181,21 +208,21 @@ COLOR_MARKER_STABLE_FRAMES = 3
 #                   "FIREFIGHTER", "Q"]
 # The commented entries below are placeholders: edit them before launching.
 ROUTE = [
-    # "BUTTON",
-    # "L",
-    # "R",
-    # "L",
-    # "CUBE1",
-    # "SLOW",
-    # "L",
-    # "R",
-    # "L",
-    # "CHARGING",
-    # "L90",
-    # "R90",
-    # "R",
-    # "L",
-    # "R",
+    "BUTTON",
+    "L",
+    "R",
+    "L",
+    "CUBE1",
+    "SLOW",
+    "L",
+    "R",
+    "L",
+    "CHARGING",
+    "L90SLOW",
+    "R90",
+    "COLOR",
+    "L",
+    "R",
     "FIREFIGHTER",
     "S",
     "L",
@@ -205,14 +232,15 @@ ROUTE = [
     "R",
     "S",
     "L",
+    "L",
     "S",
     "Q",
-    # "COLOR",
+
 
 
 ]
 ALLOWED_ROUTE_COMMANDS = {
-    "L", "R", "L90", "R90", "S", "SLOW",
+    "L", "R", "L90", "R90", "L90SLOW", "R90SLOW", "S", "SLOW",
     "BUTTON", "CHARGING", "FIREFIGHTER", "CUBE1", "COLOR", "Q",
 }
 
@@ -352,6 +380,26 @@ class JunctionDetector:
         )
 
         return self.left_black, self.right_black, candidate
+
+
+def strong_route_junction(state):
+    """A full black branch can be accepted in one fresh sensor snapshot."""
+    values = state.get("normalized", [])
+    if state.get("position") is None or len(values) != 8:
+        return False
+    center_count = sum(
+        values[index] >= ROUTE_FAST_CENTER_BLACK_MIN
+        for index in (2, 3, 4, 5)
+    )
+    left_branch = (
+        values[0] >= ROUTE_FAST_EDGE_BLACK_MIN
+        and values[1] >= ROUTE_FAST_SIDE_BLACK_MIN
+    )
+    right_branch = (
+        values[7] >= ROUTE_FAST_EDGE_BLACK_MIN
+        and values[6] >= ROUTE_FAST_SIDE_BLACK_MIN
+    )
+    return center_count >= 2 and (left_branch or right_branch)
 
 
 def gyro_raw(bus):
@@ -585,7 +633,13 @@ def pivot(bus, offset, direction, angle_target=TURN_ANGLE):
         time.sleep(PIVOT_SETTLE_SECONDS)
 
 
-def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE):
+def pivot_90(
+    bus,
+    offset,
+    direction,
+    angle_target=TURN_90_ANGLE,
+    slow=False,
+):
     """Controlled pivot with the tested 90-degree correction logic."""
     if direction not in ("L", "R"):
         raise ValueError("Turn direction must be L or R")
@@ -645,7 +699,13 @@ def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE):
             if now - start >= GYRO_TIMEOUT or (now - start > 0.7 and angle < 2):
                 print(f"\nGYRO_TURN timeout/no motion at {angle:.1f} degrees")
                 return False, None
-            pwm = TURN_PWM_SLOW if angle >= angle_target - 25 else TURN_PWM_FAST
+            fast_pwm = (
+                SLOW_90_PWM_FAST if slow else TURN_PWM_FAST
+            )
+            slow_pwm = (
+                SLOW_90_PWM_SLOW if slow else TURN_PWM_SLOW
+            )
+            pwm = slow_pwm if angle >= angle_target - 25 else fast_pwm
             motors.set_speeds(-pwm if left else pwm, pwm if left else -pwm)
             time.sleep(0.005)
 
@@ -692,6 +752,18 @@ def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE):
         time.sleep(0.02)
 
 
+def reverse_for_short_turn(seconds, speed):
+    """Back away briefly from a compact post-CHARGING turn area."""
+    deadline = time.monotonic() + seconds
+    try:
+        while time.monotonic() < deadline:
+            line_follower.reverse_straight(speed)
+            time.sleep(LOOP_DELAY)
+    finally:
+        stop()
+    return True
+
+
 def reverse_to_line_after_route_turn(calibration):
     """Back up slowly until the tracker sees a line on consecutive frames."""
     deadline = time.monotonic() + ROUTE_TURN_REVERSE_TIMEOUT
@@ -706,6 +778,35 @@ def reverse_to_line_after_route_turn(calibration):
             line_follower.reverse_straight(ROUTE_TURN_REVERSE_SPEED)
             time.sleep(ROUTE_LOOP_DELAY)
         print("\nROUTE TURN: reverse recovery timed out; stopping.")
+        return False
+    finally:
+        stop()
+
+
+def reverse_to_line_on_route(calibration, freshness):
+    """Back up after route line loss until fresh frames confirm the line."""
+    deadline = time.monotonic() + ROUTE_LINE_REVERSE_TIMEOUT
+    confirmed = 0
+    print("\nROUTE: line lost; reversing slowly to find it.")
+    try:
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            state = line_tracker.update(calibration)
+            if not line_tracker.all_channels_fresh():
+                stop()
+                confirmed = 0
+                time.sleep(ROUTE_JUNCTION_POLL_DELAY)
+                continue
+            if freshness.accept(state, now):
+                confirmed = (
+                    confirmed + 1 if state["position"] is not None else 0
+                )
+                if confirmed >= ROUTE_LINE_REVERSE_CONFIRM:
+                    print("\nROUTE: line recovered; resuming route.")
+                    return True
+            line_follower.reverse_straight(ROUTE_LINE_REVERSE_SPEED)
+            time.sleep(ROUTE_JUNCTION_POLL_DELAY)
+        print("\nROUTE: reverse recovery timed out; robot stopped.")
         return False
     finally:
         stop()
@@ -1001,14 +1102,27 @@ def button_return(
                 # the centre line and a supported outer branch for two frames.
                 # A broad straight stripe is not a junction. Also allow at
                 # least half a second of actual reversing before detection.
+                values = state.get("normalized", [])
+                center_black_count = (
+                    sum(
+                        values[index] >= BUTTON_RETURN_CENTER_BLACK_MIN
+                        for index in (2, 3, 4, 5)
+                    )
+                    if len(values) == 8 else 0
+                )
+                main_junction = (
+                    candidate
+                    and center_black_count
+                    >= BUTTON_RETURN_CENTER_SENSOR_COUNT
+                )
                 outer_confirm_count = (
                     outer_confirm_count + 1
                     if cleared_count >= JUNCTION_CLEAR
-                    and candidate
+                    and main_junction
                     and now - start >= BUTTON_RETURN_JUNCTION_DELAY
                     else 0
                 )
-                if outer_confirm_count >= JUNCTION_CONFIRM:
+                if outer_confirm_count >= BUTTON_RETURN_JUNCTION_CONFIRM:
                     print(f"\n{label}: return junction found.")
                     return True
 
@@ -1153,12 +1267,14 @@ def cube1_fold_arm(board, reason="task endpoint reached"):
 
 
 def cube1_turn_to_center_line(calibration, bus, offset, distance_sensor):
-    """Turn to four center sensors; report the diagnostic laser distance."""
+    """Turn 60-90 degrees; accept stable center-line or laser confirmation."""
     deadline = time.monotonic() + CUBE1_TURN_TIMEOUT
     previous = time.monotonic()
     signed_angle = 0.0
     clear_count = 0
     line_count = 0
+    laser_times = []
+    last_distance_mm = None
     armed = False
     try:
         while time.monotonic() < deadline:
@@ -1173,44 +1289,58 @@ def cube1_turn_to_center_line(calibration, bus, offset, distance_sensor):
                 len(values) == 8
                 and min(values[2:6]) >= JUNCTION_CENTER_MIN
             )
-            distance_mm = None
-            if four_center_black:
-                try:
-                    measured_mm = float(distance_sensor.read_distance_mm())
-                    if math.isfinite(measured_mm):
-                        distance_mm = measured_mm
-                except Exception:
-                    # Laser is diagnostic-only for now; it must not alter motion.
-                    pass
+            try:
+                measured_mm = float(distance_sensor.read_distance_mm())
+                if math.isfinite(measured_mm):
+                    last_distance_mm = measured_mm
+                    cube1_record_laser_sample(
+                        laser_times, now, measured_mm
+                    )
+            except Exception:
+                laser_times.clear()
+
+            angle = abs(signed_angle)
+            laser_confirmed = (
+                angle >= CUBE1_TURN_MIN_ANGLE
+                and len(laser_times) >= CUBE1_LASER_CONFIRM
+            )
 
             if not four_center_black:
                 clear_count += 1
                 line_count = 0
                 if clear_count >= CUBE1_TURN_CLEAR_CONFIRM:
                     armed = True
-            elif armed and abs(signed_angle) >= CUBE1_TURN_MIN_ANGLE:
+            elif armed and angle >= CUBE1_TURN_MIN_ANGLE:
                 line_count += 1
-                if line_count >= CUBE1_TURN_LINE_CONFIRM:
-                    observed_sign = 1 if signed_angle > 0 else -1
-                    left_sign = -observed_sign
-                    laser_ok = (
-                        distance_mm is not None
-                        and CUBE1_LASER_MIN_DISTANCE_MM
-                        <= distance_mm
-                        <= CUBE1_LASER_MAX_DISTANCE_MM
-                    )
-                    laser_text = (
-                        "unavailable"
-                        if distance_mm is None
-                        else f"{distance_mm:.0f} mm "
-                             f"({'OK' if laser_ok else 'OUTSIDE 140-160'})"
-                    )
-                    print(
-                        "\nCUBE1: all four center sensors confirmed the new "
-                        f"line at {abs(signed_angle):.1f} gyro degrees; "
-                        f"laser={laser_text}."
-                    )
-                    return True, left_sign
+            else:
+                line_count = 0
+
+            line_confirmed = (
+                armed
+                and angle >= CUBE1_TURN_MIN_ANGLE
+                and line_count >= CUBE1_TURN_LINE_CONFIRM
+            )
+            max_angle_reached = angle >= CUBE1_TURN_MAX_ANGLE
+            if line_confirmed or laser_confirmed or max_angle_reached:
+                observed_sign = 1 if signed_angle > 0 else -1
+                left_sign = -observed_sign
+                reason = (
+                    "center line"
+                    if line_confirmed else
+                    "laser 140-160 mm"
+                    if laser_confirmed else
+                    "90-degree safety limit"
+                )
+                laser_text = (
+                    "unavailable"
+                    if last_distance_mm is None
+                    else f"{last_distance_mm:.0f} mm"
+                )
+                print(
+                    f"\nCUBE1: turn complete by {reason} at "
+                    f"{angle:.1f} gyro degrees; laser={laser_text}."
+                )
+                return True, left_sign
 
             motors.set_speeds(CUBE1_TURN_SPEED, -CUBE1_TURN_SPEED)
             time.sleep(LOOP_DELAY)
@@ -1221,12 +1351,38 @@ def cube1_turn_to_center_line(calibration, bus, offset, distance_sensor):
         stop()
 
 
+def cube1_record_laser_sample(sample_times, now, distance_mm):
+    """Keep only consecutive in-range laser hits from the last 0.2 seconds."""
+    if (
+        CUBE1_LASER_MIN_DISTANCE_MM
+        <= distance_mm
+        <= CUBE1_LASER_MAX_DISTANCE_MM
+    ):
+        sample_times.append(now)
+        sample_times[:] = [
+            stamp for stamp in sample_times
+            if now - stamp <= CUBE1_LASER_CONFIRM_WINDOW
+        ]
+    else:
+        sample_times.clear()
+    return len(sample_times) >= CUBE1_LASER_CONFIRM
+
+
 def cube1_create_indicator():
     """Create the RGB indicator using this robot's swapped red/blue wiring."""
+    return create_robot_rgb_indicator()
+
+
+def create_robot_rgb_indicator():
+    """Create the physical RGB LED with its measured red/blue wire swap."""
     import led
     import robot_pin_config as pins
 
-    return led.RGBLED(pins.LED_BLUE, pins.LED_GREEN, pins.LED_RED)
+    rgb = led.RGBLED(pins.LED_BLUE, pins.LED_GREEN, pins.LED_RED)
+    # gpiozero already initializes to off; repeat it explicitly before use so
+    # no task can inherit a previous color while ownership changes.
+    rgb.off()
+    return rgb
 
 
 def cube1_carry_until_drop(
@@ -1402,6 +1558,9 @@ def cube1_task(calibration, detector, bus, offset, board, distance_sensor):
         # The gripper opens before the arm moves into its working coordinates.
         if not cube1_arm_action(board):
             return False
+        print("CUBE1: arm lowered; centering on the line before continuing.")
+        if not reacquire_line(calibration, recover_after_line_loss=True):
+            return False
 
         # PB0 belongs to CUBE1 only from this point onward.  Reports produced
         # during the turn or arm motion must never count as cube detections.
@@ -1478,10 +1637,37 @@ def firefighter_reverse_until_line(calibration):
     )
     deadline = time.monotonic() + FIRE_LINE_RECOVERY_TIMEOUT
     confirmed = 0
+    gray_reported = False
     try:
         while time.monotonic() < deadline:
             state = line_tracker.update(calibration)
-            if state["position"] is not None:
+            values = state.get("normalized", [])
+            raw = state.get("raw", [])
+            strong_sensors = [
+                index for index, value in enumerate(values)
+                if value >= FIRE_LINE_BLACKNESS_MIN
+            ]
+            if calibration is not None and len(raw) == len(values) == 8:
+                strong_sensors = [
+                    index for index in strong_sensors
+                    if abs(raw[index] - calibration["black"][index])
+                    < abs(raw[index] - calibration["gray"][index])
+                ]
+                if not strong_sensors and not gray_reported and any(
+                    abs(raw[index] - calibration["gray"][index])
+                    < abs(raw[index] - calibration["black"][index])
+                    and abs(raw[index] - calibration["gray"][index])
+                    < abs(raw[index] - calibration["white"][index])
+                    for index in range(8)
+                ):
+                    print("\nF: gray line passed while reversing.")
+                    gray_reported = True
+            black_line = (
+                state.get("position") is not None
+                and len(values) == 8
+                and bool(strong_sensors)
+            )
+            if black_line:
                 confirmed += 1
                 if confirmed >= FIRE_LINE_RECOVERY_CONFIRM:
                     stop()
@@ -1502,8 +1688,10 @@ def firefighter_reverse_until_line(calibration):
         stop()
 
 
-def firefighter_task(calibration, detector, bus, offset, board):
-    """Left turn, stationary arm pose, confirmed flame, at most two sprays."""
+def firefighter_task(
+    calibration, detector, bus, offset, board, camera_stream=None,
+):
+    """Approach fire; spray on confirmation or once at the line endpoint."""
     from firefighter import (
         Firefighter,
         firefighting_pose,
@@ -1542,7 +1730,7 @@ def firefighter_task(calibration, detector, bus, offset, board):
         # Wait for a new report before the robot starts approaching the flame.
         fire.wait_for_sample(after=time.monotonic())
         deadline = time.monotonic() + FIRE_APPROACH_TIMEOUT
-        line_loss_abort = False
+        line_end_fallback = False
         while time.monotonic() < deadline:
             flame_detected = fire.detected()
             if flame_detected is None:
@@ -1559,6 +1747,10 @@ def firefighter_task(calibration, detector, bus, offset, board):
                         fire, arm, pose["base"]
                     )
                 if confirmed:
+                    if camera_stream is not None:
+                        camera_stream.save_latest_task_frame(
+                            "FIREFIGHTER: flame confirmed"
+                        )
                     print(
                         "\nF: flame confirmed for 0.5 seconds; advancing "
                         f"for {FIRE_FINAL_ADVANCE_SECONDS:g} seconds."
@@ -1583,9 +1775,19 @@ def firefighter_task(calibration, detector, bus, offset, board):
                 continue
             state = line_tracker.update(calibration)
             if state["position"] is None:
+                stop()
+                if camera_stream is not None:
+                    camera_stream.save_latest_task_frame(
+                        "FIREFIGHTER: fallback spray at line end"
+                    )
+                print(
+                    "\nF: end of line reached without confirmed flame; "
+                    "fallback water spray ON for 5 seconds."
+                )
+                fire.spray()
                 if not firefighter_reverse_until_line(calibration):
                     return False
-                line_loss_abort = True
+                line_end_fallback = True
                 break
             differential_drive(
                 state,
@@ -1597,8 +1799,8 @@ def firefighter_task(calibration, detector, bus, offset, board):
             print("\nF: flame approach timeout.")
             return False
 
-        if line_loss_abort:
-            print("\nF: flame search aborted after line loss; no water used.")
+        if line_end_fallback:
+            print("\nF: fallback spray complete; returning along the line.")
 
         stop()
         _return_home(arm, START_ANGLES, AUTO_MAX_STEP_DEG, STEP_DELAY)
@@ -1639,7 +1841,7 @@ def charging_task():
 
         # Physical red/blue LED channels are swapped on this robot:
         # previous RED command lit BLUE. Swap only here, not global pins.
-        rgb = led.RGBLED(pins.LED_BLUE, pins.LED_GREEN, pins.LED_RED)
+        rgb = create_robot_rgb_indicator()
         start = time.monotonic()
         red_end = start + CHARGE_RED_SECONDS
         park_end = start + CHARGE_SECONDS
@@ -1678,23 +1880,83 @@ def charging_task():
         stop()
 
 
-def color_marker_task():
-    """Detect one stable color marker and light the matching RGB channel."""
+def color_marker_task(calibration, board, bus, offset, camera_stream=None):
+    """Run COLOR's R90, then pose the arm and detect a rotated-frame color."""
     from color_marker_detector import run_color_marker_task
+    from roboarm import get_shared_arm
 
     stop()
+    marker = None
     try:
+        print("\nCOLOR: move forward, then execute internal R90.")
+        ok = follow_for(
+            calibration,
+            TURN_90_FORWARD_TIME,
+            speed=TURN_90_FORWARD_SPEED,
+            max_speed=TURN_90_FORWARD_MAX_SPEED,
+        )
+        if ok:
+            ok, _ = pivot_90(
+                bus, offset, "R", angle_target=TURN_90_ANGLE
+            )
+        if not ok or not reacquire_line(calibration, recover_after_line_loss=True):
+            return False
+
+        arm, _ = get_shared_arm(board)
+        print(
+            "\nCOLOR: moving arm to base=90, shoulder=160, "
+            "elbow=180, wrist=0, gripper=0."
+        )
+        arm.write(**COLOR_ARM_ANGLES)
+        # Claim and initialize the LED while it is still off. Confirmation
+        # then changes only its color; no GPIO object is created between a
+        # RED/BLUE decision and the visible indication.
+        global COLOR_LED_HOLD
+        if COLOR_LED_HOLD is not None:
+            try:
+                COLOR_LED_HOLD.off()
+                COLOR_LED_HOLD.close()
+            except Exception:
+                pass
+        COLOR_LED_HOLD = create_robot_rgb_indicator()
+
+        def light_confirmed_color(match):
+            getattr(COLOR_LED_HOLD, match["color"])()
+            print(
+                f"COLOR: {match['color'].upper()} indicator ON; "
+                f"holding for {COLOR_MARKER_HOLD_SECONDS:g} second; "
+                "LED map R=GPIO22 G=GPIO27 B=GPIO17."
+            )
+
         marker = run_color_marker_task(
             timeout_s=COLOR_MARKER_TIMEOUT,
             hold_seconds=COLOR_MARKER_HOLD_SECONDS,
             min_object_area=COLOR_MARKER_MIN_AREA,
             stable_frames=COLOR_MARKER_STABLE_FRAMES,
+            control_led=False,
+            confirmation_callback=light_confirmed_color,
+            preview_port=None if camera_stream is not None else 8000,
+            camera_stream=camera_stream,
+            task_frame_callback=(
+                None if camera_stream is None else
+                lambda frame, match: camera_stream.save_task_frame(
+                    frame,
+                    f"COLOR detected {match['color'].upper()}",
+                )
+            ),
         )
         return marker is not None
     except Exception as exc:
         print(f"\nCOLOR: camera/LED error: {exc}")
         return False
     finally:
+        if marker is None and COLOR_LED_HOLD is not None:
+            try:
+                COLOR_LED_HOLD.off()
+                COLOR_LED_HOLD.close()
+            except Exception:
+                pass
+            COLOR_LED_HOLD = None
         stop()
 
 
@@ -1714,7 +1976,7 @@ def load_route():
         if cmd not in ALLOWED_ROUTE_COMMANDS:
             raise ValueError(
                 f"Invalid ROUTE entry #{index}: {command!r}. "
-                "Allowed: L, R, L90, R90, S, BUTTON, CHARGING, "
+                "Allowed: L, R, L90, R90, L90SLOW, R90SLOW, S, BUTTON, CHARGING, "
                 "SLOW, FIREFIGHTER, CUBE1, COLOR, Q."
             )
         if cmd == "Q" and index != len(ROUTE):
@@ -1724,7 +1986,9 @@ def load_route():
 
 
 def main():
+    global COLOR_LED_HOLD
     board = bus = sensor = None
+    camera_stream = None
     offset_90 = None
     motors_on = tracker_on = False
 
@@ -1781,6 +2045,10 @@ def main():
         print(f"All eight ADC channels ready: {startup_state['raw']}")
         print(f"Initial line position: {startup_state['position']}")
 
+        from color_marker_detector import ContinuousCamera
+        camera_stream = ContinuousCamera(port=8000)
+        camera_stream.start()
+
         print("Starting route; line tracker will self-center the robot.")
 
         detector = JunctionDetector()
@@ -1797,6 +2065,7 @@ def main():
         latched = False
         adc_paused = False
         acceleration_started = None
+        route_line_loss_count = 0
         last_position_status = 0.0
         straight_speed = {
             "current_speed": BASE_SPEED,
@@ -1820,12 +2089,29 @@ def main():
                     adc_paused = True
                     candidate_count = 0
                     clear_count = 0
-                time.sleep(ROUTE_LOOP_DELAY)
+                    route_line_loss_count = 0
+                time.sleep(ROUTE_JUNCTION_POLL_DELAY)
                 continue
             if adc_paused:
                 print("\nADC ready: all 8 channels fresh; route resumed.")
                 adc_paused = False
             position = state["position"]
+            route_line_loss_count = (
+                route_line_loss_count + 1 if position is None else 0
+            )
+            if route_line_loss_count >= ROUTE_LINE_LOSS_CONFIRM:
+                stop()
+                if not reverse_to_line_on_route(calibration, freshness):
+                    break
+                route_line_loss_count = 0
+                candidate_count = 0
+                clear_count = 0
+                detector = JunctionDetector()
+                acceleration_started = None
+                straight_speed["previous_error"] = None
+                straight_speed["previous_time"] = None
+                straight_speed["straight_since"] = None
+                continue
             # Use the same crossing result shown by show_line_position.py.
             # The task routines retain their own detector and maneuver rules.
             crossing = state["crossing"]
@@ -1845,11 +2131,28 @@ def main():
             else:
                 candidate_count = 0
 
-            if candidate_count >= JUNCTION_CONFIRM:
+            if (
+                candidate_count >= JUNCTION_CONFIRM
+                or (
+                    not latched and candidate
+                    and strong_route_junction(state)
+                )
+            ):
                 stop()
                 latched = True
                 candidate_count = 0
                 junction_count += 1
+
+                # COLOR's result stays lit while driving and is cleared only
+                # when the following junction has actually been confirmed.
+                if COLOR_LED_HOLD is not None:
+                    try:
+                        COLOR_LED_HOLD.off()
+                        COLOR_LED_HOLD.close()
+                    except Exception:
+                        pass
+                    COLOR_LED_HOLD = None
+                    print("\nCOLOR: next junction reached; indicator OFF.")
 
                 if route_index >= len(route):
                     print("\nROUTE finished. Robot stopped.")
@@ -1865,20 +2168,30 @@ def main():
                     break
 
                 if cmd == "COLOR":
-                    ok = color_marker_task()
+                    if bus is None:
+                        bus = smbus.SMBus(I2C_BUS)
+                        gyro_setup(bus)
+                    if offset_90 is None:
+                        offset_90 = gyro_calibrate(bus, settle_seconds=0.05)
+                    ok = color_marker_task(
+                        calibration, board, bus, offset_90, camera_stream
+                    )
                 elif cmd == "SLOW":
                     # Do not call follow_for(): junction detection must remain
                     # active because the following junction is very close.
                     ok = True
                 elif cmd in (
-                    "L", "R", "L90", "R90", "BUTTON", "CHARGING",
+                    "L", "R", "L90", "R90", "L90SLOW", "R90SLOW",
+                    "BUTTON", "CHARGING",
                     "FIREFIGHTER", "CUBE1",
                 ):
                     # Gyro stays unloaded until a maneuver requires it.
                     if bus is None:
                         bus = smbus.SMBus(I2C_BUS)
                         gyro_setup(bus)
-                    if cmd in ("L90", "R90", "BUTTON"):
+                    if cmd in (
+                        "L90", "R90", "L90SLOW", "R90SLOW", "BUTTON"
+                    ):
                         if offset_90 is None:
                             offset_90 = gyro_calibrate(bus, settle_seconds=0.05)
                         offset = offset_90
@@ -1894,7 +2207,8 @@ def main():
                         )
                     elif cmd == "FIREFIGHTER":
                         ok = firefighter_task(
-                            calibration, detector, bus, offset, board
+                            calibration, detector, bus, offset, board,
+                            camera_stream,
                         )
                     elif cmd == "CUBE1":
                         if sensor is None:
@@ -1909,7 +2223,8 @@ def main():
                             # Same 80-degree R turn and differential reacquire.
                             ok, _ = pivot(bus, offset, "R")
                             ok = ok and reacquire_line(calibration)
-                    elif cmd in ("L90", "R90"):
+                    elif cmd in ("L90", "R90", "L90SLOW", "R90SLOW"):
+                        slow_turn = cmd in ("L90SLOW", "R90SLOW")
                         ok = follow_for(
                             calibration, TURN_90_FORWARD_TIME,
                             speed=TURN_90_FORWARD_SPEED,
@@ -1921,6 +2236,20 @@ def main():
                                 offset,
                                 cmd[0],
                                 angle_target=TURN_90_ANGLE,
+                                **(
+                                    {"slow": True}
+                                    if slow_turn else {}
+                                ),
+                            )
+                        if ok and slow_turn:
+                            print(
+                                f"\nROUTE: slow {cmd}; "
+                                f"reversing for "
+                                f"{SLOW_90_REVERSE_SECONDS:g} seconds."
+                            )
+                            reverse_for_short_turn(
+                                SLOW_90_REVERSE_SECONDS,
+                                SLOW_90_REVERSE_SPEED,
                             )
                         ok = ok and reacquire_line(
                             calibration, recover_after_line_loss=True
@@ -1937,6 +2266,7 @@ def main():
                     print("\nManeuver failed. Robot stopped.")
                     break
                 acceleration_started = time.monotonic()
+                route_line_loss_count = 0
                 slow_departure = cmd == "SLOW"
                 straight_speed["current_speed"] = (
                     SLOW_STRAIGHT_SPEED if slow_departure else MANEUVER_SPEED
@@ -1994,13 +2324,22 @@ def main():
                 )
                 last_position_status = now
 
-            time.sleep(ROUTE_LOOP_DELAY)
+            time.sleep(ROUTE_JUNCTION_POLL_DELAY)
 
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
     except Exception as exc:
         print(f"\nERROR: {exc}")
     finally:
+        if camera_stream is not None:
+            camera_stream.stop()
+        if COLOR_LED_HOLD is not None:
+            try:
+                COLOR_LED_HOLD.off()
+                COLOR_LED_HOLD.close()
+            except Exception:
+                pass
+            COLOR_LED_HOLD = None
         if motors_on:
             try:
                 stop()

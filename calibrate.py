@@ -55,8 +55,10 @@ def main():
         print("\nCalibration instructions:")
         print("1. Place ALL 8 sensors over a WHITE surface.")
         print("2. Keep the sensors still and press ENTER.")
-        print("3. Place ALL 8 sensors over a BLACK line/surface.")
+        print("3. Place ALL 8 sensors over the GRAY line/surface.")
         print("4. Keep the sensors still and press ENTER.")
+        print("5. Place ALL 8 sensors over a BLACK line/surface.")
+        print("6. Keep the sensors still and press ENTER.")
         print("\nDo not move the sensors while sampling.")
 
         # Perform and save calibration
@@ -64,6 +66,7 @@ def main():
 
         print("\nCalibration completed successfully!")
         print("White values:", calibration["white"])
+        print("Gray values:", calibration["gray"])
         print("Black values:", calibration["black"])
 
         print(

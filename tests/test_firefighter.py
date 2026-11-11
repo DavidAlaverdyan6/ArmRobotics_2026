@@ -72,6 +72,7 @@ class FireTests(unittest.TestCase):
             fire.confirm_flame.side_effect = [True, still_burning]
             fire.spray.side_effect = lambda: events.append('water')
             fire.wait_for_sample.side_effect = lambda *args, **kwargs: events.append('sample')
+            camera_stream = Mock()
             arm = Mock()
             home = {'base': 90, 'shoulder': 180, 'elbow': 180,
                     'wrist': 40, 'gripper': 180}
@@ -99,8 +100,13 @@ class FireTests(unittest.TestCase):
             }), patch.object(hardware, 'Firefighter', return_value=fire), \
                  patch.object(nav.time, 'sleep'):
                 self.assertTrue(
-                    nav.firefighter_task(None, None, None, 0, Mock())
+                    nav.firefighter_task(
+                        None, None, None, 0, Mock(), camera_stream
+                    )
                 )
+            camera_stream.save_latest_task_frame.assert_called_once_with(
+                'FIREFIGHTER: flame confirmed'
+            )
             fire.off.assert_called_once()
             self.assertLess(events.index('L'), events.index('pose'))
             self.assertLess(events.index('open'), events.index('pose'))
@@ -124,19 +130,27 @@ class FireTests(unittest.TestCase):
             self.assertLess(events.index('reverse'), events.index('R90'))
             self.assertIn('after', fire.wait_for_sample.call_args.kwargs)
 
-    def test_line_loss_reverses_until_found_then_uses_normal_return(self):
+    def test_line_end_sprays_once_then_reverses_and_returns(self):
         nav = load_navigation()
         events = []
         fire = Mock()
         fire.detected.return_value = False
         fire.wait_for_sample.side_effect = lambda *a, **kw: None
+        fire.spray.side_effect = lambda: events.append('water')
         arm = Mock()
         home = {'base': 90, 'shoulder': 180, 'elbow': 180,
                 'wrist': 40, 'gripper': 180}
         missing = {'position': None}
-        found = {'position': 0.2}
+        gray = {
+            'position': 0.2,
+            'normalized': [0.22, 0.18, 0.20, 0.27, 0.24, 0.21, 0.19, 0.23],
+        }
+        found = {
+            'position': 0.2,
+            'normalized': [0.05, 0.02, 0.08, 0.88, 0.91, 0.12, 0.03, 0.04],
+        }
         nav.line_tracker.update = Mock(side_effect=[
-            missing, missing, found, found,
+            missing, gray, found, found,
         ])
         nav.stop = Mock(side_effect=lambda: events.append('stop'))
         nav.line_follower.reverse_straight = Mock(
@@ -149,6 +163,7 @@ class FireTests(unittest.TestCase):
         )
         nav.follow_for = Mock(return_value=True)
         nav.reacquire_line = Mock(return_value=True)
+        camera_stream = Mock()
         move = Mock()
 
         with patch.dict(sys.modules, {
@@ -160,12 +175,16 @@ class FireTests(unittest.TestCase):
         }), patch.object(hardware, 'Firefighter', return_value=fire), \
              patch.object(nav.time, 'sleep'):
             self.assertTrue(
-                nav.firefighter_task(None, Mock(), Mock(), 0, Mock())
+                nav.firefighter_task(
+                    None, Mock(), Mock(), 0, Mock(), camera_stream
+                )
             )
 
-        self.assertEqual(
-            nav.line_follower.reverse_straight.call_count, 2
+        camera_stream.save_latest_task_frame.assert_called_once_with(
+            'FIREFIGHTER: fallback spray at line end'
         )
+
+        self.assertEqual(nav.line_follower.reverse_straight.call_count, 2)
         nav.line_follower.reverse_straight.assert_called_with(
             nav.FIRE_LINE_RECOVERY_SPEED
         )
@@ -186,10 +205,59 @@ class FireTests(unittest.TestCase):
             'R',
             angle_target=nav.TURN_90_ANGLE,
         )
-        fire.spray.assert_not_called()
+        fire.spray.assert_called_once_with()
+        nav.follow_for.assert_called_once_with(None, nav.RETURN_FORWARD_TIME)
+        self.assertLess(events.index('water'), events.index(
+            ('recover', nav.FIRE_LINE_RECOVERY_SPEED)
+        ))
         self.assertLess(events.index(
             ('recover', nav.FIRE_LINE_RECOVERY_SPEED)
         ), events.index('return'))
+
+    def test_fire_reverse_ignores_gray_and_accepts_black(self):
+        nav = load_navigation()
+        gray = {
+            'position': 0.0,
+            'normalized': [0.20, 0.18, 0.22, 0.30, 0.28, 0.21, 0.19, 0.20],
+        }
+        black = {
+            'position': 0.0,
+            'normalized': [0.02, 0.01, 0.04, 0.90, 0.92, 0.03, 0.01, 0.02],
+        }
+        nav.line_tracker.update = Mock(
+            side_effect=[gray, gray, black, black]
+        )
+        nav.line_follower.reverse_straight = Mock()
+        nav.stop = Mock()
+
+        self.assertTrue(nav.firefighter_reverse_until_line(None))
+        self.assertEqual(
+            nav.line_follower.reverse_straight.call_count, 3
+        )
+
+    def test_fire_reverse_rejects_dark_gray_using_its_raw_calibration(self):
+        nav = load_navigation()
+        calibration = {
+            'white': [3100] * 8,
+            'gray': [3700] * 8,
+            'black': [3900] * 8,
+        }
+        gray = {
+            'position': 0.0,
+            'raw': [3700] * 8,
+            'normalized': [0.75] * 8,
+        }
+        black = {
+            'position': 0.0,
+            'raw': [3900] * 8,
+            'normalized': [1.0] * 8,
+        }
+        nav.line_tracker.update = Mock(side_effect=[gray, gray, black, black])
+        nav.line_follower.reverse_straight = Mock()
+        nav.stop = Mock()
+
+        self.assertTrue(nav.firefighter_reverse_until_line(calibration))
+        self.assertEqual(nav.line_follower.reverse_straight.call_count, 3)
 
     def test_fire_return_accepts_confirmed_one_sided_junction(self):
         nav = load_navigation()
@@ -296,8 +364,14 @@ class FireTests(unittest.TestCase):
 
     def test_route_commands(self):
         nav = load_navigation()
-        nav.ROUTE = ['Firefighter', 'charging', 'Cube1', 'slow', 'Q']
-        expected = ['FIREFIGHTER', 'CHARGING', 'CUBE1', 'SLOW', 'Q']
+        nav.ROUTE = [
+            'Firefighter', 'charging', 'Cube1', 'slow',
+            'l90slow', 'r90slow', 'Q',
+        ]
+        expected = [
+            'FIREFIGHTER', 'CHARGING', 'CUBE1', 'SLOW',
+            'L90SLOW', 'R90SLOW', 'Q',
+        ]
         self.assertEqual(nav.load_route(), expected)
         nav.ROUTE = ['P', 'Q']
         with self.assertRaises(ValueError):

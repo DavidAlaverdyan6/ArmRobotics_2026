@@ -131,6 +131,7 @@ def load_calibration():
 
         if (
             len(data.get("white", [])) != SENSOR_COUNT
+            or len(data.get("gray", [])) != SENSOR_COUNT
             or len(data.get("black", [])) != SENSOR_COUNT
             or data.get("pins") != SENSOR_PINS
         ):
@@ -178,11 +179,15 @@ def calibrate():
     input("Place all sensors over WHITE, then press ENTER...")
     white = _read_average_samples()
 
+    input("Place all sensors over GRAY, then press ENTER...")
+    gray = _read_average_samples()
+
     input("Place all sensors over BLACK, then press ENTER...")
     black = _read_average_samples()
 
     calibration = {
         "white": white,
+        "gray": gray,
         "black": black,
         "pins": SENSOR_PINS.copy(),
     }

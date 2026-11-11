@@ -116,6 +116,44 @@ class Cube1TaskTests(unittest.TestCase):
             -self.nav.CUBE1_TURN_SPEED,
         )
 
+    def test_turn_stops_at_90_even_without_line_or_laser(self):
+        clock = [0.0]
+        self.nav.line_tracker.update = Mock(
+            return_value={"normalized": [0] * 8}
+        )
+        self.nav.gyro_rate = Mock(return_value=-500.0)
+        self.nav.motors.set_speeds = Mock()
+        distance_sensor = Mock()
+        distance_sensor.read_distance_mm.return_value = 800.0
+        with patch.object(
+            self.nav.time, "monotonic", side_effect=lambda: clock[0]
+        ), patch.object(
+            self.nav.time, "sleep",
+            side_effect=lambda seconds: clock.__setitem__(
+                0, clock[0] + seconds
+            ),
+        ):
+            self.assertEqual(
+                self.nav.cube1_turn_to_center_line(
+                    None, Mock(), 12.0, distance_sensor
+                ),
+                (True, 1),
+            )
+        self.assertLessEqual(clock[0], 0.20)
+
+    def test_laser_requires_consecutive_hits_inside_point_two_seconds(self):
+        samples = []
+        record = self.nav.cube1_record_laser_sample
+        self.assertFalse(record(samples, 0.00, 150.0))
+        self.assertFalse(record(samples, 0.03, 150.0))
+        # One random outside value cancels the partial confirmation.
+        self.assertFalse(record(samples, 0.05, 900.0))
+        self.assertFalse(record(samples, 0.07, 150.0))
+        self.assertFalse(record(samples, 0.10, 150.0))
+        self.assertTrue(record(samples, 0.13, 150.0))
+        # Old hits outside the 0.2-second window cannot count.
+        self.assertFalse(record(samples, 0.40, 150.0))
+
     def test_cube_detection_pause_then_junction_stops_before_crossing(self):
         centered = {"position": 0.0}
         self.nav.line_tracker.update = Mock(return_value=centered)
@@ -326,7 +364,10 @@ class Cube1TaskTests(unittest.TestCase):
 
     def test_return_uses_line_not_gyro_when_line_is_visible(self):
         clock = [0.0]
-        state = {"position": 0.4}
+        state = {
+            "position": 0.4,
+            "normalized": [0, 0, 0, 0.9, 0.9, 0, 0.9, 0.9],
+        }
         self.nav.line_tracker.update = Mock(return_value=state)
         self.nav.differential_reverse = Mock()
         heading = Mock()
@@ -381,7 +422,8 @@ class Cube1TaskTests(unittest.TestCase):
             side_effect=lambda *args, **kwargs: events.append("fold") or True
         )
         self.nav.reacquire_line = Mock(
-            side_effect=lambda *args: events.append("reacquire") or True
+            side_effect=lambda *args, **kwargs:
+            events.append("reacquire") or True
         )
         self.nav.follow_for = Mock(
             side_effect=lambda *args, **kwargs:
