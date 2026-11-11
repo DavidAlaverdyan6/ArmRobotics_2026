@@ -13,7 +13,7 @@ from navigation_core import FreshFrames
 from stm32_reset import STM32_RESET_GPIO, reset_stm32
 from sensors.vl53l0x_sensor import VL53L0XSensor
 
-PROGRAM_BUILD = "gripper-full-range-fire-advance-2026-11-10.32"
+PROGRAM_BUILD = "button-arm-port-from-differential-2026-11-11"
 
 # Previously tested differential2 line-following speeds.
 SERIAL_PORT = "/dev/serial0"
@@ -90,15 +90,21 @@ TURN_90_FORWARD_TIME = 0.5
 TURN_TOLERANCE_DEG = 8.0
 TURN_CORRECTION_START_DEG = 4.0
 
-BUTTON_BUMPER_START_CM = 20.0
-BUTTON_BUMPER_START_TOLERANCE_CM = 1.0
-BUTTON_BUMPER_RAM_SECONDS = 1.0
-BUTTON_BUMPER_APPROACH_TIMEOUT = 18.0
-BUTTON_BUMPER_SPEED = 180
-BUTTON_BUMPER_STATUS_SECONDS = 0.25
+# Ported arm-button target from Differential/main_ggs_interactive.py.
+# Distance is the existing VL53L0XSensor.read_distance_mm() convention.
+BUTTON_DISTANCE_CM = 21.0
+BUTTON_DISTANCE_TOLERANCE_CM = 1.0
+BUTTON_CENTER_TOLERANCE = 0.6
+BUTTON_ADJUST_SPEED = 70
+BUTTON_ADJUST_SECONDS = 0.08
+BUTTON_SETTLE_SECONDS = 0.20
+BUTTON_MAX_TIME = 18.0
+BUTTON_CONFIRM = 3
+BUTTON_X_MM = 350.0
+BUTTON_Y_MM = 0.0
+BUTTON_Z_MM = -80.0
 BUTTON_RETURN_JUNCTION_DELAY = 0.5
 BUTTON_DEPART_SECONDS = 0.4
-BUTTON_FORWARD_MIN_PWM = 40
 
 # Charging: 9 s red blink, then 2 s solid green; total 11 s before R.
 CHARGE_SECONDS = 11.0
@@ -837,93 +843,125 @@ def button_depart_and_check_line(calibration):
     return True
 
 
-def button_safe_forward_drive(state):
-    """Approach the button with both wheels forward, even on an edge line."""
-    correction = max(
-        -(MANEUVER_SPEED - BUTTON_FORWARD_MIN_PWM),
-        min(
-            MANEUVER_SPEED - BUTTON_FORWARD_MIN_PWM,
-            line_follower.steering_correction(state["position"]),
-        ),
+def button_position_ready(state, distance_cm):
+    """Verify line centering and target range before allowing arm movement."""
+    position = state["position"]
+    if position is None or not math.isfinite(distance_cm) or distance_cm <= 0:
+        return False
+    values = state["normalized"]
+    return (
+        BUTTON_DISTANCE_CM - BUTTON_DISTANCE_TOLERANCE_CM
+        <= distance_cm <= BUTTON_DISTANCE_CM + BUTTON_DISTANCE_TOLERANCE_CM
+        and abs(position - TARGET_POSITION) <= BUTTON_CENTER_TOLERANCE
+        and len(values) >= 8
+        and max(values[2:6]) >= START_CENTER_BLACK_MIN
+        and max(values[0], values[7]) <= START_OUTER_BLACK_MAX
     )
-    left = min(MANEUVER_MAX_SPEED, MANEUVER_SPEED + correction)
-    right = min(MANEUVER_MAX_SPEED, MANEUVER_SPEED - correction)
-    motors.set_speeds(round(left), round(right))
 
 
-def button_bumper_approach(calibration, sensor):
-    """Use the chassis bumper to press the button; the arm never moves."""
-    deadline = time.monotonic() + BUTTON_BUMPER_APPROACH_TIMEOUT
-    ram_started = False
-    ram_deadline = None
-    last_status = 0.0
+def button_approach(calibration, sensor):
+    """Approach and verify 21 cm alignment from Differential before pressing.
+
+    Fail safely on overshoot instead of attempting an uncalibrated reverse
+    correction with the line tracker trailing the drive axle.
+    """
+    deadline = time.monotonic() + BUTTON_MAX_TIME
+    ready_count = 0
+    missing_since = None
 
     try:
         while time.monotonic() < deadline:
-            distance_cm = sensor.read_distance_mm() / 10.0
-            if not math.isfinite(distance_cm):
-                print("\nBUTTON: invalid distance reading; stopping.")
+            state = line_tracker.update(calibration)
+            distance_mm = sensor.read_distance_mm()
+            distance_cm = float(distance_mm) / 10.0
+            if not math.isfinite(distance_cm) or distance_cm <= 0:
+                print("\\nBUTTON: invalid distance; arm disabled.")
                 return False
 
-            state = line_tracker.update(calibration)
-            if not ram_started:
-                # Begin the bounded 180-PWM bumper run at 20 ± 1 cm.
-                if distance_cm <= (
-                    BUTTON_BUMPER_START_CM + BUTTON_BUMPER_START_TOLERANCE_CM
-                ):
-                    ram_started = True
-                    ram_deadline = (
-                        time.monotonic() + BUTTON_BUMPER_RAM_SECONDS
-                    )
-                    print(
-                        f"\nBUTTON: {distance_cm:.1f} cm; "
-                        f"starting {BUTTON_BUMPER_RAM_SECONDS:g}-second "
-                        f"bumper press at PWM {BUTTON_BUMPER_SPEED}."
-                    )
-                elif state["position"] is None:
-                    stop()
-                    time.sleep(LOOP_DELAY)
-                    continue
-                else:
-                    button_safe_forward_drive(state)
-                    time.sleep(LOOP_DELAY)
-                    continue
-
-            if time.monotonic() >= ram_deadline:
-                stop()
-                print(
-                    f"\nBUTTON: bumper run complete; final distance "
-                    f"{distance_cm:.1f} cm. Returning to junction."
-                )
-                return True
-
-            now = time.monotonic()
-            if now - last_status >= BUTTON_BUMPER_STATUS_SECONDS:
-                print(
-                    f"\rBUTTON RAM distance={distance_cm:.1f} cm",
-                    end="",
-                    flush=True,
-                )
-                last_status = now
             if state["position"] is None:
-                # Continue straight only during the bounded bumper press.
-                line_follower.drive_straight(
-                    speed=BUTTON_BUMPER_SPEED,
-                    max_speed=BUTTON_BUMPER_SPEED,
-                )
-            else:
+                stop()
+                ready_count = 0
+                if missing_since is None:
+                    missing_since = time.monotonic()
+                elif time.monotonic() - missing_since >= 0.5:
+                    print("\\nBUTTON: line lost during approach.")
+                    return False
+                time.sleep(LOOP_DELAY)
+                continue
+            missing_since = None
+
+            if distance_cm < BUTTON_DISTANCE_CM - BUTTON_DISTANCE_TOLERANCE_CM:
+                print("\\nBUTTON: target overshot; stop and reposition manually.")
+                return False
+
+            if distance_cm > BUTTON_DISTANCE_CM + BUTTON_DISTANCE_TOLERANCE_CM:
+                ready_count = 0
                 differential_drive(
-                    state,
-                    speed=BUTTON_BUMPER_SPEED,
-                    max_speed=BUTTON_BUMPER_SPEED,
+                    state, speed=MANEUVER_SPEED,
+                    max_speed=MANEUVER_MAX_SPEED,
                 )
+                time.sleep(LOOP_DELAY)
+                continue
+
+            stop()
+            time.sleep(BUTTON_SETTLE_SECONDS)
+            state = line_tracker.update(calibration)
+            distance_cm = float(sensor.read_distance_mm()) / 10.0
+            if not math.isfinite(distance_cm) or distance_cm <= 0:
+                print("\\nBUTTON: invalid stopped distance; arm disabled.")
+                return False
+
+            if button_position_ready(state, distance_cm):
+                ready_count += 1
+                if ready_count >= BUTTON_CONFIRM:
+                    print(
+                        f"\\nBUTTON: confirmed at {distance_cm:.1f} cm, "
+                        f"line {state['position']:+.3f}; arm enabled."
+                    )
+                    return True
+            else:
+                ready_count = 0
+                if distance_cm < BUTTON_DISTANCE_CM - BUTTON_DISTANCE_TOLERANCE_CM:
+                    print("\\nBUTTON: overshot after settling; arm disabled.")
+                    return False
+                if state["position"] is None:
+                    print("\\nBUTTON: line missing while stopped; arm disabled.")
+                    return False
+                # Limited forward correction if range is still safe.
+                if distance_cm > BUTTON_DISTANCE_CM:
+                    differential_drive(
+                        state, speed=BUTTON_ADJUST_SPEED,
+                        max_speed=BUTTON_ADJUST_SPEED + 40,
+                    )
+                    time.sleep(BUTTON_ADJUST_SECONDS)
+                    stop()
+
             time.sleep(LOOP_DELAY)
 
-        print("\nBUTTON: bumper approach timeout.")
+        print("\\nBUTTON: alignment timeout; arm disabled.")
         return False
     finally:
         stop()
 
+
+def button_arm_action(board):
+    """Use the existing calibrated two-stage arm IK, then fold home."""
+    from button_arm import move_to_xyz_and_home
+
+    stop()
+    try:
+        print(
+            f"\\nBUTTON: arm press XYZ=({BUTTON_X_MM:g}, "
+            f"{BUTTON_Y_MM:g}, {BUTTON_Z_MM:g}) mm."
+        )
+        return bool(move_to_xyz_and_home(
+            board, BUTTON_X_MM, BUTTON_Y_MM, BUTTON_Z_MM
+        ))
+    except Exception as exc:
+        print(f"\\nBUTTON: arm failure: {exc}; inspect arm before restarting.")
+        return False
+    finally:
+        stop()
 
 
 def button_return(
@@ -1073,7 +1111,11 @@ def button_task(calibration, detector, sensor, bus, offset, board):
     if not reacquire_line(calibration):
         return False
 
-    if not button_bumper_approach(calibration, sensor):
+    if not button_approach(calibration, sensor):
+        return False
+
+    # Motors remain stopped throughout the arm movement.
+    if not button_arm_action(board):
         return False
 
     if not button_return(
