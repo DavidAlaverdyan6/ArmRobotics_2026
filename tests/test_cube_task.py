@@ -47,9 +47,10 @@ class CubeTests(unittest.TestCase):
             "R90", "arm", "transport", "fold",
             "reverse", "R90", "reacquire",
         ])
-        self.assertEqual(n.pivot_90.call_args_list[0].args, (None, 12.0, "R"))
-        self.assertEqual(n.pivot_90.call_count, 2)
-        n.turn_90.assert_not_called()
+        n.pivot_90.assert_not_called()
+        self.assertEqual(n.turn_90.call_count, 2)
+        self.assertEqual(n.turn_90.call_args_list[0].args, (None, None, 12.0, "R"))
+        self.assertEqual(n.turn_90.call_args_list[1].args, (None, None, 12.0, "R"))
 
     def test_button_return_final_r90_skips_alignment(self):
         n = self.nav
@@ -59,8 +60,9 @@ class CubeTests(unittest.TestCase):
         n.button_bumper_approach = Mock(return_value=True)
         n.button_return = Mock(return_value=True)
         self.assertTrue(n.button_task("cal", Mock(), Mock(), "bus", 0.1, Mock()))
-        n.turn_90.assert_called_once_with("cal", "bus", 0.1, "L")
-        n.pivot_90.assert_called_once_with("bus", 0.1, "R")
+        self.assertEqual(n.turn_90.call_args_list[0].args, ("cal", "bus", 0.1, "L"))
+        self.assertEqual(n.turn_90.call_args_list[1].args, ("cal", "bus", 0.1, "R"))
+        n.pivot_90.assert_not_called()
 
     def test_turn_pwm_is_constant_and_ignores_line_sensors(self):
         n = self.nav
@@ -104,25 +106,13 @@ class CubeTests(unittest.TestCase):
         n.line_tracker.all_channels_fresh.assert_not_called()
         n.line_tracker.update.assert_not_called()
 
-    def test_turn90_wrapper_keeps_alignment_before_gyro_turn(self):
+    def test_all_shared_turns_pivot_without_alignment(self):
         n = self.nav
-        events = []
-        n.align_to_crossbar_center = Mock(
-            side_effect=lambda calibration: events.append("calibrated_drive") or True
-        )
-        n.pivot_90 = Mock(
-            side_effect=lambda *args, **kwargs: events.append("turn") or (True,-1)
-        )
-        self.assertEqual(n.turn_90("calibration", "bus", 1.0, "R"), (True,-1))
-        self.assertEqual(events, ["calibrated_drive", "turn"])
-        self.assertNotIn("calibration", n.pivot_90.call_args.kwargs)
-
-    def test_turn90_alignment_failure_prevents_rotation(self):
-        n = self.nav
-        n.align_to_crossbar_center = Mock(return_value=False)
-        n.pivot_90 = Mock()
-        self.assertEqual(n.turn_90(None, "bus", 1.0, "L"), (False,None))
-        n.pivot_90.assert_not_called()
+        n.pivot_90 = Mock(return_value=(True, 1))
+        self.assertEqual(n.turn_90("cal", "bus", 0.2, "R"), (True, 1))
+        n.pivot_90.assert_called_with("bus", 0.2, "R", slow=False)
+        self.assertEqual(n.turn_90("cal", "bus", 0.2, "L"), (True, 1))
+        n.pivot_90.assert_called_with("bus", 0.2, "L", slow=False)
 
     def test_stop_sends_real_zero_pwm(self):
         n = self.nav

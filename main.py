@@ -13,7 +13,6 @@ import line_tracker
 import motors
 from forward_line_pid import ForwardLinePID
 from navigation_core import FreshFrames
-from turn_alignment import align_to_crossbar_center
 from stm32_reset import STM32_RESET_GPIO, reset_stm32
 from sensors.vl53l0x_sensor import VL53L0XSensor
 
@@ -665,12 +664,12 @@ def pivot_90(
 
 
 def turn_90(calibration, bus, offset, direction, *, slow=False):
-    """Shared R90/L90: calibrated junction approach, then pure gyro 90 degrees."""
-    if not align_to_crossbar_center(calibration):
-        return False, None
-    return pivot_90(
-        bus, offset, direction, slow=slow,
-    )
+    """Single shared R90/L90: turn in place by gyro, with NO forward approach.
+
+    All tasks and explicit R90/L90 route commands use this exact operation.
+    Calibration argument is retained for compatibility with existing callers.
+    """
+    return pivot_90(bus, offset, direction, slow=slow)
 
 
 def reverse_for_short_turn(seconds, speed):
@@ -1084,8 +1083,8 @@ def button_task(calibration, detector, sensor, bus, offset, board):
     ):
         return False
 
-    print("\nB: direct gyro R90, no forward alignment.")
-    ok, _ = pivot_90(bus, offset, "R")
+    print("\nBUTTON: final shared R90.")
+    ok, _ = turn_90(calibration, bus, offset, "R")
     return ok and reacquire_line(calibration, recover_after_line_loss=True)
 
 
@@ -1374,8 +1373,8 @@ def cube1_task(calibration, detector, bus, offset, board, distance_sensor):
     indicator = None
     stop()
     try:
-        print("\nCUBE1: initial R90 directly by gyro (no forward approach).")
-        ok, left_sign = pivot_90(bus, offset, "R")
+        print("\nCUBE1: initial shared R90.")
+        ok, left_sign = turn_90(calibration, bus, offset, "R")
         if not ok or left_sign is None:
             print("\nCUBE1: initial R90 failed.")
             return False
@@ -1405,8 +1404,8 @@ def cube1_task(calibration, detector, bus, offset, board, distance_sensor):
             label="CUBE1", accept_s8_only=True, line_loss_timeout=None,
         ):
             return False
-        print("\nCUBE1: final gyro R90 without forward alignment.")
-        ok, _ = pivot_90(bus, offset, "R")
+        print("\nCUBE1: final shared R90.")
+        ok, _ = turn_90(calibration, bus, offset, "R")
         return ok and reacquire_line(calibration, recover_after_line_loss=True)
     finally:
         stop()
@@ -1494,8 +1493,8 @@ def firefighter_task(
         pose = {**START_ANGLES, **firefighting_pose()}
         fire.initialize()
         fire.wait_for_sample()
-        print("\nF: turn LEFT.")
-        ok, left_sign = pivot(bus, offset, "L")
+        print("\nF: initial shared L90.")
+        ok, left_sign = turn_90(calibration, bus, offset, "L")
         if not ok or left_sign is None:
             return False
 
@@ -1602,8 +1601,8 @@ def firefighter_task(
             line_loss_timeout=None,
         ):
             return False
-        print("\nF: execute direct gyro R90 without forward alignment.")
-        ok, _ = pivot_90(bus, offset, "R")
+        print("\nF: final shared R90.")
+        ok, _ = turn_90(calibration, bus, offset, "R")
         return ok and reacquire_line(calibration, recover_after_line_loss=True)
     finally:
         try:
@@ -1677,7 +1676,7 @@ def color_marker_task(calibration, board, bus, offset, camera_stream=None):
     stop()
     marker = None
     try:
-        print("\nCOLOR: execute shared R90 with calibrated crossing.")
+        print("\nCOLOR: execute shared R90.")
         ok, _ = turn_90(calibration, bus, offset, "R")
         if not ok or not reacquire_line(calibration, recover_after_line_loss=True):
             return False
@@ -2082,8 +2081,8 @@ def main():
                     elif cmd == "CHARGING":
                         ok = charging_task()
                         if ok:
-                            # Same 80-degree R turn and differential reacquire.
-                            ok, _ = pivot(bus, offset, "R")
+                            # Same shared R90 used throughout tasks.
+                            ok, _ = turn_90(calibration, bus, offset, "R")
                             ok = ok and reacquire_line(calibration)
                     elif cmd in ("L90", "R90", "L90SLOW", "R90SLOW"):
                         slow_turn = cmd in ("L90SLOW", "R90SLOW")
