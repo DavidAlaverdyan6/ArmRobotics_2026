@@ -5,7 +5,7 @@ import math
 import time
 
 from terminal_status import event_print as print, status_line
-from turn_alignment import align_to_crossbar_center
+from junction_drive_config import load as load_junction_drive
 
 import smbus
 from telemetrix import telemetrix
@@ -67,6 +67,11 @@ ROUTE_JUNCTION_CLEAR = 4
 # After any gyro turn, differential2 centers the robot again.
 REACQUIRE_TOLERANCE = 0.65
 REACQUIRE_CONFIRM = 4
+# After a pivot, do NOT apply full-speed PID 255 +/-255: that can stop
+# one wheel while spinning the other. Keep both wheels moving forward.
+REACQUIRE_BASE_PWM = 130
+REACQUIRE_MAX_CORRECTION = 40
+REACQUIRE_MIN_PWM = 80
 ROUTE_TURN_LINE_LOSS_SECONDS = 1.0
 ROUTE_TURN_REVERSE_SPEED = 80
 ROUTE_TURN_REVERSE_CONFIRM = 3
@@ -668,13 +673,27 @@ def pivot_90(
 
 
 def turn_90(calibration, bus, offset, direction, *, slow=False):
-    """Identical L90/R90: find junction trailing edge, calibrated pulse, gyro pivot.
+    """Shared L90/R90: calibrated straight pulse, then 86-degree gyro pivot.
 
-    The forward pulse duration/PWM come from the robot's local junction_drive.json.
-    All tasks use this shared sequence without separate alignment or turn logic.
+    Deliberately do not scan for a crossbar edge. The saved duration/PWM
+    from junction_drive.json are applied immediately at the detected junction.
     """
-    if not align_to_crossbar_center(calibration):
+    try:
+        duration, pwm = load_junction_drive()
+    except ValueError as error:
+        print(f"TURN90: invalid junction drive calibration: {error}")
+        stop()
         return False, None
+    if not line_tracker.all_channels_fresh():
+        print("TURN90: ADC stale before calibrated forward pulse; stopped.")
+        stop()
+        return False, None
+    print(f"TURN90 {direction}: forward {duration:.3f}s PWM {pwm}, then gyro {TURN_90_ANGLE:g} degrees.")
+    try:
+        motors.set_speeds(pwm, pwm)
+        time.sleep(duration)
+    finally:
+        stop()
     return pivot_90(bus, offset, direction, slow=slow)
 
 
@@ -736,8 +755,19 @@ def reverse_to_line_on_route(calibration, freshness):
         stop()
 
 
+def reacquire_pwm(position):
+    """Low-speed forward recentering: both wheels stay >=80 PWM."""
+    correction = max(
+        -REACQUIRE_MAX_CORRECTION,
+        min(REACQUIRE_MAX_CORRECTION, 30.0 * (position - TARGET_POSITION)),
+    )
+    left = round(max(REACQUIRE_MIN_PWM, REACQUIRE_BASE_PWM + correction))
+    right = round(max(REACQUIRE_MIN_PWM, REACQUIRE_BASE_PWM - correction))
+    return left, right
+
+
 def reacquire_line(calibration, *, recover_after_line_loss=False):
-    """Use the shared differential2 centering after every turn."""
+    """Gentle post-turn recentering, not full-speed differential2 PID."""
     stable = 0
     lost_since = None
     recovery_attempted = False
@@ -783,11 +813,8 @@ def reacquire_line(calibration, *, recover_after_line_loss=False):
                 stable = 0
             else:
                 lost_since = None
-                differential_drive(
-                    state,
-                    speed=MANEUVER_SPEED,
-                    max_speed=MANEUVER_MAX_SPEED,
-                )
+                left_pwm, right_pwm = reacquire_pwm(position)
+                motors.set_speeds(left_pwm, right_pwm)
                 if abs(position - TARGET_POSITION) <= REACQUIRE_TOLERANCE:
                     stable += 1
                     if stable >= REACQUIRE_CONFIRM:

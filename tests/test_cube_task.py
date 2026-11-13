@@ -107,24 +107,35 @@ class CubeTests(unittest.TestCase):
         n.line_tracker.all_channels_fresh.assert_not_called()
         n.line_tracker.update.assert_not_called()
 
-    def test_all_shared_turns_align_before_gyro_pivot(self):
+    def test_shared_turn_uses_only_saved_pulse_and_gyro(self):
         n = self.nav
-        events = []
-        n.align_to_crossbar_center = Mock(side_effect=lambda c: events.append("align") or True)
-        n.pivot_90 = Mock(side_effect=lambda *a, **kw: events.append("pivot") or (True, 1))
+        n.load_junction_drive = Mock(return_value=(0.5, 80))
+        n.line_tracker.all_channels_fresh = Mock(return_value=True)
+        n.time.sleep = Mock()
+        n.stop = Mock()
+        n.motors.set_speeds = Mock()
+        n.pivot_90 = Mock(return_value=(True, 1))
         self.assertEqual(n.turn_90("cal", "bus", 0.2, "R"), (True, 1))
-        n.pivot_90.assert_called_with("bus", 0.2, "R", slow=False)
         self.assertEqual(n.turn_90("cal", "bus", 0.2, "L"), (True, 1))
-        n.pivot_90.assert_called_with("bus", 0.2, "L", slow=False)
-        self.assertEqual(events, ["align", "pivot", "align", "pivot"])
-        self.assertEqual(n.align_to_crossbar_center.call_args_list[0].args, ("cal",))
+        self.assertEqual(n.motors.set_speeds.call_args_list,
+                         [unittest.mock.call(80, 80)] * 2)
+        self.assertEqual(n.time.sleep.call_args_list,
+                         [unittest.mock.call(0.5)] * 2)
+        self.assertEqual([c.args[2] for c in n.pivot_90.call_args_list], ["R", "L"])
 
-    def test_failed_alignment_prevents_pivot(self):
+    def test_invalid_pulse_calibration_prevents_pivot(self):
         n = self.nav
-        n.align_to_crossbar_center = Mock(return_value=False)
+        n.load_junction_drive = Mock(side_effect=ValueError("missing"))
         n.pivot_90 = Mock()
         self.assertEqual(n.turn_90("cal", "bus", 0.2, "R"), (False, None))
         n.pivot_90.assert_not_called()
+
+    def test_reacquire_never_stops_a_wheel(self):
+        n = self.nav
+        for position in (-3.5, -1.0, 0.0, 1.0, 3.5):
+            left, right = n.reacquire_pwm(position)
+            self.assertGreaterEqual(left, n.REACQUIRE_MIN_PWM)
+            self.assertGreaterEqual(right, n.REACQUIRE_MIN_PWM)
 
     def test_stop_sends_real_zero_pwm(self):
         n = self.nav
