@@ -52,26 +52,27 @@ class CubeTests(unittest.TestCase):
         self.assertEqual(n.turn_90.call_args_list[0].args, (None, None, 12.0, "R"))
         self.assertEqual(n.turn_90.call_args_list[1].args, (None, None, 12.0, "R"))
 
-    def test_button_return_final_r90_skips_alignment(self):
+    def test_button_uses_shared_l90_and_r90_and_3s_line_follow(self):
         n = self.nav
         n.turn_90 = Mock(return_value=(True, -1))
-        n.pivot_90 = Mock(return_value=(True, -1))
         n.reacquire_line = Mock(return_value=True)
-        n.button_bumper_approach = Mock(return_value=True)
+        n.follow_for = Mock(return_value=True)
+        n.button_bumper_approach = Mock(side_effect=AssertionError("old bumper mode invoked"))
         n.button_return = Mock(return_value=True)
         self.assertTrue(n.button_task("cal", Mock(), Mock(), "bus", 0.1, Mock()))
-        self.assertEqual(n.turn_90.call_args_list[0].args, ("cal", "bus", 0.1, "L"))
-        self.assertEqual(n.turn_90.call_args_list[1].args, ("cal", "bus", 0.1, "R"))
-        n.pivot_90.assert_not_called()
+        self.assertEqual([call.args[-1] for call in n.turn_90.call_args_list], ["L", "R"])
+        n.follow_for.assert_called_once_with("cal", 3.0)
+        n.button_bumper_approach.assert_not_called()
 
     def test_turn_pwm_is_constant_and_ignores_line_sensors(self):
         n = self.nav
-        self.assertEqual(n.turn_90_pwm(0, False), n.TURN_PWM_SLOW)
-        self.assertEqual(n.turn_90_pwm(80, True), n.TURN_PWM_SLOW)
+        self.assertEqual(n.turn_90_pwm(0, False), n.TURN_PWM_FAST)
+        self.assertEqual(n.turn_90_pwm(80, True), n.TURN_PWM_FAST)
         self.assertEqual(n.turn_90_pwm(80, True, slow=True), n.SLOW_90_PWM_FAST)
         self.assertEqual(n.turn_90_pwm(0, False, direction="R"), n.TURN_PWM_FAST)
+        self.assertEqual(n.turn_90_pwm(0, False, direction="L"), n.TURN_PWM_FAST)
         self.assertEqual(n.TURN_R90_ANGLE, 86.0)
-        self.assertEqual(n.TURN_90_ANGLE, 90.0)
+        self.assertEqual(n.TURN_90_ANGLE, 86.0)
 
     def test_gyro_turn_r_uses_86_and_faster_pwm(self):
         n = self.nav
@@ -106,13 +107,24 @@ class CubeTests(unittest.TestCase):
         n.line_tracker.all_channels_fresh.assert_not_called()
         n.line_tracker.update.assert_not_called()
 
-    def test_all_shared_turns_pivot_without_alignment(self):
+    def test_all_shared_turns_align_before_gyro_pivot(self):
         n = self.nav
-        n.pivot_90 = Mock(return_value=(True, 1))
+        events = []
+        n.align_to_crossbar_center = Mock(side_effect=lambda c: events.append("align") or True)
+        n.pivot_90 = Mock(side_effect=lambda *a, **kw: events.append("pivot") or (True, 1))
         self.assertEqual(n.turn_90("cal", "bus", 0.2, "R"), (True, 1))
         n.pivot_90.assert_called_with("bus", 0.2, "R", slow=False)
         self.assertEqual(n.turn_90("cal", "bus", 0.2, "L"), (True, 1))
         n.pivot_90.assert_called_with("bus", 0.2, "L", slow=False)
+        self.assertEqual(events, ["align", "pivot", "align", "pivot"])
+        self.assertEqual(n.align_to_crossbar_center.call_args_list[0].args, ("cal",))
+
+    def test_failed_alignment_prevents_pivot(self):
+        n = self.nav
+        n.align_to_crossbar_center = Mock(return_value=False)
+        n.pivot_90 = Mock()
+        self.assertEqual(n.turn_90("cal", "bus", 0.2, "R"), (False, None))
+        n.pivot_90.assert_not_called()
 
     def test_stop_sends_real_zero_pwm(self):
         n = self.nav

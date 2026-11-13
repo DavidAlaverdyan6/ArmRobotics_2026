@@ -5,6 +5,7 @@ import math
 import time
 
 from terminal_status import event_print as print, status_line
+from turn_alignment import align_to_crossbar_center
 
 import smbus
 from telemetrix import telemetrix
@@ -84,8 +85,8 @@ GYRO_DIRECTION_CONFIRM_SAMPLES = 3
 GYRO_REVERSE_CONFIRM_SECONDS = 0.05
 PIVOT_SETTLE_SECONDS = 0.1
 TURN_ANGLE = 75.0
-TURN_90_ANGLE = 90.0  # L90 remains unchanged
-TURN_R90_ANGLE = 86.0  # R90 target; verify physically at the faster PWM
+TURN_90_ANGLE = 86.0  # Common calibrated gyro target for L90 and R90
+TURN_R90_ANGLE = TURN_90_ANGLE  # Backwards-compatible name; never diverge
 TURN_PWM_FAST = 180
 TURN_PWM_SLOW = 150
 TURN_PWM_EDGE = 100
@@ -567,10 +568,8 @@ def pivot(bus, offset, direction, angle_target=TURN_ANGLE):
 
 
 def turn_90_pwm(angle, side_seen, slow=False, direction="L"):
-    """Fixed PWM: faster R90, original L90, explicitly slow turns unchanged."""
-    if slow:
-        return SLOW_90_PWM_FAST
-    return TURN_PWM_FAST if direction == "R" else TURN_PWM_SLOW
+    """Identical gyro pivot speed in either direction; no intermediate steps."""
+    return SLOW_90_PWM_FAST if slow else TURN_PWM_FAST
 
 
 def pivot_90(
@@ -589,7 +588,7 @@ def pivot_90(
     if direction not in ("L", "R"):
         raise ValueError("Turn direction must be L or R")
     if angle_target is None:
-        angle_target = TURN_R90_ANGLE if direction == "R" else TURN_90_ANGLE
+        angle_target = TURN_90_ANGLE
     stop()
     left = direction == "L"
     start = previous = time.monotonic()
@@ -669,11 +668,13 @@ def pivot_90(
 
 
 def turn_90(calibration, bus, offset, direction, *, slow=False):
-    """Single shared R90/L90: turn in place by gyro, with NO forward approach.
+    """Identical L90/R90: find junction trailing edge, calibrated pulse, gyro pivot.
 
-    All tasks and explicit R90/L90 route commands use this exact operation.
-    Calibration argument is retained for compatibility with existing callers.
+    The forward pulse duration/PWM come from the robot's local junction_drive.json.
+    All tasks use this shared sequence without separate alignment or turn logic.
     """
+    if not align_to_crossbar_center(calibration):
+        return False, None
     return pivot_90(bus, offset, direction, slow=slow)
 
 
@@ -1066,16 +1067,15 @@ def button_return(
 
 
 def button_task(calibration, detector, sensor, bus, offset, board):
+    """L90, follow line for 3 seconds, reverse to starting junction, R90."""
     print("\nBUTTON: execute shared L90.")
     ok, left_sign = turn_90(calibration, bus, offset, "L")
     if not ok or left_sign is None:
         print("\nBUTTON: initial L90/gyro check failed.")
         return False
 
-    if not reacquire_line(calibration):
-        return False
-
-    if not button_bumper_approach(calibration, sensor):
+    print("BUTTON: follow line forward for 3.0 seconds.")
+    if not follow_for(calibration, 3.0):
         return False
 
     if not button_return(
@@ -2065,11 +2065,9 @@ def main():
                         offset = gyro_calibrate(bus)
 
                     if cmd == "BUTTON":
-                        if sensor is None:
-                            sensor = VL53L0XSensor()
-                            sensor.initialize()
+                        # This task is time/line controlled; no distance sensor.
                         ok = button_task(
-                            calibration, detector, sensor, bus, offset, board
+                            calibration, detector, None, bus, offset, board
                         )
                     elif cmd == "FIREFIGHTER":
                         ok = firefighter_task(
@@ -2086,7 +2084,7 @@ def main():
                     elif cmd == "CHARGING":
                         ok = charging_task()
                         if ok:
-                            # Same shared R90 used throughout tasks.
+                            # Same shared R90 with calibrated junction approach.
                             ok, _ = turn_90(calibration, bus, offset, "R")
                             ok = ok and reacquire_line(calibration)
                     elif cmd in ("L90", "R90", "L90SLOW", "R90SLOW"):
