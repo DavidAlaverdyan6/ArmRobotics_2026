@@ -291,6 +291,9 @@ CUBE1_SENSOR_CONFIRM = 3
 CUBE1_LINE_LOSS_CONFIRM = 5
 CUBE1_EMERGENCY_REVERSE_CONFIRM = 3
 CUBE1_EMERGENCY_REVERSE_SPEED = 80
+# After CUBE1 returns to its starting junction, advance before the final R90.
+CUBE1_RETURN_FORWARD_SECONDS = 0.5
+CUBE1_RETURN_FORWARD_PWM = 80
 
 # COLOR: stop, find a stable colored marker, and show that color on the RGB LED.
 
@@ -2269,6 +2272,27 @@ def cube1_emergency_reverse_to_line(calibration):
         stop()
 
 
+def cube1_final_turn_approach():
+    """After reversing to the junction, move forward 0.5s PWM80 before R90.
+
+    No trailing-edge search and no line PID during this short calibrated move.
+    """
+    if not line_tracker.all_channels_fresh():
+        print("\nCUBE1: ADC stale before final forward pulse; stopping.")
+        stop()
+        return False
+    try:
+        print(
+            f"\nCUBE1: return junction found; forward "
+            f"{CUBE1_RETURN_FORWARD_SECONDS:.3f}s PWM {CUBE1_RETURN_FORWARD_PWM}."
+        )
+        motors.set_speeds(CUBE1_RETURN_FORWARD_PWM, CUBE1_RETURN_FORWARD_PWM)
+        time.sleep(CUBE1_RETURN_FORWARD_SECONDS)
+        return True
+    finally:
+        stop()
+
+
 def cube1_task(calibration, detector, bus, offset, board):
 
     """Find and carry CUBE1 with the optical sensor, stopping at junction."""
@@ -2325,7 +2349,25 @@ def cube1_task(calibration, detector, bus, offset, board):
 
         cube_sensor = Firefighter(board)
         cube_sensor.initialize()
-        cube_sensor.wait_for_sample(after=time.monotonic())
+        # This subscription is new, so accepting its first fresh PB0 report
+        # is sufficient. Waiting for a *later* report can time out on an
+        # unchanged analog signal even if the initial report was valid.
+        try:
+            cube_sensor.wait_for_sample()
+        except TimeoutError:
+            stop()
+            print("\nCUBE1: PB0 reported no fresh ADC data; resubscribing once.")
+            cube_sensor.initialize()
+            try:
+                cube_sensor.wait_for_sample()
+            except TimeoutError:
+                stop()
+                print(
+                    "\nCUBE1: PB0 still has no reports after resubscription. "
+                    "Check PB0 sensor wiring / Telemetrix connection; "
+                    "motors remain stopped."
+                )
+                return False
         indicator = Cube1Signal(cube1_create_indicator())
         status = cube1_transport(calibration, detector, cube_sensor, indicator)
         if status not in ("drop", "drop_line_lost", "emergency"):
@@ -2344,6 +2386,8 @@ def cube1_task(calibration, detector, bus, offset, board):
             label="CUBE1", accept_s8_only=True,
             max_return_time=None, line_loss_timeout=None,
         ):
+            return False
+        if not cube1_final_turn_approach():
             return False
         print("\nCUBE1: final R90 using main_test.py's existing pivot.")
         ok, _ = pivot_90(

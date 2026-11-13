@@ -45,6 +45,16 @@ class FireTests(unittest.TestCase):
         with patch.object(hardware.time, 'monotonic', return_value=11):
             self.assertIsNone(fire.detected())
 
+    def test_analog_callback_accepts_bound_pb0_report_identifier(self):
+        # Telemetrix may report an ADC channel ID rather than PB0=200.
+        # The callback registration already binds the report to this sensor.
+        fire = hardware.Firefighter(Mock())
+        fire._callback([3, 8, 2400])
+        self.assertIsNotNone(fire.sample)
+        self.assertEqual(fire.sample[0], 2400)
+        fire._callback([3, 8, 5000])
+        self.assertEqual(fire.sample[0], 2400)
+
     def test_water_duration_and_interrupt(self):
         for error in (None, KeyboardInterrupt()):
             board = Mock()

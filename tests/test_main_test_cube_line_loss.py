@@ -88,6 +88,23 @@ class CubeLineLossTests(unittest.TestCase):
             )
         self.assertEqual(result, "drop")
 
+    def test_final_turn_approach_uses_0_5_seconds_pwm80(self):
+        nav = self.nav
+        nav.motors.set_speeds = Mock()
+        nav.stop = Mock()
+        with patch.object(nav.time, "sleep") as sleep:
+            self.assertTrue(nav.cube1_final_turn_approach())
+        nav.motors.set_speeds.assert_called_once_with(80, 80)
+        sleep.assert_called_once_with(0.5)
+        nav.stop.assert_called_once()
+
+    def test_no_forward_pulse_with_stale_adc(self):
+        nav = self.nav
+        nav.line_tracker.all_channels_fresh.return_value = False
+        nav.motors.set_speeds = Mock()
+        self.assertFalse(nav.cube1_final_turn_approach())
+        nav.motors.set_speeds.assert_not_called()
+
     def test_completed_line_loss_reverses_then_finishes_existing_r90(self):
         nav = self.nav
         order = []
@@ -104,6 +121,9 @@ class CubeLineLossTests(unittest.TestCase):
             side_effect=lambda *args, **kwargs: order.append("return") or True
         )
         nav.cube1_create_indicator = Mock(return_value=Mock())
+        nav.cube1_final_turn_approach = Mock(
+            side_effect=lambda: order.append("forward_0.5_pwm80") or True
+        )
         with patch.dict(sys.modules, {
             "firefighter": types.SimpleNamespace(
                 Firefighter=Mock(return_value=Mock())
@@ -111,7 +131,7 @@ class CubeLineLossTests(unittest.TestCase):
         }):
             self.assertTrue(nav.cube1_task(None, Mock(), Mock(), 0, Mock()))
         self.assertEqual(
-            order, ["pivot", "fold", "find_line", "return", "pivot"],
+            order, ["pivot", "fold", "find_line", "return", "forward_0.5_pwm80", "pivot"],
         )
         self.assertEqual(nav.pivot_90.call_count, 2)
         nav.button_return.assert_called_once()

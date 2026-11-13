@@ -88,9 +88,13 @@ class Firefighter:
         )
 
     def _callback(self, data):
+        # Telemetrix dispatches this callback for the subscribed PB0 channel.
+        # Its report data[1] is not guaranteed to equal the STM32duino pin
+        # constant (PB0 == 200); checking it discarded valid ADC reports.
+        # Match line_tracker._make_callback: validate the ADC value only.
         try:
             value = int(data[2])
-            if data[1] == pins.fire_sensor and 0 <= value <= 4095:
+            if 0 <= value <= 4095:
                 self.sample = (value, time.monotonic())
         except (IndexError, TypeError, ValueError):
             pass
