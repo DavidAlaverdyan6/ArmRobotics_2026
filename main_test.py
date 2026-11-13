@@ -2910,8 +2910,8 @@ def button_bounce_red_centered(objects, width, height):
     )
 
 
-def button_bounce_find_red():
-    """Advance at PWM130 while watching fresh camera frames for centered red."""
+def button_bounce_find_red(calibration):
+    """Follow the line at base PWM130 while watching for centered red."""
     import cv2
     from color_marker_detector import ContinuousCamera, ColorMarkerDetector
 
@@ -2927,14 +2927,29 @@ def button_bounce_find_red():
         confirmed = 0
         deadline = time.monotonic() + BUTTON_BOUNCE_SEARCH_TIMEOUT
         camera.start_task("BUTTON_BOUNCE: searching centered red")
+        last_frame_at = time.monotonic()
         while time.monotonic() < deadline:
             if not line_tracker.all_channels_fresh():
                 print("\nBUTTON_BOUNCE: stale ADC; stopping.")
                 return False
-            captured = camera.get_frame(after_sequence=sequence, timeout=0.3)
+            # Correct steering every loop, not only when camera FPS permits.
+            state = line_tracker.update(calibration)
+            if state["position"] is None:
+                stop()
+                print("BUTTON_BOUNCE: line lost; stopping.")
+                return False
+            captured = camera.get_frame(after_sequence=sequence, timeout=0.01)
             if captured is None:
-                stop()  # Never drive on a frozen camera stream.
+                if time.monotonic() - last_frame_at > 0.5:
+                    stop()
+                    print("BUTTON_BOUNCE: camera stalled; stopping.")
+                    return False
+                differential_drive(
+                    state, speed=BUTTON_BOUNCE_DRIVE_PWM, max_speed=MAX_SPEED
+                )
+                time.sleep(LOOP_DELAY)
                 continue
+            last_frame_at = time.monotonic()
             sequence, frame = captured
             objects, annotated, _ = color_detector.process_frame(frame)
             height, width = frame.shape[:2]
@@ -2956,7 +2971,10 @@ def button_bounce_find_red():
                 stop()
                 print("\nBUTTON_BOUNCE: centered red confirmed.")
                 return True
-            motors.set_speeds(BUTTON_BOUNCE_DRIVE_PWM, BUTTON_BOUNCE_DRIVE_PWM)
+            differential_drive(
+                state, speed=BUTTON_BOUNCE_DRIVE_PWM, max_speed=MAX_SPEED
+            )
+            time.sleep(LOOP_DELAY)
         print("\nBUTTON_BOUNCE: camera search timeout.")
         return False
     finally:
@@ -2975,7 +2993,7 @@ def button_bounce_task(calibration, detector, bus, offset, board):
             return False
         if not button_bounce_arm_pose(board, BUTTON_BOUNCE_START):
             return False
-        if not button_bounce_find_red():
+        if not button_bounce_find_red(calibration):
             return False
         indicator = create_robot_rgb_indicator()
         indicator.red()
