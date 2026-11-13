@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Standalone 8-channel line-following PID test for Post Integral.
 
-The competition main_test.py uses line_tracker.LineTrackingEngine separately.
+The competition main.py uses forward_line_pid.ForwardLinePID with the same
+simple_pid settings. The standalone test remains independently runnable.
 Only use this standalone test with the robot in a safe, clear test area.
 """
 

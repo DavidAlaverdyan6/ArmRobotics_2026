@@ -20,7 +20,7 @@ def load_navigation():
     with patch.dict(sys.modules, stubs):
         spec = importlib.util.spec_from_file_location(
             "button_bumper_navigation",
-            Path(__file__).resolve().parents[1] / "main_test.py",
+            Path(__file__).resolve().parents[1] / "main.py",
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -192,7 +192,7 @@ class ButtonBumperTests(unittest.TestCase):
         }
         self.assertTrue(detector.read(black_side)[2])
 
-    def test_reacquire_matches_mainv2_differential_centering(self):
+    def test_reacquire_matches_main_differential_centering(self):
         nav = self.nav
         clock = [0.0]
         nav.stop = Mock()

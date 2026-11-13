@@ -3,7 +3,7 @@
 import unittest
 from unittest.mock import Mock, patch
 
-from test_cube_task import load_main_test
+from test_cube_task import load_main
 
 
 class StaticHeading:
@@ -17,7 +17,7 @@ class StaticHeading:
 
 class ReverseLineControllerTests(unittest.TestCase):
     def setUp(self):
-        self.nav = load_main_test()
+        self.nav = load_main()
         self.nav.motors.set_speeds = Mock()
 
     def test_line_correction_brakes_only_one_reverse_wheel(self):

@@ -4,6 +4,7 @@ import time
 from telemetrix import telemetrix
 import line_tracker
 from stm32_reset import STM32_RESET_GPIO, reset_stm32
+from junction_drive_config import save as save_junction_drive, validate as validate_junction_drive
 
 
 SERIAL_PORT = "/dev/serial0"
@@ -38,43 +39,58 @@ def main():
         # Wait for sensor readings
         time.sleep(1)
 
-        # Check existing calibration
+        # Sensor calibration can be skipped without skipping drive setup.
         existing = line_tracker.load_calibration()
-
+        recalibrate = existing is None
         if existing is not None:
             print("\nExisting calibration found.")
+            answer = input("Recalibrate sensors? [y/N]: ").strip().lower()
+            recalibrate = answer in ("y", "yes")
+            if not recalibrate:
+                print("Keeping existing WHITE/GRAY/BLACK calibration.")
 
-            answer = input(
-                "Recalibrate sensors? [y/N]: "
-            ).strip().lower()
+        if recalibrate:
+            print("\nCalibration instructions:")
+            print("1. Place ALL 8 sensors over a WHITE surface.")
+            print("2. Keep the sensors still and press ENTER.")
+            print("3. Place ALL 8 sensors over the GRAY line/surface.")
+            print("4. Keep the sensors still and press ENTER.")
+            print("5. Place ALL 8 sensors over a BLACK line/surface.")
+            print("6. Keep the sensors still and press ENTER.")
+            print("\nDo not move the sensors while sampling.")
 
-            if answer not in ("y", "yes"):
-                print("Keeping existing calibration.")
-                return
+            # Perform and save calibration
+            calibration = line_tracker.calibrate()
 
-        print("\nCalibration instructions:")
-        print("1. Place ALL 8 sensors over a WHITE surface.")
-        print("2. Keep the sensors still and press ENTER.")
-        print("3. Place ALL 8 sensors over the GRAY line/surface.")
-        print("4. Keep the sensors still and press ENTER.")
-        print("5. Place ALL 8 sensors over a BLACK line/surface.")
-        print("6. Keep the sensors still and press ENTER.")
-        print("\nDo not move the sensors while sampling.")
+            print("\nCalibration completed successfully!")
+            print("White values:", calibration["white"])
+            print("Gray values:", calibration["gray"])
+            print("Black values:", calibration["black"])
 
-        # Perform and save calibration
-        calibration = line_tracker.calibrate()
+            print(
+                "\nCalibration file:",
+                line_tracker.CALIBRATION_FILE
+            )
 
-        print("\nCalibration completed successfully!")
-        print("White values:", calibration["white"])
-        print("Gray values:", calibration["gray"])
-        print("Black values:", calibration["black"])
+            print("Sensors calibrated. Next: junction drive configuration.")
+        print("\nJUNCTION ALIGNMENT: after the trailing edge of the crossing,")
+        print("the robot moves forward for this fixed time at this PWM.")
+        print("Enter values you have already measured on the real robot.")
+        while True:
+            try:
+                seconds_text = input("Forward time, seconds (0.01..2): ").strip()
+                pwm_text = input("Forward motor PWM (70..255): ").strip()
+                seconds, pwm = validate_junction_drive(
+                    seconds_text.replace(",", "."), pwm_text
+                )
+            except ValueError as error:
+                print(f"Invalid junction drive settings: {error}")
+                continue
+            save_junction_drive(seconds, pwm)
+            print(f"Saved junction drive: {seconds:g} s, PWM {pwm}.")
+            print("main.py reads these settings automatically on every L90/R90.")
+            break
 
-        print(
-            "\nCalibration file:",
-            line_tracker.CALIBRATION_FILE
-        )
-
-        print("You can now run line_follow.py.")
 
     except KeyboardInterrupt:
         print("\nCalibration cancelled.")

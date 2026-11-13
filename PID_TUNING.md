@@ -1,8 +1,8 @@
 # Tuning the standalone eight-sensor PID line follower
 
-This guide is for `python differential2.py` **only**. The competition
-`main_test.py` still uses `line_tracker.LineTrackingEngine` (PD steering);
-tuning the values below does **not** change the competition controller.
+The standalone test is `python differential2.py`. The competition
+`main.py` now uses the same `simple_pid` mathematics through
+`forward_line_pid.py` at base PWM 255. Both modules have their own gain constants.
 
 ## Install
 

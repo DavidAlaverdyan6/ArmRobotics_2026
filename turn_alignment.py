@@ -5,13 +5,12 @@ physical course. Fail closed if sensor frames or calibration are unavailable.
 """
 import math
 import time
-from pathlib import Path
 
 import line_tracker
 import motors
-from navigation_core import FreshFrames, MotionCalibration
+from navigation_core import FreshFrames
+from junction_drive_config import load as load_junction_drive
 
-ALIGN_PWM = 80
 EDGE_DRIVE_TIMEOUT_S = 3.0
 EDGE_POLL_S = 0.02
 EDGE_EXIT_CONFIRM_FRAMES = 4
@@ -30,14 +29,16 @@ def align_to_crossbar_center(calibration):
     """From a confirmed junction, move until trailing edge, then pulse 55 mm.
 
     Returns False (with motor stop) on any sensor, calibration or timing error.
-    The 55-mm model is measured from REST to REST; subsequent coasting at edge
-    can shift the axle and must be independently verified physically.
+    The fixed-duration pulse is configured by calibrate.py from a measured run.
+    Stopping drift at the trailing edge still requires physical validation.
     """
-    profile_path = Path(__file__).with_name('motion_calibration.json')
-    profile = MotionCalibration.load(profile_path)
-    duration = profile.duration_after_trailing_edge(ALIGN_PWM)
-    if duration is None or not math.isfinite(duration) or not 0 < duration <= MAX_PULSE_S:
-        print('ALIGN: no valid PWM 80 motion_calibration.json profile; refuse 90-degree turn.')
+    try:
+        duration, pwm = load_junction_drive()
+    except ValueError as error:
+        print(f"ALIGN: {error}; motors stay stopped.")
+        motors.motor_stop()
+        return False
+    if not math.isfinite(duration) or not 0 < duration <= MAX_PULSE_S:
         motors.motor_stop()
         return False
     fresh = FreshFrames()
@@ -69,14 +70,14 @@ def align_to_crossbar_center(calibration):
                 motors.motor_stop()
                 time.sleep(.1)
                 break
-            motors.set_speeds(ALIGN_PWM,ALIGN_PWM)
+            motors.set_speeds(pwm,pwm)
             time.sleep(EDGE_POLL_S)
         else:
             print('ALIGN: junction trailing edge not confirmed within timeout.')
             return False
-        print(f'ALIGN: trailing edge confirmed; moving {duration:.3f}s at PWM {ALIGN_PWM}.')
+        print(f'ALIGN: trailing edge confirmed; moving {duration:.3f}s at PWM {pwm}.')
         start = time.monotonic()
-        motors.set_speeds(ALIGN_PWM,ALIGN_PWM)
+        motors.set_speeds(pwm,pwm)
         remaining = duration-(time.monotonic()-start)
         if remaining>0:
             time.sleep(remaining)

@@ -25,7 +25,7 @@ def load_navigation():
     with patch.dict(sys.modules, stubs):
         import importlib.util
         spec = importlib.util.spec_from_file_location('navigation_test',
-            Path(__file__).resolve().parents[1] / 'main_test.py')
+            Path(__file__).resolve().parents[1] / 'main.py')
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     return module

@@ -11,6 +11,7 @@ import line_tracker
 import motors
 from forward_line_pid import ForwardLinePID
 from navigation_core import FreshFrames
+from turn_alignment import align_to_crossbar_center
 from stm32_reset import STM32_RESET_GPIO, reset_stm32
 from sensors.vl53l0x_sensor import VL53L0XSensor
 
@@ -28,7 +29,7 @@ KI = 0
 KD = 5
 MAX_CORRECTION = 255
 TARGET_POSITION = line_tracker.CENTER_POSITION
-# Task/maneuver timing remains unchanged. Main V2's 25 Hz cadence is used
+# Task/maneuver timing remains unchanged. the 25 Hz cadence is used
 # only by route line-following and post-turn reacquisition below.
 LOOP_DELAY = 0.02
 ROUTE_LOOP_DELAY = 0.04
@@ -757,7 +758,7 @@ def reverse_to_line_on_route(calibration, freshness):
 
 
 def reacquire_line(calibration, *, recover_after_line_loss=False):
-    """Use the proven Main V2 differential2 centering after every turn."""
+    """Use the shared differential2 centering after every turn."""
     deadline = time.monotonic() + REACQUIRE_TIMEOUT
     stable = 0
     lost_since = None
@@ -1099,16 +1100,8 @@ def button_return(
 
 
 def button_task(calibration, detector, sensor, bus, offset, board):
-    print(
-        f"\nBUTTON: drive forward for {TURN_90_FORWARD_TIME:g} seconds "
-        "before L90."
-    )
-    if not follow_for(
-        calibration,
-        TURN_90_FORWARD_TIME,
-        speed=TURN_90_FORWARD_SPEED,
-        max_speed=TURN_90_FORWARD_MAX_SPEED,
-    ):
+    print("\nBUTTON: align axle at junction before L90.")
+    if not align_to_crossbar_center(calibration):
         return False
 
     print("\nBUTTON: execute L90.")
@@ -1135,10 +1128,8 @@ def button_task(calibration, detector, sensor, bus, offset, board):
     ):
         return False
 
-    print(
-        f"\nB: move forward for {RETURN_FORWARD_TIME:g} seconds."
-    )
-    if not follow_for(calibration, RETURN_FORWARD_TIME):
+    print("\nBUTTON: align axle at return junction before R90.")
+    if not align_to_crossbar_center(calibration):
         return False
 
     print("\nB: execute R90.")
@@ -1477,12 +1468,7 @@ def cube1_task(calibration, detector, bus, offset, board, distance_sensor):
     stop()
     try:
         print("\nCUBE1: turn RIGHT until center sensors confirm the new line.")
-        if not follow_for(
-            calibration,
-            TURN_90_FORWARD_TIME,
-            speed=TURN_90_FORWARD_SPEED,
-            max_speed=TURN_90_FORWARD_MAX_SPEED,
-        ):
+        if not align_to_crossbar_center(calibration):
             return False
         ok, left_sign = cube1_turn_to_center_line(
             calibration, bus, offset, distance_sensor
@@ -1541,11 +1527,8 @@ def cube1_task(calibration, detector, bus, offset, board, distance_sensor):
         ):
             return False
 
-        print(
-            f"\nCUBE1: move forward for "
-            f"{RETURN_FORWARD_TIME:g} seconds before final R90."
-        )
-        if not follow_for(calibration, RETURN_FORWARD_TIME):
+        print("\nCUBE1: align axle at return junction before final R90.")
+        if not align_to_crossbar_center(calibration):
             return False
         print(f"\nCUBE1: execute final R90.")
         ok, _ = pivot_90(
@@ -1751,7 +1734,7 @@ def firefighter_task(
             line_loss_timeout=BUTTON_REVERSE_LINE_LOSS_TIMEOUT,
         ):
             return False
-        if not follow_for(calibration, RETURN_FORWARD_TIME):
+        if not align_to_crossbar_center(calibration):
             return False
         print("\nF: execute R90.")
         ok, _ = pivot_90(
@@ -1831,12 +1814,7 @@ def color_marker_task(calibration, board, bus, offset, camera_stream=None):
     marker = None
     try:
         print("\nCOLOR: move forward, then execute internal R90.")
-        ok = follow_for(
-            calibration,
-            TURN_90_FORWARD_TIME,
-            speed=TURN_90_FORWARD_SPEED,
-            max_speed=TURN_90_FORWARD_MAX_SPEED,
-        )
+        ok = align_to_crossbar_center(calibration)
         if ok:
             ok, _ = pivot_90(
                 bus, offset, "R", angle_target=TURN_90_ANGLE
@@ -1907,7 +1885,7 @@ def load_route():
     if not ROUTE:
         raise ValueError(
             "ROUTE is empty. Add your junction commands to the ROUTE list "
-            "in main_test.py before starting main_test.py."
+            "in main.py before starting main.py."
         )
 
     route = []
@@ -1936,7 +1914,7 @@ def main():
 
     try:
         route = load_route()
-        print(f"MAIN_TEST BUILD: {PROGRAM_BUILD}")
+        print(f"MAIN BUILD: {PROGRAM_BUILD}")
         print(f"Automatic ROUTE loaded: {route}")
         print(
             f"Resetting STM32 through Raspberry Pi BCM{STM32_RESET_GPIO}..."
@@ -2167,11 +2145,7 @@ def main():
                             ok = ok and reacquire_line(calibration)
                     elif cmd in ("L90", "R90", "L90SLOW", "R90SLOW"):
                         slow_turn = cmd in ("L90SLOW", "R90SLOW")
-                        ok = follow_for(
-                            calibration, TURN_90_FORWARD_TIME,
-                            speed=TURN_90_FORWARD_SPEED,
-                            max_speed=TURN_90_FORWARD_MAX_SPEED,
-                        )
+                        ok = align_to_crossbar_center(calibration)
                         if ok:
                             ok, _ = pivot_90(
                                 bus,

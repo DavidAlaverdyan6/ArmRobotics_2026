@@ -11,7 +11,7 @@ from unittest.mock import Mock, call, patch
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def load_main_test():
+def load_main():
     stubs = {name: types.ModuleType(name) for name in (
         "smbus", "telemetrix", "motors", "line_tracker",
         "sensors.vl53l0x_sensor",
@@ -22,7 +22,7 @@ def load_main_test():
     stubs["sensors.vl53l0x_sensor"].VL53L0XSensor = Mock()
     with patch.dict(sys.modules, stubs):
         spec = importlib.util.spec_from_file_location(
-            "cube1_main_test", ROOT / "main_test.py"
+            "cube1_main", ROOT / "main.py"
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -31,7 +31,7 @@ def load_main_test():
 
 class Cube1TaskTests(unittest.TestCase):
     def setUp(self):
-        self.nav = load_main_test()
+        self.nav = load_main()
         self.nav.stop = Mock()
 
     def test_arm_uses_requested_xyz_pitch_and_open_gripper(self):
