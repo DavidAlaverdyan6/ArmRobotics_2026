@@ -38,7 +38,6 @@ ROUTE_LOOP_DELAY = 0.04
 ROUTE_JUNCTION_POLL_DELAY = 0.01
 ROUTE_LINE_LOSS_CONFIRM = 3
 ROUTE_LINE_REVERSE_SPEED = 80
-ROUTE_LINE_REVERSE_TIMEOUT = 5.0
 ROUTE_LINE_REVERSE_CONFIRM = 3
 
 # Line-strength limits reused by the button positioning task.
@@ -61,12 +60,10 @@ JUNCTION_CLEAR = 3
 ROUTE_JUNCTION_CLEAR = 4
 # Forward line following is always at base PWM 255. No acceleration ramp.
 # After any gyro turn, differential2 centers the robot again.
-REACQUIRE_TIMEOUT = 2.0
 REACQUIRE_TOLERANCE = 0.65
 REACQUIRE_CONFIRM = 4
 ROUTE_TURN_LINE_LOSS_SECONDS = 1.0
 ROUTE_TURN_REVERSE_SPEED = 80
-ROUTE_TURN_REVERSE_TIMEOUT = 5.0
 ROUTE_TURN_REVERSE_CONFIRM = 3
 
 I2C_BUS = 1
@@ -144,12 +141,10 @@ REVERSE_REFERENCE_WINDOW_MM = 7.0
 REVERSE_MAX_BRAKE_PWM = 70
 REVERSE_PWM_SLEW_PER_LOOP = 7
 REVERSE_LINE_LOSS_TIMEOUT = 0.8
-BUTTON_REVERSE_LINE_LOSS_TIMEOUT = 5.0
 REVERSE_GYRO_SPEED = 90
 # Set to -1 only if a brief bench test proves the physical motor sides are
 # wired opposite to the documented LEFT/RIGHT convention.
 REVERSE_STEER_SIGN = 1
-RETURN_MAX_TIME = 24.0
 
 RETURN_FORWARD_TIME = 0.5
 
@@ -158,10 +153,8 @@ FIRE_APPROACH_MAX_SPEED = 255
 FIRE_APPROACH_TIMEOUT = 12.0
 FIRE_FINAL_ADVANCE_SECONDS = 0.3
 FIRE_LINE_RECOVERY_SPEED = 80
-FIRE_LINE_RECOVERY_TIMEOUT = 5.0
 FIRE_LINE_RECOVERY_CONFIRM = 2
 FIRE_LINE_BLACKNESS_MIN = 0.75
-FIRE_RETURN_MAX_TIME = 40.0
 
 # CUBE1: arm stays at this XYZ with the gripper open while the chassis moves.
 CUBE1_STAGE_X_MM = 250.0
@@ -694,10 +687,13 @@ def reverse_for_short_turn(seconds, speed):
 
 def reverse_to_line_after_route_turn(calibration):
     """Back up slowly until the tracker sees a line on consecutive frames."""
-    deadline = time.monotonic() + ROUTE_TURN_REVERSE_TIMEOUT
     confirmed = 0
     try:
-        while time.monotonic() < deadline:
+        while True:
+            if not line_tracker.all_channels_fresh():
+                stop()
+                print("ROUTE TURN: stale ADC during reverse; stopped.")
+                return False
             state = line_tracker.update(calibration)
             confirmed = confirmed + 1 if state["position"] is not None else 0
             if confirmed >= ROUTE_TURN_REVERSE_CONFIRM:
@@ -705,19 +701,16 @@ def reverse_to_line_after_route_turn(calibration):
                 return True
             line_follower.reverse_straight(ROUTE_TURN_REVERSE_SPEED)
             time.sleep(ROUTE_LOOP_DELAY)
-        print("\nROUTE TURN: reverse recovery timed out; stopping.")
-        return False
     finally:
         stop()
 
 
 def reverse_to_line_on_route(calibration, freshness):
     """Back up after route line loss until fresh frames confirm the line."""
-    deadline = time.monotonic() + ROUTE_LINE_REVERSE_TIMEOUT
     confirmed = 0
     print("\nROUTE: line lost; reversing slowly to find it.")
     try:
-        while time.monotonic() < deadline:
+        while True:
             now = time.monotonic()
             state = line_tracker.update(calibration)
             if not line_tracker.all_channels_fresh():
@@ -734,21 +727,22 @@ def reverse_to_line_on_route(calibration, freshness):
                     return True
             line_follower.reverse_straight(ROUTE_LINE_REVERSE_SPEED)
             time.sleep(ROUTE_JUNCTION_POLL_DELAY)
-        print("\nROUTE: reverse recovery timed out; robot stopped.")
-        return False
     finally:
         stop()
 
 
 def reacquire_line(calibration, *, recover_after_line_loss=False):
     """Use the shared differential2 centering after every turn."""
-    deadline = time.monotonic() + REACQUIRE_TIMEOUT
     stable = 0
     lost_since = None
     recovery_attempted = False
 
     try:
-        while time.monotonic() < deadline:
+        while True:
+            if not line_tracker.all_channels_fresh():
+                stop()
+                print("ROUTE TURN: stale ADC during line reacquisition; stopped.")
+                return False
             state = line_tracker.update(calibration)
             position = state["position"]
 
@@ -756,20 +750,14 @@ def reacquire_line(calibration, *, recover_after_line_loss=False):
                 now = time.monotonic()
                 if lost_since is None:
                     lost_since = now
-                    if recover_after_line_loss:
-                        deadline = max(
-                            deadline,
-                            now + ROUTE_TURN_LINE_LOSS_SECONDS
-                            + ROUTE_LOOP_DELAY,
-                        )
+
                 if (
                     recover_after_line_loss
                     and now - lost_since >= ROUTE_TURN_LINE_LOSS_SECONDS
                 ):
                     stop()
                     if recovery_attempted:
-                        print("\nROUTE TURN: line lost again after recovery.")
-                        return False
+                        print("\nROUTE TURN: line lost again; retrying reverse line search.")
                     print(
                         "\nROUTE TURN: line missing for 1 second; "
                         "reversing slowly to find it."
@@ -779,7 +767,6 @@ def reacquire_line(calibration, *, recover_after_line_loss=False):
                     recovery_attempted = True
                     lost_since = None
                     stable = 0
-                    deadline = time.monotonic() + REACQUIRE_TIMEOUT
                     continue
                 if recover_after_line_loss:
                     stop()
@@ -805,8 +792,6 @@ def reacquire_line(calibration, *, recover_after_line_loss=False):
 
             time.sleep(ROUTE_LOOP_DELAY)
 
-        print("\nLine not centered yet; returning control to route tracking.")
-        return not recover_after_line_loss
 
     finally:
         stop()
@@ -951,8 +936,8 @@ def button_return(
     label="BUTTON",
     accept_s8_only=False,
     accept_any_junction=False,
-    max_return_time=RETURN_MAX_TIME,
-    line_loss_timeout=REVERSE_LINE_LOSS_TIMEOUT,
+    max_return_time=None,
+    line_loss_timeout=None,
 ):
     """Return using the geometry-aware reverse line controller."""
     heading = Heading(bus, offset, left_sign)
@@ -968,10 +953,11 @@ def button_return(
     last_status = 0.0
 
     try:
-        while (
-            max_return_time is None
-            or time.monotonic() - start < max_return_time
-        ):
+        while True:
+            if not line_tracker.all_channels_fresh():
+                stop()
+                print(f"{label}: stale ADC during return; stopped.")
+                return False
             state = line_tracker.update(calibration)
             left, right, candidate = detector.read(state)
             now = time.monotonic()
@@ -1054,7 +1040,7 @@ def button_return(
                 RETURN_SLOW_SPEED if candidate_since is not None else RETURN_SPEED
             )
             if not differential_reverse(state, speed, reverse_controller):
-                print(f"\n{label}: line lost too long while reversing.")
+                print(f"\n{label}: reverse controller failed.")
                 return False
 
             if now - last_status >= 1.0:
@@ -1070,8 +1056,6 @@ def button_return(
                 last_status = now
             time.sleep(LOOP_DELAY)
 
-        print(f"\n{label}: reverse timeout.")
-        return False
 
     finally:
         stop()
@@ -1096,13 +1080,13 @@ def button_task(calibration, detector, sensor, bus, offset, board):
         bus,
         offset,
         left_sign,
-        line_loss_timeout=BUTTON_REVERSE_LINE_LOSS_TIMEOUT,
+        line_loss_timeout=None,
     ):
         return False
 
-    print("\nB: execute shared R90.")
-    ok, _ = turn_90(calibration, bus, offset, "R")
-    return ok and reacquire_line(calibration)
+    print("\nB: direct gyro R90, no forward alignment.")
+    ok, _ = pivot_90(bus, offset, "R")
+    return ok and reacquire_line(calibration, recover_after_line_loss=True)
 
 
 def cube1_arm_action(board):
@@ -1363,11 +1347,11 @@ def cube1_transport(calibration, detector, cube_sensor, indicator):
 
 def cube1_emergency_reverse_to_line(calibration):
     """In emergency, move backwards until the 8-channel line becomes visible."""
-    deadline = time.monotonic() + ROUTE_LINE_REVERSE_TIMEOUT
     seen = 0
     try:
-        while time.monotonic() < deadline:
+        while True:
             if not line_tracker.all_channels_fresh():
+                stop()
                 return False
             state = line_tracker.update(calibration)
             if state.get("position") is not None:
@@ -1379,8 +1363,6 @@ def cube1_emergency_reverse_to_line(calibration):
                 seen = 0
             line_follower.reverse_straight(ROUTE_LINE_REVERSE_SPEED)
             time.sleep(ROUTE_LOOP_DELAY)
-        print("\nCUBE1: could not find line behind pit.")
-        return False
     finally:
         stop()
 
@@ -1423,9 +1405,9 @@ def cube1_task(calibration, detector, bus, offset, board, distance_sensor):
             label="CUBE1", accept_s8_only=True, line_loss_timeout=None,
         ):
             return False
-        print("\nCUBE1: final shared R90.")
-        ok, _ = turn_90(calibration, bus, offset, "R")
-        return ok and reacquire_line(calibration)
+        print("\nCUBE1: final gyro R90 without forward alignment.")
+        ok, _ = pivot_90(bus, offset, "R")
+        return ok and reacquire_line(calibration, recover_after_line_loss=True)
     finally:
         stop()
         if indicator is not None:
@@ -1439,11 +1421,14 @@ def firefighter_reverse_until_line(calibration):
         "\nF: line lost during flame search; emergency stop. "
         "Reversing slowly to find it."
     )
-    deadline = time.monotonic() + FIRE_LINE_RECOVERY_TIMEOUT
     confirmed = 0
     gray_reported = False
     try:
-        while time.monotonic() < deadline:
+        while True:
+            if not line_tracker.all_channels_fresh():
+                stop()
+                print("F: stale ADC during line recovery; stopped.")
+                return False
             state = line_tracker.update(calibration)
             values = state.get("normalized", [])
             raw = state.get("raw", [])
@@ -1486,8 +1471,6 @@ def firefighter_reverse_until_line(calibration):
             line_follower.reverse_straight(FIRE_LINE_RECOVERY_SPEED)
             time.sleep(LOOP_DELAY)
 
-        print("\nF: line recovery timeout; robot remains stopped.")
-        return False
     finally:
         stop()
 
@@ -1616,13 +1599,12 @@ def firefighter_task(
             left_sign,
             label="FIREFIGHTER",
             accept_any_junction=True,
-            max_return_time=FIRE_RETURN_MAX_TIME,
-            line_loss_timeout=BUTTON_REVERSE_LINE_LOSS_TIMEOUT,
+            line_loss_timeout=None,
         ):
             return False
-        print("\nF: execute shared R90.")
-        ok, _ = turn_90(calibration, bus, offset, "R")
-        return ok and reacquire_line(calibration)
+        print("\nF: execute direct gyro R90 without forward alignment.")
+        ok, _ = pivot_90(bus, offset, "R")
+        return ok and reacquire_line(calibration, recover_after_line_loss=True)
     finally:
         try:
             stop()

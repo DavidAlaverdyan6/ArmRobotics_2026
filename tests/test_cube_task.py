@@ -47,9 +47,20 @@ class CubeTests(unittest.TestCase):
             "R90", "arm", "transport", "fold",
             "reverse", "R90", "reacquire",
         ])
-        n.pivot_90.assert_called_once_with(None, 12.0, "R")
-        n.turn_90.assert_called_once()
-        self.assertEqual(n.turn_90.call_args.args[-1], "R")
+        self.assertEqual(n.pivot_90.call_args_list[0].args, (None, 12.0, "R"))
+        self.assertEqual(n.pivot_90.call_count, 2)
+        n.turn_90.assert_not_called()
+
+    def test_button_return_final_r90_skips_alignment(self):
+        n = self.nav
+        n.turn_90 = Mock(return_value=(True, -1))
+        n.pivot_90 = Mock(return_value=(True, -1))
+        n.reacquire_line = Mock(return_value=True)
+        n.button_bumper_approach = Mock(return_value=True)
+        n.button_return = Mock(return_value=True)
+        self.assertTrue(n.button_task("cal", Mock(), Mock(), "bus", 0.1, Mock()))
+        n.turn_90.assert_called_once_with("cal", "bus", 0.1, "L")
+        n.pivot_90.assert_called_once_with("bus", 0.1, "R")
 
     def test_turn_pwm_is_constant_and_ignores_line_sensors(self):
         n = self.nav
