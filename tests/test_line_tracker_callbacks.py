@@ -37,6 +37,25 @@ class LineTrackerCallbackTests(unittest.TestCase):
         self.assertTrue(line_tracker.all_callbacks_ready())
         self.assertEqual(line_tracker.sensor_values, [0] * 8)
 
+    def test_adc_style_callback_pairing_ignores_reported_pin_field(self):
+        # ADC.py uses the callback registration index, not data[1], to
+        # identify each channel. Some STM32 Telemetrix pin identifiers may
+        # differ from the project's internal PA0-PA7 constants.
+        board = FakeBoard()
+        line_tracker.initialize(board)
+        for index, (_, callback) in enumerate(board.inputs):
+            callback([0, index, 1000 + index])
+        self.assertEqual(line_tracker.callback_status(), [True] * 8)
+        self.assertEqual(
+            line_tracker.sensor_values, [1000 + i for i in range(8)]
+        )
+
+    def test_invalid_adc_value_does_not_mark_callback_ready(self):
+        board = FakeBoard()
+        line_tracker.initialize(board)
+        board.inputs[0][1]([0, 0, 5000])
+        self.assertFalse(line_tracker.callback_status()[0])
+
     def test_calibration_for_old_pin_map_is_rejected(self):
         original_path = line_tracker.CALIBRATION_FILE
         with tempfile.TemporaryDirectory() as directory:
