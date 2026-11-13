@@ -56,6 +56,25 @@ class CubeTests(unittest.TestCase):
         self.assertEqual(n.turn_90_pwm(0, False), n.TURN_PWM_SLOW)
         self.assertEqual(n.turn_90_pwm(80, True), n.TURN_PWM_SLOW)
         self.assertEqual(n.turn_90_pwm(80, True, slow=True), n.SLOW_90_PWM_FAST)
+        self.assertEqual(n.turn_90_pwm(0, False, direction="R"), n.TURN_PWM_FAST)
+        self.assertEqual(n.TURN_R90_ANGLE, 86.0)
+        self.assertEqual(n.TURN_90_ANGLE, 90.0)
+
+    def test_gyro_turn_r_uses_86_and_faster_pwm(self):
+        n = self.nav
+        clock = [0.0]
+        def tick():
+            clock[0] += 0.01
+            return clock[0]
+        n.gyro_rate = Mock(return_value=250.0)
+        n.time.monotonic = tick
+        n.time.sleep = Mock()
+        n.line_tracker.all_channels_fresh = Mock(side_effect=AssertionError("ADC queried"))
+        result, _ = n.pivot_90(Mock(), 0, "R")
+        self.assertTrue(result)
+        n.line_tracker.all_channels_fresh.assert_not_called()
+        self.assertTrue(any(call.args == (n.TURN_PWM_FAST, -n.TURN_PWM_FAST)
+                            for call in n.motors.set_speeds.call_args_list))
 
     def test_gyro_turn_does_not_read_adc(self):
         n = self.nav

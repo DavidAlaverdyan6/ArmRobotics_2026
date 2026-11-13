@@ -83,7 +83,8 @@ GYRO_DIRECTION_CONFIRM_SAMPLES = 3
 GYRO_REVERSE_CONFIRM_SECONDS = 0.05
 PIVOT_SETTLE_SECONDS = 0.1
 TURN_ANGLE = 75.0
-TURN_90_ANGLE = 90.0
+TURN_90_ANGLE = 90.0  # L90 remains unchanged
+TURN_R90_ANGLE = 86.0  # R90 target; verify physically at the faster PWM
 TURN_PWM_FAST = 180
 TURN_PWM_SLOW = 150
 TURN_PWM_EDGE = 100
@@ -568,16 +569,18 @@ def pivot(bus, offset, direction, angle_target=TURN_ANGLE):
         time.sleep(PIVOT_SETTLE_SECONDS)
 
 
-def turn_90_pwm(angle, side_seen, slow=False):
-    """Fixed PWM for gyro-only 90-degree turns; legacy args kept for callers."""
-    return SLOW_90_PWM_FAST if slow else TURN_PWM_SLOW
+def turn_90_pwm(angle, side_seen, slow=False, direction="L"):
+    """Fixed PWM: faster R90, original L90, explicitly slow turns unchanged."""
+    if slow:
+        return SLOW_90_PWM_FAST
+    return TURN_PWM_FAST if direction == "R" else TURN_PWM_SLOW
 
 
 def pivot_90(
     bus,
     offset,
     direction,
-    angle_target=TURN_90_ANGLE,
+    angle_target=None,
     slow=False,
     calibration=None,
 ):
@@ -588,6 +591,8 @@ def pivot_90(
     """
     if direction not in ("L", "R"):
         raise ValueError("Turn direction must be L or R")
+    if angle_target is None:
+        angle_target = TURN_R90_ANGLE if direction == "R" else TURN_90_ANGLE
     stop()
     left = direction == "L"
     start = previous = time.monotonic()
@@ -595,7 +600,7 @@ def pivot_90(
     gyro_sign = candidate_sign = None
     direction_samples = 0
     reverse_since = None
-    pwm = turn_90_pwm(0, False, slow=slow)
+    pwm = turn_90_pwm(0, False, slow=slow, direction=direction)
 
     try:
         while True:
@@ -671,8 +676,7 @@ def turn_90(calibration, bus, offset, direction, *, slow=False):
     if not align_to_crossbar_center(calibration):
         return False, None
     return pivot_90(
-        bus, offset, direction, angle_target=TURN_90_ANGLE,
-        slow=slow,
+        bus, offset, direction, slow=slow,
     )
 
 
