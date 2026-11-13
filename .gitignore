@@ -12,3 +12,4 @@ motion_calibration.json
 # Per-robot calibration: never replace via git pull.
 linetracker/calibration.local.json
 linetracker/calibration.local.json.tmp
+main_test.py
