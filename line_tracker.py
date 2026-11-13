@@ -14,6 +14,9 @@ import motors
 SENSOR_PINS = list(reversed(robot_pins.LINE_SENSORS))
 
 CALIBRATION_FILE = os.path.expanduser(
+    "~/ArmRobotics/linetracker/calibration.local.json"
+)
+LEGACY_CALIBRATION_FILE = os.path.expanduser(
     "~/ArmRobotics/linetracker/calibration.json"
 )
 
@@ -129,22 +132,33 @@ def wait_for_callbacks(timeout=6.0, poll_interval=0.04):
 
 
 def load_calibration():
-    try:
-        with open(CALIBRATION_FILE, "r", encoding="utf-8") as file:
-            data = json.load(file)
+    """Load gitignored local calibration, migrating legacy values once.
 
-        if (
-            len(data.get("white", [])) != SENSOR_COUNT
-            or len(data.get("gray", [])) != SENSOR_COUNT
-            or len(data.get("black", [])) != SENSOR_COUNT
-            or data.get("pins") != SENSOR_PINS
-        ):
+    Never overwrite an existing local calibration with repository defaults.
+    """
+    for path in (CALIBRATION_FILE, LEGACY_CALIBRATION_FILE):
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                data = json.load(file)
+            if (
+                not isinstance(data, dict)
+                or len(data.get("white", [])) != SENSOR_COUNT
+                or len(data.get("gray", [])) != SENSOR_COUNT
+                or len(data.get("black", [])) != SENSOR_COUNT
+                or data.get("pins") != SENSOR_PINS
+            ):
+                return None
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError, TypeError):
             return None
 
+        if path == LEGACY_CALIBRATION_FILE:
+            # First run after upgrading: retain the old sensor readings in a
+            # private file that future git pulls cannot overwrite.
+            save_calibration(data)
         return data
-
-    except (OSError, ValueError, TypeError):
-        return None
+    return None
 
 
 def save_calibration(calibration):

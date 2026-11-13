@@ -8,3 +8,8 @@ __pycache__/
 junction_drive.json
 motion_measurements.json
 motion_calibration.json
+
+# Per-robot configuration: never replace via git pull.
+route.json
+linetracker/calibration.local.json
+linetracker/calibration.local.json.tmp
