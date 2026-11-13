@@ -44,8 +44,21 @@ class CubeTests(unittest.TestCase):
         with patch.dict(sys.modules, {"firefighter":types.SimpleNamespace(Firefighter=Mock(return_value=sensor))}):
             self.assertTrue(n.cube1_task(None, Mock(), Mock(), 12.0, Mock(), Mock()))
         self.assertEqual(events, [
-            "align", "R90", "arm", "transport", "fold",
+            "R90", "arm", "transport", "fold",
             "reverse", "align", "R90", "reacquire",
+        ])
+        self.assertEqual(n.align_to_crossbar_center.call_count, 1,
+                         "Only final R90 may align; first turn must be immediate")
+
+    def test_stop_sends_real_zero_pwm(self):
+        n = self.nav
+        n.motors.motor_stop.reset_mock()
+        n.stop()
+        n.motors.motor_stop.assert_called_once_with()
+
+    def test_route_is_not_a_broken_comment_example(self):
+        self.assertEqual(self.nav.load_route(), [
+            "CUBE1", "R", "L", "R", "CHARGING", "COLOR", "L", "Q"
         ])
 
     def test_two_arm_targets(self):

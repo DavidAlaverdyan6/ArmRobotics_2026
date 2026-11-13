@@ -170,20 +170,6 @@ CUBE1_DROP_CONFIRM_FRAMES = 3
 CUBE1_DROP_TIMEOUT = 20.0
 CUBE1_APPROACH_SPEED = 255
 CUBE1_APPROACH_MAX_SPEED = 255
-CUBE1_TURN_SPEED = 90
-CUBE1_TURN_TIMEOUT = 4.0
-CUBE1_TURN_MIN_ANGLE = 60.0
-CUBE1_TURN_MAX_ANGLE = 90.0
-CUBE1_TURN_CLEAR_CONFIRM = 3
-CUBE1_TURN_LINE_CONFIRM = 3
-CUBE1_LASER_MIN_DISTANCE_MM = 140.0
-CUBE1_LASER_MAX_DISTANCE_MM = 160.0
-CUBE1_LASER_CONFIRM = 3
-CUBE1_LASER_CONFIRM_WINDOW = 0.2
-CUBE1_DROP_PUSH_SPEED = 255
-CUBE1_DROP_PUSH_MAX_SPEED = 255
-CUBE1_DROP_PUSH_TIMEOUT = 3.0
-CUBE1_DROP_BLINK_HALF_PERIOD = 0.25
 CUBE1_SENSOR_CONFIRM = 3
 CUBE1_LINE_LOSS_CONFIRM = 5
 
@@ -203,12 +189,8 @@ COLOR_ARM_ANGLES = {
 }
 COLOR_LED_HOLD = None
 
-# Automatic route: one entry for each detected junction, in order.
-# L/R/S/SLOW and L90/R90 are movement commands. SLOW goes straight without
-# a blind timed crossing and holds a low speed while junction sensing stays
-# active. Named robot tasks are BUTTON,
-# CHARGING, FIREFIGHTER, CUBE1 and COLOR. Q stops the route.
-# Example: ROUTE = [
+# Automatic route: one active command for each junction; Q stops.
+ROUTE = [
     # "BUTTON",
     # "L90",
     "CUBE1",
@@ -253,6 +235,8 @@ forward_line_pid = ForwardLinePID(motor_driver=motors)
 
 
 def stop():
+    """Stop chassis PWM immediately, then clear navigation controller state."""
+    motors.motor_stop()
     forward_line_pid.reset()
     line_follower.stop()
 
@@ -1198,108 +1182,6 @@ def cube1_fold_arm(board, reason="task endpoint reached"):
         stop()
 
 
-def cube1_turn_to_center_line(calibration, bus, offset, distance_sensor):
-    """Turn 60-90 degrees; accept stable center-line or laser confirmation."""
-    deadline = time.monotonic() + CUBE1_TURN_TIMEOUT
-    previous = time.monotonic()
-    signed_angle = 0.0
-    clear_count = 0
-    line_count = 0
-    laser_times = []
-    last_distance_mm = None
-    armed = False
-    try:
-        while time.monotonic() < deadline:
-            now = time.monotonic()
-            signed_angle += gyro_rate(bus, offset) * max(
-                0.0, min(now - previous, 0.1)
-            )
-            previous = now
-            state = line_tracker.update(calibration)
-            values = state.get("normalized", [])
-            four_center_black = (
-                len(values) == 8
-                and min(values[2:6]) >= JUNCTION_CENTER_MIN
-            )
-            try:
-                measured_mm = float(distance_sensor.read_distance_mm())
-                if math.isfinite(measured_mm):
-                    last_distance_mm = measured_mm
-                    cube1_record_laser_sample(
-                        laser_times, now, measured_mm
-                    )
-            except Exception:
-                laser_times.clear()
-
-            angle = abs(signed_angle)
-            laser_confirmed = (
-                angle >= CUBE1_TURN_MIN_ANGLE
-                and len(laser_times) >= CUBE1_LASER_CONFIRM
-            )
-
-            if not four_center_black:
-                clear_count += 1
-                line_count = 0
-                if clear_count >= CUBE1_TURN_CLEAR_CONFIRM:
-                    armed = True
-            elif armed and angle >= CUBE1_TURN_MIN_ANGLE:
-                line_count += 1
-            else:
-                line_count = 0
-
-            line_confirmed = (
-                armed
-                and angle >= CUBE1_TURN_MIN_ANGLE
-                and line_count >= CUBE1_TURN_LINE_CONFIRM
-            )
-            max_angle_reached = angle >= CUBE1_TURN_MAX_ANGLE
-            if line_confirmed or laser_confirmed or max_angle_reached:
-                observed_sign = 1 if signed_angle > 0 else -1
-                left_sign = -observed_sign
-                reason = (
-                    "center line"
-                    if line_confirmed else
-                    "laser 140-160 mm"
-                    if laser_confirmed else
-                    "90-degree safety limit"
-                )
-                laser_text = (
-                    "unavailable"
-                    if last_distance_mm is None
-                    else f"{last_distance_mm:.0f} mm"
-                )
-                print(
-                    f"\nCUBE1: turn complete by {reason} at "
-                    f"{angle:.1f} gyro degrees; laser={laser_text}."
-                )
-                return True, left_sign
-
-            motors.set_speeds(CUBE1_TURN_SPEED, -CUBE1_TURN_SPEED)
-            time.sleep(LOOP_DELAY)
-
-        print("\nCUBE1: sensor-guided right turn timed out.")
-        return False, None
-    finally:
-        stop()
-
-
-def cube1_record_laser_sample(sample_times, now, distance_mm):
-    """Keep only consecutive in-range laser hits from the last 0.2 seconds."""
-    if (
-        CUBE1_LASER_MIN_DISTANCE_MM
-        <= distance_mm
-        <= CUBE1_LASER_MAX_DISTANCE_MM
-    ):
-        sample_times.append(now)
-        sample_times[:] = [
-            stamp for stamp in sample_times
-            if now - stamp <= CUBE1_LASER_CONFIRM_WINDOW
-        ]
-    else:
-        sample_times.clear()
-    return len(sample_times) >= CUBE1_LASER_CONFIRM
-
-
 def cube1_create_indicator():
     """Create the RGB indicator using this robot's swapped red/blue wiring."""
     return create_robot_rgb_indicator()
@@ -1527,9 +1409,8 @@ def cube1_task(calibration, detector, bus, offset, board, distance_sensor):
     indicator = None
     stop()
     try:
-        print("\nCUBE1: align after crossbar then execute gyro R90.")
-        if not align_to_crossbar_center(calibration):
-            return False
+        print("\nCUBE1: junction detected; execute gyro R90 immediately.")
+        # No trailing-edge drive or junction alignment before the first turn.
         ok, left_sign = pivot_90(bus, offset, "R", angle_target=TURN_90_ANGLE)
         if not ok or left_sign is None:
             print("\nCUBE1: initial R90 failed.")
