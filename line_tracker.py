@@ -475,7 +475,7 @@ def update(calibration):
     }
 
 
-def all_channels_fresh(max_age=0.35):
+def all_channels_fresh(max_age=1.0):
     now = time.monotonic()
     with _sample_lock:
         times = sample_times.copy()
