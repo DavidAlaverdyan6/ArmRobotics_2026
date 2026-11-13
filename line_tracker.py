@@ -67,9 +67,13 @@ def _make_callback(index):
     pin = SENSOR_PINS[index]
 
     def callback(data):
+        # Match ADC.py: set_pin_mode_analog_input binds each callback to a
+        # sensor index, and data[2] is the ADC value. Do not compare data[1]
+        # with the configured pin: Telemetrix's reported pin identifier may
+        # differ from this project's STM32 pin constants.
         try:
             value = int(data[2])
-            if int(data[1]) != pin or not 0 <= value <= 4095:
+            if not 0 <= value <= 4095:
                 return
         except (IndexError, TypeError, ValueError):
             return
