@@ -208,25 +208,17 @@ COLOR_LED_HOLD = None
 # a blind timed crossing and holds a low speed while junction sensing stays
 # active. Named robot tasks are BUTTON,
 # CHARGING, FIREFIGHTER, CUBE1 and COLOR. Q stops the route.
-# Example: ROUTE = ["L", "S", "BUTTON", "R", "CHARGING", "CUBE1",
-#                   "FIREFIGHTER", "Q"]
-# The commented entries below are placeholders: edit them before launching.
-ROUTE = [
+# Example: ROUTE = [
     # "BUTTON",
-    # "L",
-    # "R",
-    # "L",
-    # "CUBE1",
-    # "SLOW",
-    # "L",
-    # "R",
-    # "L",
-    # "CHARGING",
-    # "L90SLOW",
-    # "R90",
+    # "L90",
+    "CUBE1",
+    "R",
+    "L",
+    "R",
+    "CHARGING",
     "COLOR",
-    # "L",
-    # "R",
+    "L",
+    "Q",
     # "FIREFIGHTER",
     # "S",
     # "L",
@@ -239,10 +231,8 @@ ROUTE = [
     # "L",
     # "S",
     # "Q",
-
-
-
 ]
+
 ALLOWED_ROUTE_COMMANDS = {
     "L", "R", "L90", "R90", "L90SLOW", "R90SLOW", "S", "SLOW",
     "BUTTON", "CHARGING", "FIREFIGHTER", "CUBE1", "COLOR", "Q",
