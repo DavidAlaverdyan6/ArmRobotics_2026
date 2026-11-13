@@ -45,7 +45,7 @@ class ColorPreviewServer:
         self._sequence = 0
         self._task_frame = self._make_placeholder()
         self._task_sequence = 0
-        self._task_label = "No completed camera task yet"
+        self._task_label = "Task not active"
         self._closed = False
         self._httpd = None
         self._thread = None
@@ -56,7 +56,7 @@ class ColorPreviewServer:
         frame = np.zeros((600, 800, 3), dtype=np.uint8)
         cv2.putText(
             frame,
-            "No completed camera task yet",
+            "Task not active",
             (105, 310),
             cv2.FONT_HERSHEY_SIMPLEX,
             1.0,
@@ -92,7 +92,7 @@ class ColorPreviewServer:
                         '<div class="panel"><h2>Live camera</h2>'
                         '<img src="/stream.mjpg"></div>'
                         '<div class="panel"><h2>Task camera</h2>'
-                        '<div id="taskLabel">Waiting for a completed task</div>'
+                        '<div id="taskLabel">Task not active</div>'
                         '<img id="taskFrame" src="/task-stream.mjpg"></div></div>'
                         '<script>async function refreshTask(){'
                         'try{const r=await fetch('
@@ -221,6 +221,12 @@ class ColorPreviewServer:
             self._condition.notify_all()
         return True
 
+    def set_task_status(self, status):
+        """Display task lifecycle independently from the live feed."""
+        with self._condition:
+            self._task_label = str(status)
+            self._condition.notify_all()
+
     def stop(self):
         with self._condition:
             self._closed = True
@@ -304,8 +310,21 @@ class ContinuousCamera:
                 return None
             return self._sequence, self._frame.copy()
 
+    def start_task(self, label):
+        """Begin a camera task; later tasks can use the same shared preview."""
+        if self.preview is not None:
+            self.preview.set_task_status(label)
+
+    def publish_task_frame(self, frame, label):
+        """Publish every annotated frame of an active camera task."""
+        return self.save_task_frame(frame, label)
+
+    def end_task(self, label="Task not active"):
+        if self.preview is not None:
+            self.preview.set_task_status(label)
+
     def save_task_frame(self, frame, label):
-        """Publish a completed task result without changing the live stream."""
+        """Publish a task frame without changing the live stream."""
         if self.preview is None:
             return False
         return self.preview.update_task(frame, label)
@@ -619,6 +638,8 @@ def run_color_marker_task(
 
         deadline = time.monotonic() + timeout_s
         last_status = 0.0
+        if camera_stream is not None:
+            camera_stream.start_task("COLOR: searching for a marker")
         # Begin with the next exposure after the arm reached its COLOR pose.
         last_sequence = (
             camera_stream.sequence if camera_stream is not None else 0
@@ -636,6 +657,10 @@ def run_color_marker_task(
                     continue
                 last_sequence, frame = captured
             objects, annotated, confirmed = detector.process_frame(frame)
+            if camera_stream is not None:
+                camera_stream.publish_task_frame(
+                    annotated, "COLOR: searching (red / green / blue)"
+                )
             if preview is not None:
                 preview.update(annotated)
             if frame_callback is not None:
@@ -676,12 +701,16 @@ def run_color_marker_task(
             print("\r\033[2K", end="", flush=True)
             status_open = False
         print("Color marker detection timed out.")
+        if camera_stream is not None:
+            camera_stream.end_task("COLOR: timeout")
         return None
     finally:
         if status_open:
             print("\r\033[2K", end="", flush=True)
         if preview is not None:
             preview.stop()
+        if camera_stream is not None:
+            camera_stream.end_task("Task not active")
         try:
             if detector is not None:
                 detector.reset()

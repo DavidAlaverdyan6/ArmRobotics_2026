@@ -155,10 +155,18 @@ FIRE_LINE_BLACKNESS_MIN = 0.75
 FIRE_RETURN_MAX_TIME = 40.0
 
 # CUBE1: arm stays at this XYZ with the gripper open while the chassis moves.
-CUBE1_X_MM = 350.0
+CUBE1_STAGE_X_MM = 250.0
+CUBE1_STAGE_Y_MM = 0.0
+CUBE1_STAGE_Z_MM = 100.0
+CUBE1_X_MM = 200.0
 CUBE1_Y_MM = 0.0
-CUBE1_Z_MM = -140.0
-CUBE1_TOOL_PITCH_DEG = -10.0
+CUBE1_Z_MM = -180.0
+CUBE1_TOOL_PITCH_DEG = -90.0
+CUBE1_PIT_ALL_BLACK_MIN = 0.85
+CUBE1_PIT_CONFIRM_FRAMES = 4
+CUBE1_EMERGENCY_TIMEOUT = 8.0
+CUBE1_BLINK_HALF_PERIOD = 0.25
+CUBE1_DROP_CONFIRM_FRAMES = 3
 CUBE1_DROP_TIMEOUT = 20.0
 CUBE1_APPROACH_SPEED = 255
 CUBE1_APPROACH_MAX_SPEED = 255
@@ -1140,30 +1148,38 @@ def button_task(calibration, detector, sensor, bus, offset, board):
 
 
 def cube1_arm_action(board):
-    """Hold the open gripper at the configured CUBE1 pose."""
-    from button_arm import move_to_xyz_and_hold
+    """Two exact requested poses; no chassis centering between R90 and arm."""
+    from roboarm import get_shared_arm
+    from button_arm import _execute_plan
+    import arm_web
 
     stop()
-    print(
-        f"\nCUBE1: moving arm to X={CUBE1_X_MM:g}, Y={CUBE1_Y_MM:g}, "
-        f"Z={CUBE1_Z_MM:g} mm, fixed pitch "
-        f"{CUBE1_TOOL_PITCH_DEG:g} degrees."
-    )
+    arm, _ = get_shared_arm(board)
+    arm_web.arm = arm
     try:
-        return move_to_xyz_and_hold(
-            board,
-            CUBE1_X_MM,
-            CUBE1_Y_MM,
-            CUBE1_Z_MM,
-            tool_pitch=CUBE1_TOOL_PITCH_DEG,
-            gripper=0.0,
-            open_before_move=True,
-        )
+        # Pre-position with automatic / free wrist, open gripper throughout.
+        arm.write(gripper=0)
+        first, free_pitch = arm_web.plan_auto_path({
+            "x": CUBE1_STAGE_X_MM, "y": CUBE1_STAGE_Y_MM,
+            "z": CUBE1_STAGE_Z_MM, "orientation_mode": "auto",
+        })
+        print(f"CUBE1: stage 1 (250,0,100), free pitch {free_pitch:.1f}, gripper open.")
+        _execute_plan(arm, first, arm_web.STEP_DELAY)
+        arm.write(gripper=0)
+
+        # Final posture locks the gripper's absolute pitch at -90 degrees.
+        second = arm_web.plan_target_pitch_path({
+            "x": CUBE1_X_MM, "y": CUBE1_Y_MM, "z": CUBE1_Z_MM,
+            "tool_pitch": CUBE1_TOOL_PITCH_DEG,
+        })
+        print("CUBE1: stage 2 (200,0,-180), pitch -90, gripper open.")
+        _execute_plan(arm, second, arm_web.STEP_DELAY)
+        arm.write(gripper=0)
+        return True
     except Exception as exc:
-        print(f"CUBE1: arm positioning failed: {exc}")
-        return False
-    finally:
+        print(f"CUBE1: arm motion failed: {exc}")
         stop()
+        return False
 
 
 def cube1_fold_arm(board, reason="task endpoint reached"):
@@ -1311,239 +1327,258 @@ def create_robot_rgb_indicator():
     return rgb
 
 
-def cube1_carry_until_drop(
-    calibration, detector, cube_sensor, on_cube_found=None,
-):
-    """Find the cube, then carry it to the next confirmed junction."""
+class Cube1Signal:
+    """Non-blocking, continuously refreshed RGB status; no background GPIO writes."""
+    def __init__(self, led):
+        self.led = led
+        self.mode = "off"
+        self.last_visible = None
+
+    def set_mode(self, mode):
+        if mode not in ("off", "green_blink", "green", "red_blink"):
+            raise ValueError(mode)
+        if mode != self.mode:
+            self.mode = mode
+            self.last_visible = None
+        self.tick()
+
+    def tick(self, now=None):
+        if now is None:
+            now = time.monotonic()
+        show = self.mode == "green" or (
+            self.mode.endswith("_blink")
+            and int(now / CUBE1_BLINK_HALF_PERIOD) % 2 == 0
+        )
+        color = "green" if self.mode.startswith("green") else "red"
+        state = (show, color if show else None)
+        if state != self.last_visible:
+            if show:
+                getattr(self.led, color)()
+            else:
+                self.led.off()
+            self.last_visible = state
+
+    def close(self):
+        self.led.off()
+        self.led.close()
+
+
+def cube1_transport(calibration, detector, cube_sensor, indicator):
+    """Perform CUBE1 search, carry, and bounded pit emergency.
+
+    Return "drop" when cube disappears AFTER the second crossing, or
+    "emergency" only when the PIT is confirmed AFTER that crossing has cleared.
+    A full-black junction must never be mistaken for the pit.
+    """
     deadline = time.monotonic() + CUBE1_DROP_TIMEOUT
+    phase = "search"
     clear_count = 0
     junction_armed = False
-    junction_count = 0
-    cube_count = 0
-    line_loss_count = 0
-    cube_found = False
+    crossing_count = 0
+    second_crossing_seen = False
+    second_crossing_cleared = False
+    post_cross_clear_count = 0
+    present_count = 0
+    missing_count = 0
+    pit_count = 0
+    emergency_deadline = None
     last_status = 0.0
 
+    def enter_emergency(reason, now):
+        nonlocal phase, emergency_deadline
+        if phase != "emergency":
+            print(f"\\nCUBE1 EMERGENCY: {reason}; RED blink until pit after second crossing.")
+            phase = "emergency"
+            indicator.set_mode("red_blink")
+            # Give time to reach the second crossing before the pit timer.
+            emergency_deadline = now + CUBE1_DROP_TIMEOUT
+
     try:
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline or phase == "emergency":
+            now = time.monotonic()
+            if phase == "emergency" and now >= emergency_deadline:
+                print("\\nCUBE1: emergency timeout before confirmed pit; STOP.")
+                return None
             state = line_tracker.update(calibration)
+            values = state.get("normalized", ())
+            if not line_tracker.all_channels_fresh() or len(values) != 8:
+                print("\\nCUBE1: ADC stale; STOP.")
+                return None
+            indicator.tick(now)
+
             left, right, candidate = detector.read(state)
-            clear_count = clear_count + 1 if not left and not right else 0
+            if not left and not right:
+                clear_count += 1
+            else:
+                clear_count = 0
             if clear_count >= JUNCTION_CLEAR:
                 junction_armed = True
 
-            if not cube_found:
-                cube_visible = cube_sensor.detected()
-                if cube_visible is None:
-                    stop()
-                    print(
-                        "\nCUBE1: cube sensor report is missing or stale; "
-                        "stopping."
-                    )
-                    return None
-                cube_count = (
-                    cube_count + 1 if cube_visible else 0
-                )
-                if cube_count >= CUBE1_SENSOR_CONFIRM:
-                    cube_found = True
-                    junction_count = 0
-                    if on_cube_found is not None:
-                        on_cube_found()
-                    print(
-                        "\nCUBE1: cube detected by optical sensor; "
-                        "orange indicator ON; continuing to second junction."
-                    )
-            else:
-                # Ignore the arm IR sensor while carrying. It becomes the
-                # drop detector only after the second junction is reached.
-                cube_visible = True
-                junction_count = (
-                    junction_count + 1 if junction_armed and candidate else 0
-                )
-                if junction_count >= JUNCTION_CONFIRM:
-                    stop()
-                    print(
-                        "\nCUBE1: second junction reached; stopping before "
-                        "the timed drop push."
-                    )
-                    return "junction"
+            at_junction = junction_armed and candidate
+            crossing_count = crossing_count + 1 if at_junction else 0
+            if crossing_count >= JUNCTION_CONFIRM and not second_crossing_seen:
+                second_crossing_seen = True
+                post_cross_clear_count = 0
+                print("\\nCUBE1: second crossing reached.")
+                if phase == "search":
+                    enter_emergency("cube NOT found before second crossing", now)
+                elif phase == "carry":
+                    phase = "past_junction"
+                    missing_count = 0
+                    indicator.set_mode("green")
+                    print("\\nCUBE1: GREEN solid, keep moving until cube disappears.")
 
-            if state["position"] is None:
-                line_loss_count += 1
-                if line_loss_count >= CUBE1_LINE_LOSS_CONFIRM:
-                    stop()
-                    print(
-                        "\nCUBE1: line lost for "
-                        f"{line_loss_count} consecutive frames; stopping."
-                    )
-                    return None
-                # Servo movement and ADC updates can produce a short dropout.
-                # Bridge it slowly, just as follow_for/reacquire_line do.
-                forward_drive_straight(
-                    speed=CUBE1_APPROACH_SPEED,
-                    max_speed=CUBE1_APPROACH_MAX_SPEED,
-                )
-            else:
-                line_loss_count = 0
-                differential_drive(
-                    state,
-                    speed=CUBE1_APPROACH_SPEED,
-                    max_speed=CUBE1_APPROACH_MAX_SPEED,
-                )
+            # Suppress pit recognition across the width of the crossing.
+            # Demand confirmed non-crossing after the second crossing,
+            # and only then start checking the all-black condition.
+            if second_crossing_seen and not second_crossing_cleared:
+                if (
+                    not candidate and not left and not right
+                    and not all(v >= CUBE1_PIT_ALL_BLACK_MIN for v in values)
+                ):
+                    post_cross_clear_count += 1
+                    if post_cross_clear_count >= JUNCTION_CLEAR:
+                        second_crossing_cleared = True
+                        if phase == "emergency":
+                            emergency_deadline = now + CUBE1_EMERGENCY_TIMEOUT
+                        pit_count = 0
+                        print("\\nCUBE1: second crossing cleared; PIT detection armed.")
+                else:
+                    post_cross_clear_count = 0
 
-            now = time.monotonic()
-            if now - last_status >= 0.25:
-                phase = "CARRY" if cube_found else "SEARCH"
-                print(
-                    f"\rCUBE1 {phase} sensor={int(cube_visible)} "
-                    f"pos={state['position']}",
-                    end="", flush=True,
-                )
+            cube_visible = cube_sensor.detected()
+            if cube_visible is None:
+                print("\\nCUBE1: cube IR sensor stale; STOP.")
+                return None
+
+            if phase == "search" and not second_crossing_seen:
+                if cube_visible:
+                    present_count += 1
+                    if present_count >= CUBE1_SENSOR_CONFIRM:
+                        phase = "carry"
+                        missing_count = 0
+                        indicator.set_mode("green_blink")
+                        print("\\nCUBE1: cube found; GREEN blinking.")
+                else:
+                    present_count = 0
+            elif phase == "carry" and not second_crossing_seen:
+                if cube_visible:
+                    missing_count = 0
+                else:
+                    missing_count += 1
+                    if missing_count >= CUBE1_DROP_CONFIRM_FRAMES:
+                        enter_emergency("cube lost BEFORE second crossing", now)
+            elif phase == "past_junction":
+                if not cube_visible:
+                    missing_count += 1
+                    if missing_count >= CUBE1_DROP_CONFIRM_FRAMES:
+                        print("\\nCUBE1: cube dropped AFTER second crossing.")
+                        return "drop"
+                else:
+                    missing_count = 0
+
+            if phase == "emergency" and second_crossing_cleared:
+                black = all(value >= CUBE1_PIT_ALL_BLACK_MIN for value in values)
+                pit_count = pit_count + 1 if black else 0
+                if pit_count >= CUBE1_PIT_CONFIRM_FRAMES:
+                    print("\\nCUBE1: all 8 black AFTER crossing; reversing to find line.")
+                    return "emergency"
+
+            if state.get("position") is None:
+                # Emergency may traverse a short gap; ordinary phases stop
+                # rather than accelerating blind at full PWM.
+                if phase != "emergency":
+                    print("\\nCUBE1: line lost before drop; STOP.")
+                    return None
+                forward_drive_straight()
+            else:
+                differential_drive(state)
+            if now - last_status >= 0.5:
+                print(f"\\rCUBE1 phase={phase} cube={int(cube_visible)} "
+                      f"crossing_passed={int(second_crossing_cleared)}",
+                      end="", flush=True)
                 last_status = now
             time.sleep(LOOP_DELAY)
 
-        print("\nCUBE1: cube search/transport timeout.")
+        print("\\nCUBE1: search/transport timeout; STOP.")
         return None
     finally:
         stop()
 
 
-def cube1_push_past_junction(calibration, cube_sensor, indicator=None):
-    """Push slowly until the cube disappears, with a three-second limit."""
-    start = time.monotonic()
-    deadline = start + CUBE1_DROP_PUSH_TIMEOUT
-    lost_count = 0
-    blink_on = None
+def cube1_emergency_reverse_to_line(calibration):
+    """In emergency, move backwards until the 8-channel line becomes visible."""
+    deadline = time.monotonic() + ROUTE_LINE_REVERSE_TIMEOUT
+    seen = 0
     try:
         while time.monotonic() < deadline:
-            now = time.monotonic()
-            next_blink_on = (
-                int((now - start) / CUBE1_DROP_BLINK_HALF_PERIOD) % 2 == 0
-            )
-            if indicator is not None and next_blink_on != blink_on:
-                indicator.orange() if next_blink_on else indicator.off()
-                blink_on = next_blink_on
-
-            cube_visible = cube_sensor.detected()
-            if cube_visible is None:
-                print("\nCUBE1: cube sensor became stale during final push.")
-                return None
-
-            lost_count = lost_count + 1 if not cube_visible else 0
-            if lost_count >= CUBE1_SENSOR_CONFIRM:
-                print("\nCUBE1: cube dropped; stopping the slow push.")
+            if not line_tracker.all_channels_fresh():
                 return False
-
             state = line_tracker.update(calibration)
-            if state["position"] is None:
-                forward_drive_straight(
-                    speed=CUBE1_DROP_PUSH_SPEED,
-                    max_speed=CUBE1_DROP_PUSH_MAX_SPEED,
-                )
+            if state.get("position") is not None:
+                seen += 1
+                if seen >= ROUTE_LINE_REVERSE_CONFIRM:
+                    print("\nCUBE1: line recovered behind pit.")
+                    return True
             else:
-                differential_drive(
-                    state,
-                    speed=CUBE1_DROP_PUSH_SPEED,
-                    max_speed=CUBE1_DROP_PUSH_MAX_SPEED,
-                )
-            time.sleep(LOOP_DELAY)
-
-        print(
-            f"\nCUBE1: cube still present after the "
-            f"{CUBE1_DROP_PUSH_TIMEOUT:g}-second slow-push timeout."
-        )
-        return True
+                seen = 0
+            line_follower.reverse_straight(ROUTE_LINE_REVERSE_SPEED)
+            time.sleep(ROUTE_LOOP_DELAY)
+        print("\nCUBE1: could not find line behind pit.")
+        return False
     finally:
         stop()
-        if indicator is not None:
-            indicator.off()
-        time.sleep(0.15)
 
 
 def cube1_task(calibration, detector, bus, offset, board, distance_sensor):
-    """Find and carry CUBE1 with the optical sensor, stopping at junction."""
+    """R90 -> arm stages -> cube transport or emergency -> reverse -> R90."""
     from firefighter import Firefighter
 
-    rgb = None
+    indicator = None
     stop()
     try:
-        print("\nCUBE1: turn RIGHT until center sensors confirm the new line.")
+        print("\nCUBE1: align after crossbar then execute gyro R90.")
         if not align_to_crossbar_center(calibration):
             return False
-        ok, left_sign = cube1_turn_to_center_line(
-            calibration, bus, offset, distance_sensor
-        )
+        ok, left_sign = pivot_90(bus, offset, "R", angle_target=TURN_90_ANGLE)
         if not ok or left_sign is None:
-            print("CUBE1: center-line turn failed.")
+            print("\nCUBE1: initial R90 failed.")
             return False
-        # The gripper opens before the arm moves into its working coordinates.
+        # Explicitly NO reacquire_line() here. Move arm immediately.
+        stop()
         if not cube1_arm_action(board):
             return False
-        print("CUBE1: arm lowered; centering on the line before continuing.")
-        if not reacquire_line(calibration, recover_after_line_loss=True):
-            return False
 
-        # PB0 belongs to CUBE1 only from this point onward.  Reports produced
-        # during the turn or arm motion must never count as cube detections.
         cube_sensor = Firefighter(board)
         cube_sensor.initialize()
-        sensor_enabled_at = time.monotonic()
-        cube_sensor.wait_for_sample(after=sensor_enabled_at)
-        rgb = cube1_create_indicator()
-        rgb.off()
-        print("CUBE1: optical sensor ready; starting line following.")
-
-        endpoint = cube1_carry_until_drop(
-            calibration,
-            detector,
-            cube_sensor,
-            on_cube_found=rgb.orange,
-        )
-        if endpoint != "junction":
+        cube_sensor.wait_for_sample(after=time.monotonic())
+        indicator = Cube1Signal(cube1_create_indicator())
+        status = cube1_transport(calibration, detector, cube_sensor, indicator)
+        if status not in ("drop", "emergency"):
             return False
 
-        print(
-            f"\nCUBE1: pushing slowly past the junction until the cube "
-            f"drops (timeout {CUBE1_DROP_PUSH_TIMEOUT:g} seconds)."
-        )
-        cube_still_present = cube1_push_past_junction(
-            calibration, cube_sensor, indicator=rgb
-        )
-        if cube_still_present is None:
+        # Fold arm before reverse; it is no longer holding the cube.
+        if not cube1_fold_arm(board, reason=status):
             return False
-
-        if not cube1_fold_arm(board, reason=endpoint):
-            return False
-
+        if status == "emergency":
+            if not cube1_emergency_reverse_to_line(calibration):
+                return False
+        # Return on the line to the same junction. Keep the existing
+        # geometry-aware reverse controller with gyro heading protection.
         if not button_return(
-            calibration,
-            detector,
-            bus,
-            offset,
-            left_sign,
-            label="CUBE1",
-            accept_s8_only=True,
-            line_loss_timeout=None,
+            calibration, detector, bus, offset, left_sign,
+            label="CUBE1", accept_s8_only=True, line_loss_timeout=None,
         ):
             return False
-
-        print("\nCUBE1: align axle at return junction before final R90.")
         if not align_to_crossbar_center(calibration):
             return False
-        print(f"\nCUBE1: execute final R90.")
-        ok, _ = pivot_90(
-            bus, offset, "R", angle_target=TURN_90_ANGLE
-        )
+        print("\nCUBE1: final R90.")
+        ok, _ = pivot_90(bus, offset, "R", angle_target=TURN_90_ANGLE)
         return ok and reacquire_line(calibration)
     finally:
-        try:
-            stop()
-        finally:
-            if rgb is not None:
-                try:
-                    rgb.off()
-                finally:
-                    rgb.close()
+        stop()
+        if indicator is not None:
+            indicator.close()
 
 
 def firefighter_reverse_until_line(calibration):
@@ -1905,12 +1940,67 @@ def load_route():
     return route
 
 
+def recover_stm32_connection(old_board, calibration):
+    """Reopen the STM32 and resubscribe ADC after an actual stale-data fault.
+
+    Only called from ordinary route following, not during an arm task. If
+    recovery fails, the caller aborts; never blindly arm the old connection.
+    """
+    try:
+        stop()
+    except Exception:
+        pass
+    line_tracker.shutdown()
+    try:
+        old_board.shutdown()
+    except Exception as exc:
+        print(f"STM32 RECOVERY: old connection close error: {exc}")
+    reset_stm32()
+    board = None
+    try:
+        board = telemetrix.Telemetrix(com_port=SERIAL_PORT)
+        motors.initialize(board)
+        motors.motor_stop()
+        # Reset shared STM32-backed servo handles before reattaching.
+        import roboarm
+        roboarm._shared_board = None
+        roboarm._shared_arm = None
+        activate_arm_home(board)
+        line_tracker.initialize(board)
+        if not line_tracker.wait_for_callbacks(timeout=6.0):
+            raise RuntimeError("Not all eight ADC callbacks returned")
+        deadline = time.monotonic() + 2.0
+        while not line_tracker.all_channels_fresh():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("ADC remained stale after reconnect")
+            time.sleep(ROUTE_LOOP_DELAY)
+        if line_tracker.update(calibration).get("position") is None:
+            raise RuntimeError("No track line after reconnect; stop safely")
+        print("STM32 RECOVERY: all eight ADC channels fresh and line visible.")
+        return board
+    except Exception:
+        try:
+            motors.motor_stop()
+        except Exception:
+            pass
+        if board is not None:
+            try:
+                board.shutdown()
+            except Exception:
+                pass
+        raise
+
+
 def main():
     global COLOR_LED_HOLD
     board = bus = sensor = None
     camera_stream = None
     offset_90 = None
     motors_on = tracker_on = False
+    adc_stale_since = None
+    stm32_recovery_count = 0
+    STM32_RECOVERY_LIMIT = 2
+    STM32_RECOVERY_DELAY_SECONDS = 0.75
 
     try:
         route = load_route()
@@ -2001,24 +2091,46 @@ def main():
         while True:
             state = line_tracker.update(calibration)
             if not freshness.accept(state, time.monotonic()):
-                # A repeated callback snapshot is harmless for a short time.
-                # Stop if any channel actually goes stale or a frame is mixed.
                 if not line_tracker.all_channels_fresh():
-                    if not adc_paused:
+                    if adc_stale_since is None:
                         stop()
+                        adc_stale_since = time.monotonic()
                         print(
-                            "\nADC STALE: motors stopped; waiting for all 8 "
-                            f"channels. RAW={state['raw']}"
+                            "\nADC STALE: motor stop, waiting briefly before reboot. "
+                            f"RAW={state['raw']}"
                         )
                     adc_paused = True
                     candidate_count = 0
                     clear_count = 0
                     route_line_loss_count = 0
+                    if time.monotonic() - adc_stale_since >= STM32_RECOVERY_DELAY_SECONDS:
+                        if stm32_recovery_count >= STM32_RECOVERY_LIMIT:
+                            raise RuntimeError(
+                                "ADC stale after maximum STM32 recovery attempts"
+                            )
+                        stm32_recovery_count += 1
+                        print(f"STM32 RECOVERY {stm32_recovery_count}/{STM32_RECOVERY_LIMIT}: "
+                              f"route remains at step {route_index+1}/{len(route)}.")
+                        board = recover_stm32_connection(board, calibration)
+                        freshness = FreshFrames()
+                        fresh_state = line_tracker.update(calibration)
+                        freshness.accept(fresh_state, time.monotonic())
+                        detector = JunctionDetector()
+                        # The just-recovered crossing is not a new command.
+                        latched = fresh_state.get("crossing") is not None
+                        clear_count = 0
+                        candidate_count = 0
+                        route_line_loss_count = 0
+                        adc_paused = False
+                        adc_stale_since = None
+                        offset_90 = None
+                        # Servo outputs were reinitialized on the new board.
                 time.sleep(ROUTE_JUNCTION_POLL_DELAY)
                 continue
             if adc_paused:
                 print("\nADC ready: all 8 channels fresh; route resumed.")
                 adc_paused = False
+            adc_stale_since = None
             position = state["position"]
             route_line_loss_count = (
                 route_line_loss_count + 1 if position is None else 0
@@ -2215,10 +2327,15 @@ def main():
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
     except Exception as exc:
+        import traceback
         print(f"\nERROR: {exc}")
+        traceback.print_exc()  # A Python TypeError is NOT proof of an STM32 fault.
     finally:
         if camera_stream is not None:
-            camera_stream.stop()
+            try:
+                camera_stream.stop()
+            except Exception as exc:
+                print(f"CAMERA cleanup error: {exc}")
         if COLOR_LED_HOLD is not None:
             try:
                 COLOR_LED_HOLD.off()
