@@ -4,8 +4,6 @@
 import math
 import time
 
-from local_route_config import load_local_route
-
 from terminal_status import event_print as print, status_line
 
 import smbus
@@ -1757,16 +1755,15 @@ def color_marker_task(calibration, board, bus, offset, camera_stream=None):
 
 
 def load_route():
-    """Load gitignored route.json, or preserve the default ROUTE on first run."""
-    configured_route = load_local_route(ROUTE)
-    if not configured_route:
+    """Validate the ROUTE list defined directly in main.py."""
+    if not ROUTE:
         raise ValueError(
             "ROUTE is empty. Add your junction commands to the ROUTE list "
-            "in route.json before starting main.py."
+            "in main.py before starting main.py."
         )
 
     route = []
-    for index, command in enumerate(configured_route, 1):
+    for index, command in enumerate(ROUTE, 1):
         if not isinstance(command, str):
             raise ValueError(f"ROUTE entry {index} is not a string.")
         cmd = command.strip().upper()
@@ -1776,7 +1773,7 @@ def load_route():
                 "Allowed: L, R, L90, R90, L90SLOW, R90SLOW, S, BUTTON, CHARGING, "
                 "SLOW, FIREFIGHTER, CUBE1, COLOR, Q."
             )
-        if cmd == "Q" and index != len(configured_route):
+        if cmd == "Q" and index != len(ROUTE):
             raise ValueError("Q must be the last ROUTE entry.")
         route.append(cmd)
     return route
