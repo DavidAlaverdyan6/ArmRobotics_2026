@@ -20,13 +20,13 @@ from stm32_reset import reset_stm32
 PORT = "/dev/serial0"
 
 # Initial tuning guesses, NOT measured/validated gains.
-BASE_SPEED = 100
-MAX_SPEED = 170
+BASE_SPEED = 255
+MAX_SPEED = 255
 MIN_SPEED = 0  # During this standalone forward PID test, never reverse a wheel.
-KP = 30.0     # PWM per normalized sensor-position unit
-KI = 0.5      # PWM per position-unit-second
-KD = 0.4      # PWM-seconds per position unit
-MAX_CORRECTION = 60.0
+KP = 100     # PWM per normalized sensor-position unit
+KI = 0     # PWM per position-unit-second
+KD = 5     # PWM-seconds per position unit
+MAX_CORRECTION = 255
 TARGET_POSITION = line_tracker.CENTER_POSITION  # 0.0 for the 8 symmetric weights
 LOOP_DELAY = 0.04
 REPORT_INTERVAL = 0.25
