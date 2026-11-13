@@ -1388,8 +1388,8 @@ def cube1_task(calibration, detector, bus, offset, board, distance_sensor):
     indicator = None
     stop()
     try:
-        print("\nCUBE1: execute shared R90 with calibrated approach.")
-        ok, left_sign = turn_90(calibration, bus, offset, "R")
+        print("\nCUBE1: initial R90 directly by gyro (no forward approach).")
+        ok, left_sign = pivot_90(bus, offset, "R")
         if not ok or left_sign is None:
             print("\nCUBE1: initial R90 failed.")
             return False

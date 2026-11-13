@@ -32,6 +32,7 @@ class CubeTests(unittest.TestCase):
     def test_first_r90_then_arm_without_recenter(self):
         n = self.nav
         events = []
+        n.pivot_90 = Mock(side_effect=lambda *args, **kw: events.append("R90") or (True,-1))
         n.turn_90 = Mock(side_effect=lambda *args, **kw: events.append("R90") or (True,-1))
         n.cube1_arm_action = Mock(side_effect=lambda *_: events.append("arm") or True)
         n.reacquire_line = Mock(side_effect=lambda *args, **kw: events.append("reacquire") or True)
@@ -46,9 +47,9 @@ class CubeTests(unittest.TestCase):
             "R90", "arm", "transport", "fold",
             "reverse", "R90", "reacquire",
         ])
-        self.assertEqual(n.turn_90.call_count, 2)
-        for call in n.turn_90.call_args_list:
-            self.assertEqual(call.args[-1], "R")
+        n.pivot_90.assert_called_once_with(None, 12.0, "R")
+        n.turn_90.assert_called_once()
+        self.assertEqual(n.turn_90.call_args.args[-1], "R")
 
     def test_turn_pwm_is_constant_and_ignores_line_sensors(self):
         n = self.nav
