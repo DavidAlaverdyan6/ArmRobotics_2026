@@ -2084,7 +2084,8 @@ def cube1_transport(calibration, detector, cube_sensor, indicator):
     """Perform CUBE1 search, carry, and bounded pit emergency.
 
     Return "drop" when cube disappears AFTER the second crossing, or
-    "emergency" only when the PIT is confirmed AFTER that crossing has cleared.
+    "drop_line_lost" when the line disappears after that crossing.
+    "emergency" applies only when the PIT is confirmed in emergency mode.
     A full-black junction must never be mistaken for the pit.
     """
     deadline = time.monotonic() + CUBE1_DROP_TIMEOUT
@@ -2097,6 +2098,7 @@ def cube1_transport(calibration, detector, cube_sensor, indicator):
     post_cross_clear_count = 0
     present_count = 0
     missing_count = 0
+    line_loss_count = 0
     pit_count = 0
     emergency_deadline = None
     last_status = 0.0
@@ -2190,7 +2192,11 @@ def cube1_transport(calibration, detector, cube_sensor, indicator):
                     missing_count += 1
                     if missing_count >= CUBE1_DROP_CONFIRM_FRAMES:
                         print("\\nCUBE1: cube dropped AFTER second crossing.")
-                        return "drop"
+                        return (
+                            "drop_line_lost"
+                            if state.get("position") is None
+                            else "drop"
+                        )
                 else:
                     missing_count = 0
 
@@ -2202,8 +2208,23 @@ def cube1_transport(calibration, detector, cube_sensor, indicator):
                     return "emergency"
 
             if state.get("position") is None:
-                # Emergency may traverse a short gap; ordinary phases stop
-                # rather than accelerating blind at full PWM.
+                # A confirmed line loss after the second crossing is an
+                # alternative successful drop. Stop during confirmation:
+                # do not drive blindly past the end of the track.
+                if (
+                    phase == "past_junction" and second_crossing_seen
+                    and not candidate and not left and not right
+                ):
+                    line_loss_count += 1
+                    stop()
+                    if line_loss_count >= CUBE1_LINE_LOSS_CONFIRM:
+                        print(
+                            "\\nCUBE1: line lost after second crossing; "
+                            "counting cube as dropped. Reverse to find line."
+                        )
+                        return "drop_line_lost"
+                    time.sleep(LOOP_DELAY)
+                    continue
                 if phase != "emergency":
                     print("\\nCUBE1: line lost before drop; STOP.")
                     return None
@@ -2212,6 +2233,7 @@ def cube1_transport(calibration, detector, cube_sensor, indicator):
                     max_speed=MANEUVER_MAX_SPEED,
                 )
             else:
+                line_loss_count = 0
                 differential_drive(state)
             if now - last_status >= 0.5:
                 print(f"CUBE1 phase={phase} cube={int(cube_visible)} "
@@ -2226,7 +2248,7 @@ def cube1_transport(calibration, detector, cube_sensor, indicator):
 
 
 def cube1_emergency_reverse_to_line(calibration):
-    """In emergency, move backwards until the 8-channel line becomes visible."""
+    """Reverse until line is visible after an emergency OR a confirmed drop."""
     seen = 0
     try:
         while True:
@@ -2237,7 +2259,7 @@ def cube1_emergency_reverse_to_line(calibration):
             if state.get("position") is not None:
                 seen += 1
                 if seen >= CUBE1_EMERGENCY_REVERSE_CONFIRM:
-                    print("\nCUBE1: line recovered behind pit.")
+                    print("\nCUBE1: line recovered; reversing to starting junction.")
                     return True
             else:
                 seen = 0
@@ -2306,13 +2328,13 @@ def cube1_task(calibration, detector, bus, offset, board):
         cube_sensor.wait_for_sample(after=time.monotonic())
         indicator = Cube1Signal(cube1_create_indicator())
         status = cube1_transport(calibration, detector, cube_sensor, indicator)
-        if status not in ("drop", "emergency"):
+        if status not in ("drop", "drop_line_lost", "emergency"):
             return False
 
         # Fold arm before reverse; it is no longer holding the cube.
         if not cube1_fold_arm(board, reason=status):
             return False
-        if status == "emergency":
+        if status in ("emergency", "drop_line_lost"):
             if not cube1_emergency_reverse_to_line(calibration):
                 return False
         # Return on the line to the same junction. Keep the existing
