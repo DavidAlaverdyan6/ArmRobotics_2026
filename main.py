@@ -4,6 +4,8 @@
 import math
 import time
 
+from terminal_status import event_print as print, status_line
+
 import smbus
 from telemetrix import telemetrix
 
@@ -972,11 +974,7 @@ def button_bumper_approach(calibration, sensor):
 
             now = time.monotonic()
             if now - last_status >= BUTTON_BUMPER_STATUS_SECONDS:
-                print(
-                    f"\rBUTTON RAM distance={distance_cm:.1f} cm",
-                    end="",
-                    flush=True,
-                )
+                status_line(f"BUTTON RAM distance={distance_cm:.1f} cm")
                 last_status = now
             if state["position"] is None:
                 # Continue straight only during the bounded bumper press.
@@ -1119,11 +1117,10 @@ def button_return(
                 position_text = (
                     "None" if position is None else f"{position:+.3f}"
                 )
-                print(
-                    f'\r\033[2K{label} BACK pos={position_text} '
+                status_line(
+                    f'{label} BACK pos={position_text} '
                     f'S1={int(left)} S8={int(right)} '
-                    f'armed={int(cleared_count >= JUNCTION_CLEAR)}',
-                    end="", flush=True,
+                    f'armed={int(cleared_count >= JUNCTION_CLEAR)}'
                 )
                 last_status = now
             time.sleep(LOOP_DELAY)
@@ -1408,9 +1405,8 @@ def cube1_transport(calibration, detector, cube_sensor, indicator):
             else:
                 differential_drive(state)
             if now - last_status >= 0.5:
-                print(f"\\rCUBE1 phase={phase} cube={int(cube_visible)} "
-                      f"crossing_passed={int(second_crossing_cleared)}",
-                      end="", flush=True)
+                status_line(f"CUBE1 phase={phase} cube={int(cube_visible)} "
+                            f"crossing_passed={int(second_crossing_cleared)}")
                 last_status = now
             time.sleep(LOOP_DELAY)
 
@@ -2213,10 +2209,9 @@ def main():
                     "NO LINE: paused"
                     if position is None else f"LINE pos={position:+.3f}"
                 )
-                print(
-                    f"\r\033[2K{status} S1={int(left)} S8={int(right)} "
-                    f"CROSSING={crossing or 'None'}",
-                    end="", flush=True,
+                status_line(
+                    f"{status} S1={int(left)} S8={int(right)} "
+                    f"CROSSING={crossing or 'None'}"
                 )
                 last_position_status = now
 
