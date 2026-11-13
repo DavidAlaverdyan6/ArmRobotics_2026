@@ -1861,13 +1861,7 @@ def recover_stm32_connection(old_board, calibration):
     board = None
     try:
         board = telemetrix.Telemetrix(com_port=SERIAL_PORT)
-        motors.initialize(board)
-        motors.motor_stop()
-        # Reset shared STM32-backed servo handles before reattaching.
-        import roboarm
-        roboarm._shared_board = None
-        roboarm._shared_arm = None
-        activate_arm_home(board)
+        # Preserve the differential2.py order during recovery as well.
         line_tracker.initialize(board)
         if not line_tracker.wait_for_callbacks(timeout=6.0):
             raise RuntimeError("Not all eight ADC callbacks returned")
@@ -1878,6 +1872,14 @@ def recover_stm32_connection(old_board, calibration):
             time.sleep(ROUTE_LOOP_DELAY)
         if line_tracker.update(calibration).get("position") is None:
             raise RuntimeError("No track line after reconnect; stop safely")
+        motors.initialize(board)
+        motors.motor_stop()
+        # Reset shared STM32-backed servo handles before reattaching.
+        import roboarm
+        roboarm._shared_board = None
+        roboarm._shared_arm = None
+        activate_arm_home(board)
+        motors.motor_stop()
         print("STM32 RECOVERY: all eight ADC channels fresh and line visible.")
         return board
     except Exception:
@@ -1912,16 +1914,11 @@ def main():
             f"Resetting STM32 through Raspberry Pi BCM{STM32_RESET_GPIO}..."
         )
         reset_stm32()
-        # Connect once, force the drive outputs to zero, then enable the arm.
+        # Match the verified differential2.py / ADC.py startup sequence:
+        # subscribe to every analog input BEFORE motor or servo pin commands.
+        # No output pins are configured and no movement is commanded until
+        # all eight ADC channels have returned valid, fresh samples.
         board = telemetrix.Telemetrix(com_port=SERIAL_PORT)
-        # Do this before any servo motion or callback wait.  It prevents a
-        # previous PWM state from moving the chassis while servos wake up.
-        motors.initialize(board)
-        motors_on = True
-        stop()
-        activate_arm_home(board)
-
-        # Only after the arm is held safely at home, register all ADC inputs.
         line_tracker.initialize(board)
         tracker_on = True
 
@@ -1946,8 +1943,7 @@ def main():
         ready_deadline = time.monotonic() + 2.0
         while not line_tracker.all_channels_fresh():
             if time.monotonic() >= ready_deadline:
-                stop()
-                print("ERROR: ADC channels are stale or out of sync; motors remain stopped.")
+                print("ERROR: ADC channels are stale or out of sync; motors remain uninitialized.")
                 print(f"Latest RAW values: {line_tracker.update(calibration)['raw']}")
                 return
             time.sleep(ROUTE_LOOP_DELAY)
@@ -1956,6 +1952,15 @@ def main():
         freshness.accept(startup_state, time.monotonic())
         print(f"All eight ADC channels ready: {startup_state['raw']}")
         print(f"Initial line position: {startup_state['position']}")
+
+        # As in differential2.py, configure motor outputs only after the ADC
+        # subscriptions have succeeded. Keep chassis PWM at zero while servos
+        # are attached and moved to the starting pose.
+        motors.initialize(board)
+        motors_on = True
+        motors.motor_stop()
+        activate_arm_home(board)
+        motors.motor_stop()
 
         # The MJPEG preview is optional; a streaming-only failure should
         # not abort line navigation. COLOR can open its own capture later.
