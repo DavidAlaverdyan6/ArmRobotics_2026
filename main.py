@@ -8,6 +8,7 @@ from terminal_status import event_print as print, status_line
 
 import smbus
 from telemetrix import telemetrix
+from telemetrix_guard import install_unexpected_onewire_guard
 
 import line_tracker
 import motors
@@ -15,6 +16,10 @@ from forward_line_pid import ForwardLinePID
 from navigation_core import FreshFrames
 from stm32_reset import STM32_RESET_GPIO, reset_stm32
 from sensors.vl53l0x_sensor import VL53L0XSensor
+
+# Install before any Telemetrix board is constructed: the library binds
+# reporter dispatch callbacks during __init__.
+install_unexpected_onewire_guard(telemetrix.Telemetrix)
 
 PROGRAM_BUILD = "hsv-blue-light-filter-2026-11-11.43"
 
