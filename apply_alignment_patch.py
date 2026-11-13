@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Apply the L90/R90 trailing-edge alignment patch to the pinned main_test.py.
 
-Place this file, turn_alignment.py, and measure_55mm_interactive.py in the
+Place this file, turn_alignment.py, and measure_55mm.py in the
 ArmRobotics_2026 repository root; run `python3 apply_alignment_patch.py`.
 Creates a backup and refuses unexpected source versions, without running motors.
 """
@@ -100,7 +100,7 @@ def main():
     shutil.copy2(MAIN,backup)
     MAIN.write_text(updated,encoding='utf-8')
     print('Patched main_test.py; backup:',backup)
-    print('Calibrate at PWM 80 using measure_55mm_interactive.py at two distinct times before L90/R90.')
+    print('Calibrate at PWM 80 using measure_55mm.py at two distinct times before L90/R90.')
 
 if __name__=='__main__':
     main()
