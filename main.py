@@ -203,7 +203,7 @@ COLOR_LED_HOLD = None
 
 # Automatic route: one active command for each junction; Q stops.
 ROUTE = [
-    "BUTTON",
+    "L90",
     "L90",
     "CUBE1",
     "R",
