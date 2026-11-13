@@ -569,11 +569,8 @@ def pivot(bus, offset, direction, angle_target=TURN_ANGLE):
 
 
 def turn_90_pwm(angle, side_seen, slow=False):
-    """Consistent PWM ladder for all standard 90-degree turns."""
-    pwm = (TURN_PWM_EDGE if side_seen
-           else TURN_PWM_SLOW if angle >= TURN_90_SLOWDOWN_ANGLE
-           else TURN_PWM_FAST)
-    return min(pwm, SLOW_90_PWM_FAST) if slow else pwm
+    """Fixed PWM for gyro-only 90-degree turns; legacy args kept for callers."""
+    return SLOW_90_PWM_FAST if slow else TURN_PWM_SLOW
 
 
 def pivot_90(
@@ -584,13 +581,10 @@ def pivot_90(
     slow=False,
     calibration=None,
 ):
-    """Shared gyro + line-tracker turn. The preceding calibrated pulse belongs
-    to turn_90(), not individual route tasks.
+    """Rotate to the requested angle using only the gyro (no ADC sampling).
 
-    Begin at PWM180; at 60 degrees use PWM150; when the outer sensor on the
-    turning side confirms black use PWM100; stop on a confirmed center-line
-    capture. If the sensors miss the line, finish to the gyro 90-degree limit.
-    A gyro fault / missing ADC data stops the robot instead of driving blindly.
+    The calibrated approach to the junction is performed by turn_90().
+    No S1/S8 detection, center-line capture, or multi-stage PWM changes.
     """
     if direction not in ("L", "R"):
         raise ValueError("Turn direction must be L or R")
@@ -601,17 +595,7 @@ def pivot_90(
     gyro_sign = candidate_sign = None
     direction_samples = 0
     reverse_since = None
-    side_hits = center_hits = 0
-    side_seen = False
-    captured_line = False
-    frames = FreshFrames()
-    # The wide crossing must clear before a new side-line detection is trusted.
-    # This avoids completing the turn on the crossing being exited.
-    side_clear_hits = 0
-    edge_armed = False
-    sensor_index = 0 if left else 7
-    center_indices = (3, 4)
-    last_sensor_report = 0.0
+    pwm = turn_90_pwm(0, False, slow=slow)
 
     try:
         while True:
@@ -647,53 +631,17 @@ def pivot_90(
                 angle = max(0.0, angle + directed * dt)
                 signed += rate * dt
 
-            if calibration is not None and angle >= TURN_90_SLOWDOWN_ANGLE:
-                if not line_tracker.all_channels_fresh():
-                    raise RuntimeError("GYRO_TURN: stale ADC during line capture")
-                state = line_tracker.update(calibration)
-                values = state.get("normalized", [])
-                if len(values) != 8:
-                    raise RuntimeError("GYRO_TURN: expected 8 line sensors")
-                if frames.accept(state, now):
-                    # The original crossbar must have cleared before we trust
-                    # the side sensor as a *new* line. A short repeated black
-                    # sample is not sufficient to switch speeds.
-                    if values[sensor_index] < TURN_90_SENSOR_ON:
-                        side_clear_hits += 1
-                        if side_clear_hits >= TURN_90_EDGE_CONFIRM:
-                            edge_armed = True
-                    elif edge_armed:
-                        side_hits += 1
-                        if side_hits >= TURN_90_EDGE_CONFIRM:
-                            if not side_seen:
-                                print(f"\\nGYRO_TURN {direction}: S{sensor_index+1} sees line; PWM100.")
-                            side_seen = True
-                    if side_seen:
-                        if (min(values[i] for i in center_indices) >=
-                                TURN_90_CENTER_ON):
-                            center_hits += 1
-                            if center_hits >= TURN_90_CENTER_CONFIRM:
-                                captured_line = True
-                                print(f"\\nGYRO_TURN {direction}: center sensors confirmed.")
-                                break
-                        else:
-                            center_hits = 0
-
-            # Gyro is the hard fallback even if neither outer nor center
-            # sensors ever detects the new line.
             if angle >= angle_target:
-                print(f"\\nGYRO_TURN {direction}: gyro {angle_target:g} degree fallback.")
                 break
             if now - start >= GYRO_TIMEOUT or (now - start > 0.7 and angle < 2):
-                print(f"\\nGYRO_TURN {direction}: timeout/no rotation at {angle:.1f} degrees")
+                print(f"GYRO_TURN {direction}: timeout/no rotation at {angle:.1f} degrees")
                 return False, None
 
-            pwm = turn_90_pwm(angle, side_seen, slow=slow)
             motors.set_speeds(-pwm if left else pwm, pwm if left else -pwm)
             time.sleep(0.005)
 
         stop()
-        # Measure coast without starting a second arbitrary correction turn.
+        # Measure coast without starting any additional correction turn.
         settle_until = time.monotonic() + 0.05
         while time.monotonic() < settle_until:
             now = time.monotonic()
@@ -704,34 +652,27 @@ def pivot_90(
             time.sleep(0.005)
         final_angle = abs(signed)
         print(
-            f"\\nGYRO_TURN {direction}: target={angle_target:.1f}, "
-            f"gyro={final_angle:.1f}, error={final_angle-angle_target:+.1f}; "
-            f"finish={'line' if captured_line else 'gyro fallback'}"
+            f"GYRO_TURN {direction}: target={angle_target:.1f}, "
+            f"gyro={final_angle:.1f}, error={final_angle-angle_target:+.1f}"
         )
         left_sign = None
         if abs(signed) > 5:
             observed_sign = 1 if signed > 0 else -1
             left_sign = observed_sign if left else -observed_sign
-        # A properly confirmed center line is success even if wheel inertia
-        # makes the gyro angle differ; otherwise the gyro fallback must be
-        # close to the requested angle.
         tolerance = min(TURN_TOLERANCE_DEG, angle_target * 0.2)
-        return (captured_line or abs(final_angle-angle_target) <= tolerance), left_sign
+        return abs(final_angle-angle_target) <= tolerance, left_sign
     finally:
         stop()
         time.sleep(0.02)
 
 
 def turn_90(calibration, bus, offset, direction, *, slow=False):
-    """ONE shared R90/L90: calibrate.py crossing pulse then sensor/gyro turn.
-
-    All tasks call this same function; no per-task PWM, angle or timing hacks.
-    """
+    """Shared R90/L90: calibrated junction approach, then pure gyro 90 degrees."""
     if not align_to_crossbar_center(calibration):
         return False, None
     return pivot_90(
         bus, offset, direction, angle_target=TURN_90_ANGLE,
-        slow=slow, calibration=calibration,
+        slow=slow,
     )
 
 

@@ -50,12 +50,28 @@ class CubeTests(unittest.TestCase):
         for call in n.turn_90.call_args_list:
             self.assertEqual(call.args[-1], "R")
 
-    def test_turn_pwm_ladder(self):
-        n=self.nav
-        self.assertEqual(n.turn_90_pwm(0, False), 180)
-        self.assertEqual(n.turn_90_pwm(59.9, False), 180)
-        self.assertEqual(n.turn_90_pwm(60.0, False), 150)
-        self.assertEqual(n.turn_90_pwm(70, True), 100)
+    def test_turn_pwm_is_constant_and_ignores_line_sensors(self):
+        n = self.nav
+        self.assertEqual(n.turn_90_pwm(0, False), n.TURN_PWM_SLOW)
+        self.assertEqual(n.turn_90_pwm(80, True), n.TURN_PWM_SLOW)
+        self.assertEqual(n.turn_90_pwm(80, True, slow=True), n.SLOW_90_PWM_FAST)
+
+    def test_gyro_turn_does_not_read_adc(self):
+        n = self.nav
+        # A short deterministic fake gyro trace: the only input to pivot_90.
+        clock = [0.0]
+        def tick():
+            clock[0] += 0.01
+            return clock[0]
+        n.gyro_rate = Mock(return_value=250.0)
+        n.time.monotonic = tick
+        n.time.sleep = Mock()
+        n.line_tracker.all_channels_fresh = Mock(side_effect=AssertionError("ADC queried"))
+        n.line_tracker.update = Mock(side_effect=AssertionError("ADC queried"))
+        result, _ = n.pivot_90(Mock(), 0, "L")
+        self.assertTrue(result)
+        n.line_tracker.all_channels_fresh.assert_not_called()
+        n.line_tracker.update.assert_not_called()
 
     def test_turn90_wrapper_keeps_alignment_before_gyro_turn(self):
         n = self.nav
@@ -68,7 +84,7 @@ class CubeTests(unittest.TestCase):
         )
         self.assertEqual(n.turn_90("calibration", "bus", 1.0, "R"), (True,-1))
         self.assertEqual(events, ["calibrated_drive", "turn"])
-        self.assertEqual(n.pivot_90.call_args.kwargs["calibration"], "calibration")
+        self.assertNotIn("calibration", n.pivot_90.call_args.kwargs)
 
     def test_turn90_alignment_failure_prevents_rotation(self):
         n = self.nav
