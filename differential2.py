@@ -71,6 +71,7 @@ class LinePID:
 def main():
     board = None
     sensors_ready = False
+    motors_ready = False
     controller = LinePID()
     last_report = 0.0
     freshness = FreshFrames()
@@ -78,8 +79,10 @@ def main():
     try:
         reset_stm32()
         board = telemetrix.Telemetrix(com_port=PORT)
-        motors.initialize(board)
-        motors.motor_stop()
+
+        # Match ADC.py exactly: register analog inputs immediately after
+        # connection, before configuring/writing any motor outputs.
+        # Only enable the motor driver after all eight inputs report.
         line_tracker.initialize(board)
         sensors_ready = True
 
@@ -90,13 +93,26 @@ def main():
 
         print("Waiting for all eight analog channels...")
         if not line_tracker.wait_for_callbacks(timeout=SENSOR_STARTUP_TIMEOUT):
+            state = line_tracker.update(calibration)
             print("ADC callback timeout. Missing channels:",
                   [i + 1 for i, ready in enumerate(line_tracker.callback_status())
                    if not ready])
+            print("Configured pins:", line_tracker.SENSOR_PINS)
+            print("Callback counts:", state["sample_ids"])
+            print("Latest raw values:", state["raw"])
+            print("No motor outputs have been initialized; robot stays stopped.")
             return
         if not line_tracker.all_channels_fresh():
+            state = line_tracker.update(calibration)
             print("Sensor readings are stale or unsynchronized. Motors kept stopped.")
+            print("Callback counts:", state["sample_ids"])
+            print("Latest raw values:", state["raw"])
             return
+
+        # Motor outputs are configured only after successful analog pairing.
+        motors.initialize(board)
+        motors_ready = True
+        motors.motor_stop()
 
         print(
             f"PID ready: target={TARGET_POSITION:.2f} "
@@ -138,7 +154,10 @@ def main():
     finally:
         if board is not None:
             try:
-                motors.motor_stop()
+                # If ADC pairing failed before motors.initialize(), do not
+                # send motor writes to an uninitialized motor driver.
+                if motors_ready:
+                    motors.motor_stop()
             finally:
                 try:
                     if sensors_ready:
