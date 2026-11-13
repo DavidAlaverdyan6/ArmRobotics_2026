@@ -1833,45 +1833,52 @@ def firefighter_task(
 
 
 def charging_task():
-    """Stop for 11 s: blink RED for 9 s, GREEN for 2 s, then turn R."""
+    """Honor the 11-second charging pause even if its visual LED fails.
+
+    A display-only failure must not cancel the route. Motors remain stopped
+    throughout the pause; navigation still validates the subsequent turn.
+    """
     stop()
     rgb = None
     try:
-        # The existing led.RGBLED handles the robot's active-low RGB pins.
-        import led
-        import robot_pin_config as pins
+        try:
+            rgb = create_robot_rgb_indicator()
+        except Exception as exc:
+            print(f"\nC: RGB unavailable ({exc}); continuing timed charge without LED.")
 
-        # Physical red/blue LED channels are swapped on this robot:
-        # previous RED command lit BLUE. Swap only here, not global pins.
-        rgb = create_robot_rgb_indicator()
         start = time.monotonic()
         red_end = start + CHARGE_RED_SECONDS
         park_end = start + CHARGE_SECONDS
 
-        print("\nC: robot stopped. Red blinking for 9 seconds.")
+        def indicate(method):
+            nonlocal rgb
+            if rgb is None:
+                return
+            try:
+                getattr(rgb, method)()
+            except Exception as exc:
+                print(f"\nC: RGB indicator failed ({exc}); charging timer continues.")
+                try:
+                    rgb.close()
+                except Exception:
+                    pass
+                rgb = None
+
+        print("\nC: charging pause; red blink for 9 seconds if LED available.")
         while time.monotonic() < red_end:
-            rgb.red()
-            time.sleep(
-                max(0.0, min(CHARGE_BLINK_HALF_PERIOD,
-                             red_end - time.monotonic()))
-            )
-            rgb.off()
-            time.sleep(
-                max(0.0, min(CHARGE_BLINK_HALF_PERIOD,
-                             red_end - time.monotonic()))
-            )
-
-        print("\nC: green ON for remaining 2 seconds.")
-        rgb.green()
+            indicate("red")
+            time.sleep(max(0.0, min(
+                CHARGE_BLINK_HALF_PERIOD, red_end - time.monotonic()
+            )))
+            indicate("off")
+            time.sleep(max(0.0, min(
+                CHARGE_BLINK_HALF_PERIOD, red_end - time.monotonic()
+            )))
+        print("\nC: remaining 2 seconds; green LED if available.")
+        indicate("green")
         time.sleep(max(0.0, park_end - time.monotonic()))
-        print("\nC: charging complete; turning RIGHT.")
+        print("\nC: charging pause complete; proceeding to validated right turn.")
         return True
-
-    except Exception as exc:
-        print(f"\nC: RGB charging error: {exc}")
-        print("C: not turning until the light problem is resolved.")
-        return False
-
     finally:
         if rgb is not None:
             try:
@@ -2047,9 +2054,20 @@ def main():
         print(f"All eight ADC channels ready: {startup_state['raw']}")
         print(f"Initial line position: {startup_state['position']}")
 
-        from color_marker_detector import ContinuousCamera
-        camera_stream = ContinuousCamera(port=8000)
-        camera_stream.start()
+        # The MJPEG preview is optional; a streaming-only failure should
+        # not abort line navigation. COLOR can open its own capture later.
+        try:
+            from color_marker_detector import ContinuousCamera
+            camera_stream = ContinuousCamera(port=8000)
+            camera_stream.start()
+        except Exception as exc:
+            print(f"\nCAMERA STREAM unavailable ({exc}); route continues without preview.")
+            if camera_stream is not None:
+                try:
+                    camera_stream.stop()
+                except Exception:
+                    pass
+            camera_stream = None
 
         print("Starting route; line tracker will self-center the robot.")
 
