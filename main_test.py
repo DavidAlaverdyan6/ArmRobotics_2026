@@ -312,7 +312,15 @@ COLOR_ARM_ANGLES = {
     "gripper": 0.0,
 }
 COLOR_LED_HOLD = None
-
+BUTTON_BOUNCE_START = (0.0, 150.0, 50.0)
+BUTTON_BOUNCE_PRESS = (0.0, 250.0, -50.0)
+BUTTON_BOUNCE_GRIPPER_CLOSED = 180.0
+BUTTON_BOUNCE_DRIVE_PWM = 130
+BUTTON_BOUNCE_CENTER_FRACTION = 0.20
+BUTTON_BOUNCE_RED_AREA = 120
+BUTTON_BOUNCE_CONFIRM_FRAMES = 3
+BUTTON_BOUNCE_SEARCH_TIMEOUT = 20.0
+BUTTON_BOUNCE_REVERSE_LINE_TIMEOUT = 5.0
 
 
 # Automatic route: one entry for each detected junction, in order.
@@ -389,7 +397,7 @@ ALLOWED_ROUTE_COMMANDS = {
 
     "L", "R", "L90", "R90", "S",
 
-    "BUTTON", "CHARGING", "FIREFIGHTER", "CUBE1", "COLOR", "Q",
+    "BUTTON", "BUTTON_BOUNCE", "CHARGING", "FIREFIGHTER", "CUBE1", "COLOR", "Q",
 
 }
 
@@ -2868,6 +2876,134 @@ def color_marker_task(calibration, board, bus, offset):
         stop()
 
 
+
+def button_bounce_arm_pose(board, xyz):
+    """Move the closed gripper using the existing auto-pitch IK."""
+    import arm_web
+    from roboarm import get_shared_arm
+    from button_arm import _execute_plan
+
+    stop()
+    arm, _ = get_shared_arm(board)
+    arm_web.arm = arm
+    x, y, z = xyz
+    path, pitch = arm_web.plan_auto_path({
+        "x": x, "y": y, "z": z, "orientation_mode": "auto",
+    })
+    arm.write(gripper=BUTTON_BOUNCE_GRIPPER_CLOSED)
+    print(f"BUTTON_BOUNCE: arm ({x:g},{y:g},{z:g}), auto pitch {pitch:.1f}.")
+    _execute_plan(arm, path, arm_web.STEP_DELAY)
+    arm.write(gripper=BUTTON_BOUNCE_GRIPPER_CLOSED)
+    return True
+
+
+def button_bounce_red_centered(objects, width, height):
+    """Require the red blob's centroid in the central 20% x 20% rectangle."""
+    half_w = width * BUTTON_BOUNCE_CENTER_FRACTION / 2
+    half_h = height * BUTTON_BOUNCE_CENTER_FRACTION / 2
+    return any(
+        obj["color"] == "red"
+        and obj["area"] >= BUTTON_BOUNCE_RED_AREA
+        and abs(obj["center"][0] - width / 2) <= half_w
+        and abs(obj["center"][1] - height / 2) <= half_h
+        for obj in objects
+    )
+
+
+def button_bounce_find_red():
+    """Advance at PWM130 while watching fresh camera frames for centered red."""
+    import cv2
+    from color_marker_detector import ContinuousCamera, ColorMarkerDetector
+
+    camera = ContinuousCamera(port=8000)
+    color_detector = ColorMarkerDetector(
+        min_object_area=BUTTON_BOUNCE_RED_AREA,
+        allowed_colors={"red"},
+    )
+    stop()
+    try:
+        camera.start()
+        sequence = camera.sequence
+        confirmed = 0
+        deadline = time.monotonic() + BUTTON_BOUNCE_SEARCH_TIMEOUT
+        camera.start_task("BUTTON_BOUNCE: searching centered red")
+        while time.monotonic() < deadline:
+            if not line_tracker.all_channels_fresh():
+                print("\nBUTTON_BOUNCE: stale ADC; stopping.")
+                return False
+            captured = camera.get_frame(after_sequence=sequence, timeout=0.3)
+            if captured is None:
+                stop()  # Never drive on a frozen camera stream.
+                continue
+            sequence, frame = captured
+            objects, annotated, _ = color_detector.process_frame(frame)
+            height, width = frame.shape[:2]
+            centered = button_bounce_red_centered(objects, width, height)
+            confirmed = confirmed + 1 if centered else 0
+            half_w = int(width * BUTTON_BOUNCE_CENTER_FRACTION / 2)
+            half_h = int(height * BUTTON_BOUNCE_CENTER_FRACTION / 2)
+            cv2.rectangle(
+                annotated,
+                (width // 2 - half_w, height // 2 - half_h),
+                (width // 2 + half_w, height // 2 + half_h),
+                (255, 255, 255), 2,
+            )
+            camera.publish_task_frame(
+                annotated,
+                f"BUTTON_BOUNCE: red center {confirmed}/{BUTTON_BOUNCE_CONFIRM_FRAMES}",
+            )
+            if confirmed >= BUTTON_BOUNCE_CONFIRM_FRAMES:
+                stop()
+                print("\nBUTTON_BOUNCE: centered red confirmed.")
+                return True
+            motors.set_speeds(BUTTON_BOUNCE_DRIVE_PWM, BUTTON_BOUNCE_DRIVE_PWM)
+        print("\nBUTTON_BOUNCE: camera search timeout.")
+        return False
+    finally:
+        stop()
+        camera.stop()
+
+
+def button_bounce_task(calibration, detector, bus, offset, board):
+    """Normal R, closed-gripper poses, centered red, reverse, CUBE1-style R90."""
+    indicator = None
+    stop()
+    try:
+        print("\nBUTTON_BOUNCE: execute ordinary R.")
+        ok, left_sign = pivot(bus, offset, "R")
+        if not ok or left_sign is None or not reacquire_line(calibration):
+            return False
+        if not button_bounce_arm_pose(board, BUTTON_BOUNCE_START):
+            return False
+        if not button_bounce_find_red():
+            return False
+        indicator = create_robot_rgb_indicator()
+        indicator.red()
+        print("BUTTON_BOUNCE: red LED on.")
+        if not button_bounce_arm_pose(board, BUTTON_BOUNCE_PRESS):
+            return False
+        if not button_return(
+            calibration, detector, bus, offset, left_sign,
+            label="BUTTON_BOUNCE",
+            line_loss_timeout=BUTTON_BOUNCE_REVERSE_LINE_TIMEOUT,
+        ):
+            return False
+        # Same PWM80 0.5-second forward pulse as the completed CUBE1.
+        if not cube1_final_turn_approach():
+            return False
+        print("\nBUTTON_BOUNCE: final R90.")
+        ok, _ = pivot_90(bus, offset, "R", angle_target=TURN_90_ANGLE)
+        return ok and reacquire_line(calibration)
+    except Exception as exc:
+        print(f"\nBUTTON_BOUNCE: error: {exc}")
+        return False
+    finally:
+        stop()
+        if indicator is not None:
+            indicator.off()
+            indicator.close()
+
+
 def load_route():
 
     """Read the user-edited ROUTE list before starting the robot."""
@@ -2902,7 +3038,7 @@ def load_route():
 
                 "Allowed: L, R, L90, R90, S, BUTTON, CHARGING, "
 
-                "FIREFIGHTER, CUBE1, COLOR, Q."
+                "FIREFIGHTER, CUBE1, COLOR, BUTTON_BOUNCE, Q."
 
             )
 
@@ -3145,7 +3281,7 @@ def main():
 
                 elif cmd in (
 
-                    "L", "R", "L90", "R90", "BUTTON", "CHARGING",
+                    "L", "R", "L90", "R90", "BUTTON", "BUTTON_BOUNCE", "CHARGING",
 
                     "FIREFIGHTER", "CUBE1",
 
@@ -3185,6 +3321,12 @@ def main():
 
                             calibration, detector, sensor, bus, offset, board
 
+                        )
+
+                    elif cmd == "BUTTON_BOUNCE":
+
+                        ok = button_bounce_task(
+                            calibration, detector, bus, offset, board
                         )
 
                     elif cmd == "FIREFIGHTER":
@@ -3275,7 +3417,7 @@ def main():
 
                     "L", "R", "L90", "R90", "BUTTON", "CHARGING",
 
-                    "FIREFIGHTER", "CUBE1", "COLOR",
+                    "FIREFIGHTER", "CUBE1", "COLOR", "BUTTON_BOUNCE",
 
                 ):
 
