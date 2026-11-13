@@ -2945,7 +2945,7 @@ def button_bounce_find_red(calibration):
                     print("BUTTON_BOUNCE: camera stalled; stopping.")
                     return False
                 differential_drive(
-                    state, speed=BUTTON_BOUNCE_DRIVE_PWM, max_speed=MAX_SPEED
+                    state, speed=BUTTON_BOUNCE_DRIVE_PWM, max_speed=BUTTON_BOUNCE_DRIVE_PWM
                 )
                 time.sleep(LOOP_DELAY)
                 continue
@@ -2972,7 +2972,7 @@ def button_bounce_find_red(calibration):
                 print("\nBUTTON_BOUNCE: centered red confirmed.")
                 return True
             differential_drive(
-                state, speed=BUTTON_BOUNCE_DRIVE_PWM, max_speed=MAX_SPEED
+                state, speed=BUTTON_BOUNCE_DRIVE_PWM, max_speed=BUTTON_BOUNCE_DRIVE_PWM
             )
             time.sleep(LOOP_DELAY)
         print("\nBUTTON_BOUNCE: camera search timeout.")
