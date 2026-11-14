@@ -259,6 +259,7 @@ FIRE_APPROACH_SPEED = 70
 FIRE_APPROACH_MAX_SPEED = 100
 
 FIRE_APPROACH_TIMEOUT = 12.0
+FIRE_FINAL_ADVANCE_SECONDS = 0.3
 
 FIRE_LINE_RECOVERY_SPEED = 80
 
@@ -318,7 +319,9 @@ BUTTON_BOUNCE_PRESS = (0.0, 250.0, -50.0)
 BUTTON_BOUNCE_GRIPPER_CLOSED = 180.0
 BUTTON_BOUNCE_DRIVE_PWM = 130
 BUTTON_BOUNCE_MAX_SPEED = 130  # Wheel PWM ceiling during camera-guided approach.
-BUTTON_BOUNCE_LOOP_DELAY = 0.04  # Use the validated standalone PID test cadence.
+BUTTON_BOUNCE_LOOP_DELAY = 0.04
+BUTTON_BOUNCE_KP = 65.0
+BUTTON_BOUNCE_KD = 2.0  # Use the validated standalone PID test cadence.
 # KP=100, KI=0, KD=5 and MIN_SPEED=0 are inherited from line_follower.
 # MAX_CORRECTION=255 is a reference setting; wheel PWM is clamped to 0..130.
 BUTTON_BOUNCE_CENTER_FRACTION = 0.20
@@ -1411,6 +1414,10 @@ def reacquire_line(calibration):
 
     """Use differential2 driving after EVERY turn, including edge-only line."""
 
+    state = line_tracker.update(calibration)
+    if state.get("position") is not None:
+        print("\nREACQUIRE: visible line, handing over to existing PD.")
+        return True
     deadline = time.monotonic() + REACQUIRE_TIMEOUT
 
     stable = 0
@@ -1911,75 +1918,24 @@ def button_return(
 
 
 def button_task(calibration, detector, sensor, bus, offset, board):
-
-    print("\nB: turn LEFT.")
-
+    """Existing verified pivots, with fixed two-second line-following approach."""
+    print("\nBUTTON: turn LEFT.")
     ok, left_sign = pivot(bus, offset, "L")
-
-    if not ok or left_sign is None:
-
-        print("\nB: initial turn/gyro check failed.")
-
+    if not ok or left_sign is None or not reacquire_line(calibration):
         return False
-
-
-
-    if not reacquire_line(calibration):
-
+    print("\nBUTTON: follow line for 2 seconds.")
+    if not follow_for(calibration, 2.0):
         return False
-
-
-
-    if not button_bumper_approach(calibration, sensor):
-
-        return False
-
-
-
     if not button_return(
-
-        calibration,
-
-        detector,
-
-        bus,
-
-        offset,
-
-        left_sign,
-
+        calibration, detector, bus, offset, left_sign,
         line_loss_timeout=BUTTON_REVERSE_LINE_LOSS_TIMEOUT,
-
     ):
-
         return False
-
-
-
-    print(
-
-        f"\nB: move forward for {RETURN_FORWARD_TIME:g} seconds."
-
-    )
-
     if not follow_for(calibration, RETURN_FORWARD_TIME):
-
         return False
-
-
-
-    print("\nB: execute R90.")
-
-    ok, _ = pivot_90(
-
-        bus, offset, "R", angle_target=TURN_90_ANGLE
-
-    )
-
+    print("\nBUTTON: final R90.")
+    ok, _ = pivot_90(bus, offset, "R", angle_target=TURN_90_ANGLE)
     return ok and reacquire_line(calibration)
-
-
-
 
 
 def cube1_arm_action(board):
@@ -2487,228 +2443,141 @@ def firefighter_reverse_until_line(calibration):
 
 
 
-def firefighter_task(calibration, detector, bus, offset, board):
-
-    """Left turn, stationary arm pose, confirmed flame, at most two sprays."""
-
+def firefighter_task(
+    calibration, detector, bus, offset, board, camera_stream=None,
+):
+    """Approach fire; spray on confirmation or once at the line endpoint."""
     from firefighter import (
-
         Firefighter,
-
         firefighting_pose,
-
         scan_for_confirmed_flame,
-
     )
-
     from roboarm import get_shared_arm
-
     from arm_web import START_ANGLES, AUTO_MAX_STEP_DEG, STEP_DELAY
-
     from button_arm import _return_home
 
-
-
     fire = Firefighter(board)
-
     stop()
-
     try:
-
         pose = {**START_ANGLES, **firefighting_pose()}
-
         fire.initialize()
-
         fire.wait_for_sample()
-
-        print("\nF: turn LEFT.")
-
-        ok, left_sign = pivot(bus, offset, "L")
-
+        print("\nF: initial shared L90.")
+        ok, left_sign = pivot_90(bus, offset, "L", angle_target=TURN_90_ANGLE)
         if not ok or left_sign is None:
-
             return False
-
-
 
         # No forward movement until arm positioning completes.
-
         stop()
-
         arm, newly_attached = get_shared_arm(board)
-
         if newly_attached:
-
             arm.write(**START_ANGLES)
-
         else:
-
             _return_home(arm, START_ANGLES, AUTO_MAX_STEP_DEG, STEP_DELAY)
-
         time.sleep(0.6)
-
+        # Open before moving into the firefighting pose so the gripper cannot
+        # obstruct the water stream while the arm is being positioned.
+        arm.open_gripper()
         _return_home(arm, pose, AUTO_MAX_STEP_DEG, STEP_DELAY)
-
         time.sleep(0.3)
 
-
-
         # Servo movement can outlast the flame sample taken before the turn.
-
         # Wait for a new report before the robot starts approaching the flame.
-
         fire.wait_for_sample(after=time.monotonic())
-
         deadline = time.monotonic() + FIRE_APPROACH_TIMEOUT
-
-        line_loss_abort = False
-
+        line_end_fallback = False
         while time.monotonic() < deadline:
-
             flame_detected = fire.detected()
-
             if flame_detected is None:
-
                 # Never keep driving while the flame input is stale.
-
                 stop()
-
                 fire.wait_for_sample()
-
                 continue
-
-
 
             if flame_detected:
-
                 stop()
-
                 confirmed = fire.confirm_flame()
-
                 if not confirmed:
-
                     confirmed = scan_for_confirmed_flame(
-
                         fire, arm, pose["base"]
-
                     )
-
                 if confirmed:
-
-                    print("\nF: flame confirmed for 0.5 seconds. Water ON.")
-
+                    if camera_stream is not None:
+                        camera_stream.save_latest_task_frame(
+                            "FIREFIGHTER: flame confirmed"
+                        )
+                    print(
+                        "\nF: flame confirmed for 0.5 seconds; advancing "
+                        f"for {FIRE_FINAL_ADVANCE_SECONDS:g} seconds."
+                    )
+                    if not follow_for(
+                        calibration,
+                        FIRE_FINAL_ADVANCE_SECONDS,
+                        speed=FIRE_APPROACH_SPEED,
+                        max_speed=FIRE_APPROACH_MAX_SPEED,
+                    ):
+                        return False
+                    print("\nF: final advance complete. Water ON.")
                     fire.spray()
-
                     # Discard reports taken during spraying. Keep the input
-
                     # subscribed: there is no sensor power-control pin.
-
                     fire.wait_for_sample(after=time.monotonic())
-
                     if fire.confirm_flame():
-
                         print("\nF: flame remains. Second and final 5 s spray.")
-
                         fire.spray()
-
                     break
-
                 # A transient signal and an empty scan must not trigger water.
-
                 continue
-
             state = line_tracker.update(calibration)
-
             if state["position"] is None:
-
+                stop()
+                if camera_stream is not None:
+                    camera_stream.save_latest_task_frame(
+                        "FIREFIGHTER: fallback spray at line end"
+                    )
+                print(
+                    "\nF: end of line reached without confirmed flame; "
+                    "fallback water spray ON for 5 seconds."
+                )
+                fire.spray()
                 if not firefighter_reverse_until_line(calibration):
-
                     return False
-
-                line_loss_abort = True
-
+                line_end_fallback = True
                 break
-
             differential_drive(
-
                 state,
-
                 speed=FIRE_APPROACH_SPEED,
-
                 max_speed=FIRE_APPROACH_MAX_SPEED,
-
             )
-
             time.sleep(LOOP_DELAY)
-
         else:
-
             print("\nF: flame approach timeout.")
-
             return False
 
-
-
-        if line_loss_abort:
-
-            print("\nF: flame search aborted after line loss; no water used.")
-
-
+        if line_end_fallback:
+            print("\nF: fallback spray complete; returning along the line.")
 
         stop()
-
         _return_home(arm, START_ANGLES, AUTO_MAX_STEP_DEG, STEP_DELAY)
-
         if not button_return(
-
             calibration,
-
             detector,
-
             bus,
-
             offset,
-
             left_sign,
-
             label="FIREFIGHTER",
-
             accept_any_junction=True,
-
-            max_return_time=FIRE_RETURN_MAX_TIME,
-
             line_loss_timeout=BUTTON_REVERSE_LINE_LOSS_TIMEOUT,
-
         ):
-
             return False
-
-        if not follow_for(calibration, RETURN_FORWARD_TIME):
-
-            return False
-
-        print("\nF: execute R90.")
-
-        ok, _ = pivot_90(
-
-            bus, offset, "R", angle_target=TURN_90_ANGLE
-
-        )
-
+        print("\nF: final shared R90.")
+        ok, _ = pivot_90(bus, offset, "R", angle_target=TURN_90_ANGLE)
         return ok and reacquire_line(calibration)
-
     finally:
-
         try:
-
             stop()
-
         finally:
-
             fire.off()
-
-
-
 
 
 def charging_task():
@@ -2820,7 +2689,7 @@ def create_color_rgb_indicator():
     return rgb
 
 
-def color_marker_task(calibration, board, bus, offset):
+def color_marker_task(calibration, board, bus, offset, camera_stream=None):
     """Current COLOR behavior adapted to this file's existing R90 maneuver.
     Turn right using this file's existing 90-degree maneuver, center on line,
     pose the arm, then detect color and hold the indicator until next junction.
@@ -2870,9 +2739,12 @@ def color_marker_task(calibration, board, bus, offset):
             stable_frames=COLOR_MARKER_STABLE_FRAMES,
             control_led=False,
             confirmation_callback=light_confirmed_color,
-            preview_port=8000,
+            preview_port=None if camera_stream is not None else 8000,
+            camera_stream=camera_stream,
         )
-        return marker is not None
+        if marker is None:
+            print("COLOR: marker not found within 10 seconds; continue route.")
+        return True
     except Exception as exc:
         print(f"\nCOLOR: camera/LED error: {exc}")
         return False
@@ -2921,19 +2793,24 @@ def button_bounce_red_centered(objects, width, height):
     )
 
 
-def button_bounce_find_red(calibration):
+def button_bounce_find_red(calibration, camera_stream):
     """Follow the line at base PWM130 while watching for centered red."""
     import cv2
-    from color_marker_detector import ContinuousCamera, ColorMarkerDetector
+    from color_marker_detector import ColorMarkerDetector
+    if camera_stream is None:
+        print("BUTTON_BOUNCE: shared camera unavailable.")
+        return False
 
-    camera = ContinuousCamera(port=8000)
+    camera = camera_stream
     color_detector = ColorMarkerDetector(
         min_object_area=BUTTON_BOUNCE_RED_AREA,
         allowed_colors={"red"},
     )
     stop()
+    old_kp, old_kd = line_follower.kp, line_follower.kd
+    line_follower.kp, line_follower.kd = BUTTON_BOUNCE_KP, BUTTON_BOUNCE_KD
+    line_follower.reset_steering()
     try:
-        camera.start()
         sequence = camera.sequence
         confirmed = 0
         deadline = time.monotonic() + BUTTON_BOUNCE_SEARCH_TIMEOUT
@@ -2990,10 +2867,12 @@ def button_bounce_find_red(calibration):
         return False
     finally:
         stop()
-        camera.stop()
+        line_follower.kp, line_follower.kd = old_kp, old_kd
+        line_follower.reset_steering()
+        camera.end_task()
 
 
-def button_bounce_task(calibration, detector, bus, offset, board):
+def button_bounce_task(calibration, detector, bus, offset, board, camera_stream=None):
     """Normal R, closed-gripper poses, centered red, reverse, CUBE1-style R90."""
     indicator = None
     stop()
@@ -3004,7 +2883,7 @@ def button_bounce_task(calibration, detector, bus, offset, board):
             return False
         if not button_bounce_arm_pose(board, BUTTON_BOUNCE_START):
             return False
-        if not button_bounce_find_red(calibration):
+        if not button_bounce_find_red(calibration, camera_stream):
             return False
         indicator = create_robot_rgb_indicator()
         indicator.red()
@@ -3088,6 +2967,7 @@ def main():
     global COLOR_LED_HOLD
 
     board = bus = sensor = None
+    camera_stream = None
 
     offset_90 = None
 
@@ -3181,6 +3061,16 @@ def main():
 
 
 
+        # Shared camera: avoid reopening Picamera2 on each task.
+        try:
+            from color_marker_detector import ContinuousCamera
+            camera_stream = ContinuousCamera(port=8000)
+            camera_stream.start()
+        except Exception as exc:
+            print(f"CAMERA: unavailable ({exc}).")
+            if camera_stream is not None:
+                camera_stream.stop()
+            camera_stream = None
         print("Starting route; line tracker will self-center the robot.")
 
 
@@ -3306,7 +3196,7 @@ def main():
                         gyro_setup(bus)
                     if offset_90 is None:
                         offset_90 = gyro_calibrate(bus, settle_seconds=0.05)
-                    ok = color_marker_task(calibration, board, bus, offset_90)
+                    ok = color_marker_task(calibration, board, bus, offset_90, camera_stream)
 
                 elif cmd in (
 
@@ -3340,12 +3230,7 @@ def main():
 
                     if cmd == "BUTTON":
 
-                        if sensor is None:
-
-                            sensor = VL53L0XSensor()
-
-                            sensor.initialize()
-
+                        # No ToF setup: BUTTON uses two seconds of line tracking.
                         ok = button_task(
 
                             calibration, detector, sensor, bus, offset, board
@@ -3355,7 +3240,7 @@ def main():
                     elif cmd == "BUTTON_BOUNCE":
 
                         ok = button_bounce_task(
-                            calibration, detector, bus, offset, board
+                            calibration, detector, bus, offset, board, camera_stream
                         )
 
                     elif cmd == "FIREFIGHTER":
@@ -3561,6 +3446,12 @@ def main():
         print(f"\nERROR: {exc}")
 
     finally:
+
+        if camera_stream is not None:
+            try:
+                camera_stream.stop()
+            except Exception:
+                pass
 
         if COLOR_LED_HOLD is not None:
             try:
