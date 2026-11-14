@@ -24,6 +24,10 @@ KD = 5.0
 MAX_CORRECTION = 255  # Справочное значение; ограничение PWM выполняет LineTrackingEngine.
 TARGET_POSITION = line_tracker.CENTER_POSITION
 LOOP_DELAY = 0.02
+# Восстановление пропущенного перекрёстка.
+MISSED_JUNCTION_REVERSE_PWM = 80
+MISSED_JUNCTION_EXTRA_REVERSE_SECONDS = 1.0
+MISSED_JUNCTION_REAPPROACH_PWM = 150
 
 # Пороги интенсивности линии для позиционирования возле кнопки.
 START_CENTER_BLACK_MIN = 0.30
@@ -2318,6 +2322,9 @@ def main():
         junction_gate = JunctionRearmGate()
         junction_ignore_until = 0.0
         acceleration_started = None
+        # None -> reverse_find -> reverse_clear -> reverse_extra -> approach.
+        missed_junction_phase = None
+        missed_junction_extra_until = None
         straight_speed = {
             "current_speed": BASE_SPEED,
             "previous_error": None,
@@ -2354,6 +2361,29 @@ def main():
             position = state["position"]
             left, right, candidate = detector.read(state)
             now = time.monotonic()
+            if missed_junction_phase in ("reverse_find", "reverse_clear", "reverse_extra"):
+                # Не расходуем ROUTE и не запускаем задания при движении назад.
+                if missed_junction_phase == "reverse_find" and candidate:
+                    missed_junction_phase = "reverse_clear"
+                    print("\\nRECOVERY: junction found; reversing through it.")
+                elif (missed_junction_phase == "reverse_clear"
+                      and position is not None and not candidate):
+                    missed_junction_phase = "reverse_extra"
+                    missed_junction_extra_until = now + MISSED_JUNCTION_EXTRA_REVERSE_SECONDS
+                    print("\\nRECOVERY: junction cleared; reversing 1 more second.")
+                if (missed_junction_phase == "reverse_extra"
+                        and now >= missed_junction_extra_until):
+                    stop()
+                    missed_junction_phase = "approach"
+                    candidate_count = 0
+                    detector = JunctionDetector()
+                    junction_gate = JunctionRearmGate()
+                    print("\\nRECOVERY: reapproaching at PWM 150.")
+                    continue
+                motors.set_speeds(-MISSED_JUNCTION_REVERSE_PWM,
+                                  -MISSED_JUNCTION_REVERSE_PWM)
+                time.sleep(LOOP_DELAY)
+                continue
             junction_gate.update(left, right, position)
             if (now >= junction_ignore_until
                     and junction_gate.armed and candidate):
@@ -2362,6 +2392,9 @@ def main():
                 candidate_count = 0
             if candidate_count >= JUNCTION_CONFIRM:
                 stop()
+                if missed_junction_phase == "approach":
+                    print("\\nRECOVERY: missed junction reacquired; executing pending ROUTE command.")
+                    missed_junction_phase = None
                 junction_gate.mark_junction()
                 candidate_count = 0
                 junction_count += 1
@@ -2503,7 +2536,16 @@ def main():
 
             # Только проверенный differential2.py управляет движением по линии.
             if position is None:
+                if missed_junction_phase == "approach":
+                    # Повторный заход не превращаем в бесконечный цикл восстановления.
+                    stop()
+                    print("\\nRECOVERY: line lost during reapproach; stopped.")
+                    break
+                missed_junction_phase = "reverse_find"
+                candidate_count = 0
                 stop()
+                print("\\nRECOVERY: line lost; reversing to missed junction.")
+                continue
                 if acceleration_started is not None:
                     acceleration_started = time.monotonic()
                 print(
@@ -2512,7 +2554,10 @@ def main():
                     end="", flush=True,
                 )
             else:
-                if acceleration_started is None:
+                if missed_junction_phase == "approach":
+                    differential_drive(state, speed=MISSED_JUNCTION_REAPPROACH_PWM,
+                                       max_speed=MISSED_JUNCTION_REAPPROACH_PWM)
+                elif acceleration_started is None:
                     speed, max_speed = update_straight_speed(
                         state, left, right, candidate,
                         straight_speed, time.monotonic(),
