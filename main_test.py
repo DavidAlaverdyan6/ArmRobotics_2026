@@ -195,12 +195,7 @@ BUTTON_BOUNCE_REVERSE_LINE_TIMEOUT = 5.0
 
 # CHARGING, FIREFIGHTER, CUBE1 и COLOR — задания; Q завершает маршрут.
 
-# Пример маршрута: ROUTE = ["L", "S", "BUTTON", "R", "CHARGING", "CUBE1",
-
-#                   "FIREFIGHTER", "Q"]
-
-# Закомментированные записи ниже — примеры, измените ROUTE перед запуском.
-ROUTE = [
+# Пример маршрута: ROUTE = [
     "BUTTON",
     "L",
     "CUBE1",
@@ -208,15 +203,15 @@ ROUTE = [
     "L",
     "R",
     "CHARGING",
+    "COLOR",
+    "L90",
     "R",
-    "L",
     "R",
-    "R",
-    "L",
+    "L90",
     "FIREFIGHTER",
-    "L",
+    "L90",
     "R",
-    "S",
+    "BUTTON_BOUNCE",
     "R",
     "L",
     "R",
@@ -226,6 +221,7 @@ ROUTE = [
     "L",
     "S",
     "Q",
+
 ]
 ALLOWED_ROUTE_COMMANDS = {
     "L", "R", "L90", "R90", "S",
@@ -724,10 +720,6 @@ def aggressive_reacquire_drive(state):
 
 def reacquire_line(calibration):
     """После поворота восстанавливает линию с использованием differential2."""
-    state = line_tracker.update(calibration)
-    if state.get("position") is not None:
-        print("\nREACQUIRE: visible line, handing over to existing PD.")
-        return True
     deadline = time.monotonic() + REACQUIRE_TIMEOUT
     stable = 0
     try:
