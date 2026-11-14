@@ -2373,12 +2373,13 @@ def main():
             if missed_junction_phase == "found":
                 # Перекрёсток уже найден при заднем ходе: выполняем команду сейчас.
                 candidate_count = JUNCTION_CONFIRM
-            junction_gate.update(left, right, position)
-            if (now >= junction_ignore_until
-                    and junction_gate.armed and candidate):
-                candidate_count += 1
-            else:
-                candidate_count = 0
+            if missed_junction_phase != "found":
+                junction_gate.update(left, right, position)
+                if (now >= junction_ignore_until
+                        and junction_gate.armed and candidate):
+                    candidate_count += 1
+                else:
+                    candidate_count = 0
             if candidate_count >= JUNCTION_CONFIRM:
                 stop()
                 recovered_junction = missed_junction_phase == "found"
