@@ -25,7 +25,6 @@ MAX_CORRECTION = 255  # Справочное значение; ограниче�
 TARGET_POSITION = line_tracker.CENTER_POSITION
 LOOP_DELAY = 0.02
 # Восстановление пропущенного перекрёстка.
-MISSED_JUNCTION_REVERSE_PWM = 80
 
 # Пороги интенсивности линии для позиционирования возле кнопки.
 START_CENTER_BLACK_MIN = 0.30
@@ -2320,7 +2319,6 @@ def main():
         junction_gate = JunctionRearmGate()
         junction_ignore_until = 0.0
         acceleration_started = None
-        missed_junction_phase = None
         slow_until_next_junction = False
         straight_speed = {
             "current_speed": BASE_SPEED,
@@ -2358,32 +2356,14 @@ def main():
             position = state["position"]
             left, right, candidate = detector.read(state)
             now = time.monotonic()
-            if missed_junction_phase == "reverse_find":
-                # Восстановление допускается только для следующей команды L/R/L90/R90.
-                if candidate:
-                    stop()
-                    missed_junction_phase = "found"
-                    candidate_count = JUNCTION_CONFIRM
-                    print("\\nRECOVERY: missed junction found; forward 0.5s then turn.")
-                else:
-                    motors.set_speeds(-MISSED_JUNCTION_REVERSE_PWM,
-                                      -MISSED_JUNCTION_REVERSE_PWM)
-                    time.sleep(LOOP_DELAY)
-                    continue
-            if missed_junction_phase == "found":
-                # Перекрёсток уже найден при заднем ходе: выполняем команду сейчас.
-                candidate_count = JUNCTION_CONFIRM
-            if missed_junction_phase != "found":
-                junction_gate.update(left, right, position)
-                if (now >= junction_ignore_until
-                        and junction_gate.armed and candidate):
-                    candidate_count += 1
-                else:
-                    candidate_count = 0
+            junction_gate.update(left, right, position)
+            if (now >= junction_ignore_until
+                    and junction_gate.armed and candidate):
+                candidate_count += 1
+            else:
+                candidate_count = 0
             if candidate_count >= JUNCTION_CONFIRM:
                 stop()
-                recovered_junction = missed_junction_phase == "found"
-                missed_junction_phase = None
                 slow_until_next_junction = False
                 junction_gate.mark_junction()
                 candidate_count = 0
@@ -2467,7 +2447,7 @@ def main():
                             # Тот же поворот вправо и последующее центрирование, что в старом алгоритме.
                             ok, _ = pivot(bus, offset, "R")
                             ok = ok and reacquire_line(calibration)
-                    elif cmd in ("L90", "R90", "L90SLOW", "R90SLOW") or (recovered_junction and cmd in ("L", "R")):
+                    elif cmd in ("L90", "R90", "L90SLOW", "R90SLOW"):
                         ok = follow_for(
                             calibration, TURN_90_FORWARD_TIME,
                             speed=TURN_90_FORWARD_SPEED,
@@ -2524,12 +2504,6 @@ def main():
             # Только проверенный differential2.py управляет движением по линии.
             if position is None:
                 next_cmd = route[route_index] if route_index < len(route) else None
-                if next_cmd in ("L", "R", "L90", "R90"):
-                    missed_junction_phase = "reverse_find"
-                    candidate_count = 0
-                    stop()
-                    print("\\nRECOVERY: line lost; reversing to missed junction.")
-                    continue
                 stop()
                 print(f'\\rNO LINE: waiting; next ROUTE={next_cmd}', end="", flush=True)
             else:
