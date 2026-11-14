@@ -39,7 +39,8 @@ JUNCTION_CENTER_MIN = 0.50
 JUNCTION_CONFIRM = 2
 JUNCTION_CLEAR = 3
 JUNCTION_REARM_CLEAR_FRAMES = 3
-POST_TURN_JUNCTION_IGNORE_SECONDS = 0.0
+POST_TURN_JUNCTION_IGNORE_SECONDS = 0.5
+POST_SLOW_JUNCTION_IGNORE_SECONDS = 0.2
 POST_JUNCTION_ACCEL_SECONDS = 0.5
 STRAIGHT_MAX_SPEED = 255
 STRAIGHT_ACCEL_RATE = 180.0
@@ -48,13 +49,6 @@ STRAIGHT_CONFIRM_SECONDS = 0.25
 STRAIGHT_POSITION_TOLERANCE = 0.35
 STRAIGHT_DERROR_LIMIT = 8.0
 
-# После поворота по гироскопу робот возвращается к управлению differential2.
-REACQUIRE_TIMEOUT = 1.2
-REACQUIRE_TOLERANCE = 0.25
-REACQUIRE_CONFIRM = 3
-REACQUIRE_SPEED = 80
-REACQUIRE_MAX_SPEED = 170
-REACQUIRE_STEER_GAIN = 1.6
 I2C_BUS = 1
 MPU_ADDR = 0x68
 GYRO_Z_REG = 0x47
@@ -351,7 +345,7 @@ class JunctionDetector:
 
 
 class JunctionRearmGate:
-    """Разрешает новый перекрёсток только после устойчивого центрирования."""
+    """Разрешает новый перекрёсток после выхода датчиков со старого."""
 
     def __init__(self):
         self.armed = True
@@ -364,13 +358,7 @@ class JunctionRearmGate:
     def update(self, left, right, position):
         if self.armed:
             return
-        centered_clear = (
-            not left
-            and not right
-            and position is not None
-            and abs(position - TARGET_POSITION) <= STRAIGHT_POSITION_TOLERANCE
-        )
-        if not centered_clear:
+        if left or right:
             self.clear_count = 0
             return
         self.clear_count += 1
@@ -701,72 +689,6 @@ def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE, *, slow=False):
         time.sleep(0.02)
 
 
-def aggressive_reacquire_drive(state):
-    """Резко корректирует положение на небольшой скорости до центрирования датчиков."""
-    position = state.get("position") if state else None
-    if position is None:
-        line_follower.drive_straight(
-            speed=REACQUIRE_SPEED,
-            max_speed=REACQUIRE_MAX_SPEED,
-        )
-        return False
-    correction = (
-        line_follower.steering_correction(position) * REACQUIRE_STEER_GAIN
-    )
-    left = max(
-        MIN_SPEED,
-        min(REACQUIRE_MAX_SPEED, REACQUIRE_SPEED + correction),
-    )
-    right = max(
-        MIN_SPEED,
-        min(REACQUIRE_MAX_SPEED, REACQUIRE_SPEED - correction),
-    )
-    motors.set_speeds(round(left), round(right))
-    return True
-
-
-def reacquire_line(calibration, recover_connection=None):
-    """После поворота восстанавливает линию с использованием differential2."""
-    deadline = time.monotonic() + REACQUIRE_TIMEOUT
-    stable = 0
-    try:
-        while time.monotonic() < deadline:
-            if not line_tracker.all_channels_fresh():
-                stop()
-                if recover_connection is None or not recover_connection("reacquire"):
-                    print("\nREACQUIRE: ADC stale; stopping.")
-                    return False
-                deadline = time.monotonic() + REACQUIRE_TIMEOUT
-                stable = 0
-                continue
-            state = line_tracker.update(calibration)
-            position = state["position"]
-            if not aggressive_reacquire_drive(state):
-                stable = 0
-            else:
-                if abs(position - TARGET_POSITION) <= REACQUIRE_TOLERANCE:
-                    stable += 1
-                    if stable >= REACQUIRE_CONFIRM:
-                        print("\nREACQUIRE: line centered.")
-                        return True
-                else:
-                    stable = 0
-            print(
-                f"\rREACQUIRE pos={position} N=["
-                + " ".join(
-                    f"{value:.2f}" for value in state["normalized"]
-                )
-                + "]",
-                end="",
-                flush=True,
-            )
-            time.sleep(LOOP_DELAY)
-        print("\nREACQUIRE timeout: line is not centered; stopping maneuver.")
-        return False
-    finally:
-        stop()
-
-
 def follow_for(calibration, seconds, *, speed=MANEUVER_SPEED,
                max_speed=MANEUVER_MAX_SPEED, recover_connection=None):
     """Движение вперёд заданное время с сохранением регулятора differential2."""
@@ -1030,9 +952,7 @@ def button_task(
     """Проверенные повороты и двухсекундное движение по линии."""
     print("\nBUTTON: turn LEFT.")
     ok, left_sign = pivot(bus, offset, "L")
-    if not ok or left_sign is None or not reacquire_line(
-        calibration, recover_connection=recover_connection
-    ):
+    if not ok or left_sign is None:
         return False
     print("\nBUTTON: follow line for 2 seconds.")
     if not follow_for(calibration, 2.0, recover_connection=recover_connection):
@@ -1049,9 +969,7 @@ def button_task(
         return False
     print("\nBUTTON: final R90.")
     ok, _ = pivot_90(bus, offset, "R", angle_target=TURN_90_ANGLE)
-    return ok and reacquire_line(
-        calibration, recover_connection=recover_connection
-    )
+    return ok
 
 
 def cube1_arm_action(board):
@@ -1445,14 +1363,7 @@ def cube1_task(
         if not ok or left_sign is None:
             print("CUBE1: initial turn/gyro check failed.")
             return False
-        if not reacquire_line(
-            calibration, recover_connection=recover_cube
-        ):
-            return False
-
-        # Во время поворота рука остаётся сложенной;
-
-        # захват опускается только после выравнивания по линии.
+        # Рука начинает работать сразу после поворота, без отдельного центрирования.
         if not cube1_arm_action(board):
             return False
         if not line_tracker.all_channels_fresh():
@@ -1520,9 +1431,7 @@ def cube1_task(
         ok, _ = pivot_90(
             bus, offset, "R", angle_target=TURN_90_ANGLE
         )
-        return ok and reacquire_line(
-            calibration, recover_connection=recover_cube
-        )
+        return ok
     finally:
         stop()
         if indicator is not None:
@@ -1761,10 +1670,7 @@ def firefighter_task(
             return False
         print("\nF: final shared R90.")
         ok, _ = pivot_90(bus, offset, "R", angle_target=TURN_90_ANGLE)
-        return ok and reacquire_line(
-            calibration,
-            recover_connection=lambda stage: reconnect_fire(stage),
-        )
+        return ok
     finally:
         try:
             stop()
@@ -1858,7 +1764,7 @@ def color_marker_task(calibration, board, bus, offset, camera_stream=None):
         ):
             return False
         ok, _ = pivot_90(bus, offset, "R", angle_target=TURN_90_ANGLE)
-        if not ok or not reacquire_line(calibration):
+        if not ok:
             return False
         arm, _ = get_shared_arm(board)
         print("COLOR: arm base=90 shoulder=160 elbow=180 wrist=0 gripper=0.")
@@ -2034,9 +1940,7 @@ def button_bounce_task(
     try:
         print("\\nBUTTON_BOUNCE: ordinary R.")
         ok, turn_sign = pivot(bus, offset, "R")
-        if not ok or turn_sign is None or not reacquire_line(
-            calibration, recover_connection=recover_connection
-        ):
+        if not ok or turn_sign is None:
             return False
         stop()
         button_bounce_prepare_arm(board)
@@ -2062,9 +1966,7 @@ def button_bounce_task(
             return False
         print("\\nBUTTON_BOUNCE: final L90.")
         ok, _ = pivot_90(bus, offset, "L", angle_target=TURN_90_ANGLE)
-        return ok and reacquire_line(
-            calibration, recover_connection=recover_connection
-        )
+        return ok
     except Exception as exc:
         print(f"\\nBUTTON_BOUNCE: {exc}")
         return False
@@ -2340,7 +2242,7 @@ def main():
                         offset_90 = gyro_calibrate(bus, settle_seconds=0.05)
                     ok = color_marker_task(calibration, board, bus, offset_90, camera_stream)
                 elif cmd == "SLOW":
-                    # Как в main.py: не задерживаем обнаружение следующего перекрёстка.
+                    # Только медленное движение вперёд; короткая защита от старого перекрёстка.
                     ok = True
                 elif cmd in (
                     "L", "R", "L90", "R90", "L90SLOW", "R90SLOW", "BUTTON", "BUTTON_BOUNCE", "CHARGING",
@@ -2388,7 +2290,7 @@ def main():
 
                             # Тот же поворот вправо и последующее центрирование, что в старом алгоритме.
                             ok, _ = pivot(bus, offset, "R")
-                            ok = ok and reacquire_line(calibration)
+                            # Обычное differential2 продолжит движение после задания.
                     elif cmd in ("L90", "R90", "L90SLOW", "R90SLOW"):
                         ok = follow_for(
                             calibration, TURN_90_FORWARD_TIME,
@@ -2404,15 +2306,11 @@ def main():
                                 angle_target=TURN_90_ANGLE,
                                 slow=False,
                             )
-                        ok = ok and reacquire_line(
-                            calibration, recover_connection=recover_during_task
-                        )
+                        # Центрирование выполняется обычным differential2 в основном цикле.
                     else:
                         # Обычные L/R выполняются без проезда вперёд.
                         ok, _ = pivot(bus, offset, cmd)
-                        ok = ok and reacquire_line(
-                            calibration, recover_connection=recover_during_task
-                        )
+                        # Центрирование выполняется обычным differential2 в основном цикле.
                 else:
                     ok = follow_for(calibration, 0.5)
                 if not ok:
@@ -2433,9 +2331,9 @@ def main():
                     )
                     candidate_count = 0
                 if slow_until_next_junction:
-                    # Без блокировки обнаружения после SLOW-поворота.
-                    junction_ignore_until = 0.0
-                    junction_gate = JunctionRearmGate()
+                    junction_ignore_until = (
+                        time.monotonic() + POST_SLOW_JUNCTION_IGNORE_SECONDS
+                    )
                     candidate_count = 0
                 if route_index >= len(route):
                     stop()
@@ -2455,7 +2353,7 @@ def main():
                 )
             else:
                 if slow_until_next_junction:
-                    differential_drive(state, speed=150, max_speed=150)
+                    differential_drive(state, speed=150, max_speed=MAX_SPEED)
                 elif acceleration_started is None:
                     speed, max_speed = update_straight_speed(
                         state, left, right, candidate,
