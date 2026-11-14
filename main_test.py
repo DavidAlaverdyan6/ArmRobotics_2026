@@ -1562,7 +1562,7 @@ def firefighter_task(
     stop()
 
     def reconnect_fire(stage, restage=False, require_line=True):
-        nonlocal board, fire
+        nonlocal board, fire, arm
         if recover_connection is None:
             return False
         new_board = recover_connection(
@@ -1574,11 +1574,9 @@ def firefighter_task(
         fire = Firefighter(board)
         fire.initialize()
         if restage:
-            current_arm, _ = get_shared_arm(board)
-            current_arm.open_gripper()
-            _return_home(
-                current_arm, pose, AUTO_MAX_STEP_DEG, STEP_DELAY
-            )
+            arm, _ = get_shared_arm(board)
+            arm.open_gripper()
+            _return_home(arm, pose, AUTO_MAX_STEP_DEG, STEP_DELAY)
         return line_tracker.all_channels_fresh()
 
     try:
