@@ -2052,7 +2052,8 @@ class Cube1Signal:
         self.led.close()
 
 
-def cube1_transport(calibration, detector, cube_sensor, indicator):
+def cube1_transport(calibration, detector, cube_sensor, indicator,
+                    force_emergency=False, recover_ir=None):
     """Perform CUBE1 search, carry, and bounded pit emergency.
 
     Return "drop" when cube disappears AFTER the second crossing, or
@@ -2085,6 +2086,10 @@ def cube1_transport(calibration, detector, cube_sensor, indicator):
             # Give time to reach the second crossing before the pit timer.
             emergency_deadline = now + CUBE1_DROP_TIMEOUT
 
+    if force_emergency:
+        enter_emergency("PB0 has no fresh readings", time.monotonic())
+
+    ir_recovery_attempted = False
     try:
         while time.monotonic() < deadline or phase == "emergency":
             now = time.monotonic()
@@ -2140,10 +2145,19 @@ def cube1_transport(calibration, detector, cube_sensor, indicator):
                 else:
                     post_cross_clear_count = 0
 
-            cube_visible = cube_sensor.detected()
+            cube_visible = cube_sensor.detected() if cube_sensor is not None else None
+            if cube_visible is None and phase != "emergency":
+                if not ir_recovery_attempted and recover_ir is not None:
+                    ir_recovery_attempted = True
+                    print("\nCUBE1: IR reports stale; reconnecting STM32 once.")
+                    if not recover_ir():
+                        print("\nCUBE1: STM32 recovery failed; stopping safely.")
+                        return None
+                # After reset the arm returns home, so completing the ordinary
+                # cube-carry routine is not reliable. Use emergency pit behavior.
+                enter_emergency("IR input unavailable", now)
             if cube_visible is None:
-                print("\\nCUBE1: cube IR sensor stale; STOP.")
-                return None
+                cube_visible = False
 
             if phase == "search" and not second_crossing_seen:
                 if cube_visible:
@@ -2268,7 +2282,7 @@ def cube1_final_turn_approach():
         stop()
 
 
-def cube1_task(calibration, detector, bus, offset, board):
+def cube1_task(calibration, detector, bus, offset, board, board_state=None):
 
     """Find and carry CUBE1 with the optical sensor, stopping at junction."""
 
@@ -2324,6 +2338,7 @@ def cube1_task(calibration, detector, bus, offset, board):
 
         cube_sensor = Firefighter(board)
         cube_sensor.initialize()
+        sensor_ready = True
         # This subscription is new, so accepting its first fresh PB0 report
         # is sufficient. Waiting for a *later* report can time out on an
         # unchanged analog signal even if the initial report was valid.
@@ -2342,9 +2357,26 @@ def cube1_task(calibration, detector, bus, offset, board):
                     "Check PB0 sensor wiring / Telemetrix connection; "
                     "motors remain stopped."
                 )
+                sensor_ready = False
+
+        def recover_ir():
+            nonlocal board
+            # Chassis stopped; reattach all ADC inputs and servo outputs.
+            stop()
+            try:
+                board = recover_stm32_connection(board, calibration)
+                if board_state is not None:
+                    board_state["board"] = board
+                return True
+            except Exception as exc:
+                print(f"CUBE1: STM32 reconnect failed: {exc}")
                 return False
+
         indicator = Cube1Signal(cube1_create_indicator())
-        status = cube1_transport(calibration, detector, cube_sensor, indicator)
+        status = cube1_transport(
+            calibration, detector, cube_sensor if sensor_ready else None,
+            indicator, force_emergency=not sensor_ready, recover_ir=recover_ir,
+        )
         if status not in ("drop", "drop_line_lost", "emergency"):
             return False
 
@@ -2962,6 +2994,60 @@ def load_route():
 
 
 
+def recover_stm32_connection(old_board, calibration):
+    """Reopen the STM32 and resubscribe ADC after an actual stale-data fault.
+
+    Only called from ordinary route following, not during an arm task. If
+    recovery fails, the caller aborts; never blindly arm the old connection.
+    """
+    try:
+        stop()
+    except Exception:
+        pass
+    line_tracker.shutdown()
+    try:
+        old_board.shutdown()
+    except Exception as exc:
+        print(f"STM32 RECOVERY: old connection close error: {exc}")
+    reset_stm32()
+    time.sleep(3.0)  # Allow STM32 to boot after a real connection fault.
+    board = None
+    try:
+        board = telemetrix.Telemetrix(com_port=SERIAL_PORT)
+        # Preserve the differential2.py order during recovery as well.
+        line_tracker.initialize(board)
+        if not line_tracker.wait_for_callbacks(timeout=6.0):
+            raise RuntimeError("Not all eight ADC callbacks returned")
+        deadline = time.monotonic() + 2.0
+        while not line_tracker.all_channels_fresh():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("ADC remained stale after reconnect")
+            time.sleep(LOOP_DELAY)
+        if line_tracker.update(calibration).get("position") is None:
+            raise RuntimeError("No track line after reconnect; stop safely")
+        motors.initialize(board)
+        motors.motor_stop()
+        # Reset shared STM32-backed servo handles before reattaching.
+        import roboarm
+        roboarm._shared_board = None
+        roboarm._shared_arm = None
+        activate_arm_home(board)
+        motors.motor_stop()
+        print("STM32 RECOVERY: all eight ADC channels fresh and line visible.")
+        return board
+    except Exception:
+        try:
+            motors.motor_stop()
+        except Exception:
+            pass
+        if board is not None:
+            try:
+                board.shutdown()
+            except Exception:
+                pass
+        raise
+
+
 def main():
 
     global COLOR_LED_HOLD
@@ -2972,8 +3058,9 @@ def main():
     offset_90 = None
 
     motors_on = tracker_on = False
-
-
+    adc_stale_since = None
+    stm32_recovery_count = 0
+    STM32_RECOVERY_LIMIT = 2
 
     try:
 
@@ -3117,10 +3204,31 @@ def main():
 
         while True:
 
-            # EXACT same reading as the working standalone differential2.py.
-
+            # Never reuse old ADC values to command motors.
             state = line_tracker.update(calibration)
-
+            if not line_tracker.all_channels_fresh():
+                stop()
+                if adc_stale_since is None:
+                    adc_stale_since = time.monotonic()
+                    print("\nADC stale; motors stopped pending recovery.")
+                if time.monotonic() - adc_stale_since >= 0.75:
+                    if stm32_recovery_count >= STM32_RECOVERY_LIMIT:
+                        print("\nADC stale after 2 STM32 recovery attempts.")
+                        break
+                    stm32_recovery_count += 1
+                    try:
+                        board = recover_stm32_connection(board, calibration)
+                    except Exception as exc:
+                        print(f"STM32 recovery failed: {exc}")
+                        break
+                    offset_90 = None
+                    detector = JunctionDetector()
+                    junction_gate = JunctionRearmGate()
+                    candidate_count = 0
+                    adc_stale_since = None
+                time.sleep(LOOP_DELAY)
+                continue
+            adc_stale_since = None
             position = state["position"]
 
             left, right, candidate = detector.read(state)
@@ -3246,18 +3354,17 @@ def main():
                     elif cmd == "FIREFIGHTER":
 
                         ok = firefighter_task(
-
-                            calibration, detector, bus, offset, board
-
+                            calibration, detector, bus, offset, board, camera_stream
                         )
 
                     elif cmd == "CUBE1":
 
+                        board_state = {"board": board}
                         ok = cube1_task(
-
-                            calibration, detector, bus, offset, board
-
+                            calibration, detector, bus, offset, board,
+                            board_state=board_state,
                         )
+                        board = board_state["board"]
 
                     elif cmd == "CHARGING":
 
