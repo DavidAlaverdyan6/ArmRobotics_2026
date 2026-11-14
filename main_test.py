@@ -22,7 +22,7 @@ import motors
 
 from stm32_reset import STM32_RESET_GPIO, reset_stm32
 
-from sensors.vl53l0x_sensor import VL53L0XSensor
+# BUTTON now uses two seconds of line tracking; no VL53L0X import needed.
 
 
 
@@ -2410,69 +2410,67 @@ def cube1_task(calibration, detector, bus, offset, board, board_state=None):
 
 
 def firefighter_reverse_until_line(calibration):
-
     """Emergency slow reverse after the flame approach loses the line."""
-
     stop()
-
     print(
-
         "\nF: line lost during flame search; emergency stop. "
-
         "Reversing slowly to find it."
-
     )
-
-    deadline = time.monotonic() + FIRE_LINE_RECOVERY_TIMEOUT
-
     confirmed = 0
-
+    gray_reported = False
+    deadline = time.monotonic() + FIRE_LINE_RECOVERY_TIMEOUT
     try:
-
         while time.monotonic() < deadline:
-
+            if not line_tracker.all_channels_fresh():
+                stop()
+                print("F: stale ADC during line recovery; stopped.")
+                return False
             state = line_tracker.update(calibration)
-
-            if state["position"] is not None:
-
+            values = state.get("normalized", [])
+            raw = state.get("raw", [])
+            strong_sensors = [
+                index for index, value in enumerate(values)
+                if value >= FIRE_LINE_BLACKNESS_MIN
+            ]
+            if calibration is not None and len(raw) == len(values) == 8:
+                strong_sensors = [
+                    index for index in strong_sensors
+                    if abs(raw[index] - calibration["black"][index])
+                    < abs(raw[index] - calibration["gray"][index])
+                ]
+                if not strong_sensors and not gray_reported and any(
+                    abs(raw[index] - calibration["gray"][index])
+                    < abs(raw[index] - calibration["black"][index])
+                    and abs(raw[index] - calibration["gray"][index])
+                    < abs(raw[index] - calibration["white"][index])
+                    for index in range(8)
+                ):
+                    print("\nF: gray line passed while reversing.")
+                    gray_reported = True
+            black_line = (
+                state.get("position") is not None
+                and len(values) == 8
+                and bool(strong_sensors)
+            )
+            if black_line:
                 confirmed += 1
-
                 if confirmed >= FIRE_LINE_RECOVERY_CONFIRM:
-
                     stop()
-
                     print(
-
                         "\nF: line found; switching to the normal "
-
                         "line-following return."
-
                     )
-
                     return True
-
             else:
-
                 confirmed = 0
 
-
-
             line_follower.reverse_straight(FIRE_LINE_RECOVERY_SPEED)
-
             time.sleep(LOOP_DELAY)
-
-
-
-        print("\nF: line recovery timeout; robot remains stopped.")
-
+        print("F: line recovery exceeded safe time; stopped.")
         return False
 
     finally:
-
         stop()
-
-
-
 
 
 def firefighter_task(
@@ -2613,103 +2611,60 @@ def firefighter_task(
 
 
 def charging_task():
+    """Honor the 11-second charging pause even if its visual LED fails.
 
-    """Stop for 11 s: blink RED for 9 s, GREEN for 2 s, then turn R."""
-
+    A display-only failure must not cancel the route. Motors remain stopped
+    throughout the pause; navigation still validates the subsequent turn.
+    """
     stop()
-
     rgb = None
-
     try:
-
-        # The existing led.RGBLED handles the robot's active-low RGB pins.
-
-        import led
-
-        import robot_pin_config as pins
-
-
-
-        # Physical red/blue LED channels are swapped on this robot:
-
-        # previous RED command lit BLUE. Swap only here, not global pins.
-
-        rgb = led.RGBLED(pins.LED_BLUE, pins.LED_GREEN, pins.LED_RED)
+        try:
+            rgb = create_robot_rgb_indicator()
+        except Exception as exc:
+            print(f"\nC: RGB unavailable ({exc}); continuing timed charge without LED.")
 
         start = time.monotonic()
-
         red_end = start + CHARGE_RED_SECONDS
-
         park_end = start + CHARGE_SECONDS
 
-
-
-        print("\nC: robot stopped. Red blinking for 9 seconds.")
-
-        while time.monotonic() < red_end:
-
-            rgb.red()
-
-            time.sleep(
-
-                max(0.0, min(CHARGE_BLINK_HALF_PERIOD,
-
-                             red_end - time.monotonic()))
-
-            )
-
-            rgb.off()
-
-            time.sleep(
-
-                max(0.0, min(CHARGE_BLINK_HALF_PERIOD,
-
-                             red_end - time.monotonic()))
-
-            )
-
-
-
-        print("\nC: green ON for remaining 2 seconds.")
-
-        rgb.green()
-
-        time.sleep(max(0.0, park_end - time.monotonic()))
-
-        print("\nC: charging complete; turning RIGHT.")
-
-        return True
-
-
-
-    except Exception as exc:
-
-        print(f"\nC: RGB charging error: {exc}")
-
-        print("C: not turning until the light problem is resolved.")
-
-        return False
-
-
-
-    finally:
-
-        if rgb is not None:
-
+        def indicate(method):
+            nonlocal rgb
+            if rgb is None:
+                return
             try:
+                getattr(rgb, method)()
+            except Exception as exc:
+                print(f"\nC: RGB indicator failed ({exc}); charging timer continues.")
+                try:
+                    rgb.close()
+                except Exception:
+                    pass
+                rgb = None
 
+        print("\nC: charging pause; red blink for 9 seconds if LED available.")
+        while time.monotonic() < red_end:
+            indicate("red")
+            time.sleep(max(0.0, min(
+                CHARGE_BLINK_HALF_PERIOD, red_end - time.monotonic()
+            )))
+            indicate("off")
+            time.sleep(max(0.0, min(
+                CHARGE_BLINK_HALF_PERIOD, red_end - time.monotonic()
+            )))
+        print("\nC: remaining 2 seconds; green LED if available.")
+        indicate("green")
+        time.sleep(max(0.0, park_end - time.monotonic()))
+        print("\nC: charging pause complete; proceeding to validated right turn.")
+        return True
+    finally:
+        if rgb is not None:
+            try:
                 rgb.off()
-
                 rgb.close()
-
             except Exception:
-
                 pass
-
         stop()
-
-
-
 
 
 def create_color_rgb_indicator():
