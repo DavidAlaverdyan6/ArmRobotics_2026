@@ -723,12 +723,20 @@ def aggressive_reacquire_drive(state):
     return True
 
 
-def reacquire_line(calibration):
+def reacquire_line(calibration, recover_connection=None):
     """После поворота восстанавливает линию с использованием differential2."""
     deadline = time.monotonic() + REACQUIRE_TIMEOUT
     stable = 0
     try:
         while time.monotonic() < deadline:
+            if not line_tracker.all_channels_fresh():
+                stop()
+                if recover_connection is None or not recover_connection("reacquire"):
+                    print("\nREACQUIRE: ADC stale; stopping.")
+                    return False
+                deadline = time.monotonic() + REACQUIRE_TIMEOUT
+                stable = 0
+                continue
             state = line_tracker.update(calibration)
             position = state["position"]
             if not aggressive_reacquire_drive(state):
@@ -758,11 +766,19 @@ def reacquire_line(calibration):
 
 
 def follow_for(calibration, seconds, *, speed=MANEUVER_SPEED,
-               max_speed=MANEUVER_MAX_SPEED):
+               max_speed=MANEUVER_MAX_SPEED, recover_connection=None):
     """Движение вперёд заданное время с сохранением регулятора differential2."""
     deadline = time.monotonic() + seconds
     try:
         while time.monotonic() < deadline:
+            if not line_tracker.all_channels_fresh():
+                stop()
+                remaining = max(0.0, deadline - time.monotonic())
+                if recover_connection is None or not recover_connection("forward"):
+                    print("\nFORWARD: ADC stale; stopping.")
+                    return False
+                deadline = time.monotonic() + remaining
+                continue
             state = line_tracker.update(calibration)
             if state["position"] is None:
                 line_follower.drive_straight(
@@ -1006,25 +1022,34 @@ def button_return(
         stop()
 
 
-def button_task(calibration, detector, sensor, bus, offset, board):
+def button_task(
+    calibration, detector, sensor, bus, offset, board, recover_connection=None,
+):
     """Проверенные повороты и двухсекундное движение по линии."""
     print("\nBUTTON: turn LEFT.")
     ok, left_sign = pivot(bus, offset, "L")
-    if not ok or left_sign is None or not reacquire_line(calibration):
+    if not ok or left_sign is None or not reacquire_line(
+        calibration, recover_connection=recover_connection
+    ):
         return False
     print("\nBUTTON: follow line for 2 seconds.")
-    if not follow_for(calibration, 2.0):
+    if not follow_for(calibration, 2.0, recover_connection=recover_connection):
         return False
     if not button_return(
         calibration, detector, bus, offset, left_sign,
         line_loss_timeout=BUTTON_REVERSE_LINE_LOSS_TIMEOUT,
+        recover_connection=recover_connection,
     ):
         return False
-    if not follow_for(calibration, RETURN_FORWARD_TIME):
+    if not follow_for(
+        calibration, RETURN_FORWARD_TIME, recover_connection=recover_connection
+    ):
         return False
     print("\nBUTTON: final R90.")
     ok, _ = pivot_90(bus, offset, "R", angle_target=TURN_90_ANGLE)
-    return ok and reacquire_line(calibration)
+    return ok and reacquire_line(
+        calibration, recover_connection=recover_connection
+    )
 
 
 def cube1_arm_action(board):
@@ -1454,7 +1479,7 @@ def cube1_task(calibration, detector, bus, offset, board, board_state=None):
             indicator.close()
 
 
-def firefighter_reverse_until_line(calibration):
+def firefighter_reverse_until_line(calibration, recover_connection=None):
     """Аварийный медленный задний ход для восстановления линии при тушении."""
     stop()
     print(
@@ -1468,8 +1493,12 @@ def firefighter_reverse_until_line(calibration):
         while time.monotonic() < deadline:
             if not line_tracker.all_channels_fresh():
                 stop()
-                print("F: stale ADC during line recovery; stopped.")
-                return False
+                print("F: ADC stale during emergency line search; reconnecting.")
+                if recover_connection is None or not recover_connection("reverse line"):
+                    return False
+                deadline = time.monotonic() + FIRE_LINE_RECOVERY_TIMEOUT
+                confirmed = 0
+                continue
             state = line_tracker.update(calibration)
             values = state.get("normalized", [])
             raw = state.get("raw", [])
@@ -1518,6 +1547,7 @@ def firefighter_reverse_until_line(calibration):
 
 def firefighter_task(
     calibration, detector, bus, offset, board, camera_stream=None,
+    recover_connection=None,
 ):
     """Тушит найденное пламя; при отсутствии сигнала тушит в конце линии."""
     from firefighter import (
@@ -1530,6 +1560,27 @@ def firefighter_task(
     fire = Firefighter(board)
     indicator = None
     stop()
+
+    def reconnect_fire(stage, restage=False, require_line=True):
+        nonlocal board, fire
+        if recover_connection is None:
+            return False
+        new_board = recover_connection(
+            f"FIREFIGHTER {stage}", require_line=require_line
+        )
+        if new_board is None:
+            return False
+        board = new_board
+        fire = Firefighter(board)
+        fire.initialize()
+        if restage:
+            current_arm, _ = get_shared_arm(board)
+            current_arm.open_gripper()
+            _return_home(
+                current_arm, pose, AUTO_MAX_STEP_DEG, STEP_DELAY
+            )
+        return line_tracker.all_channels_fresh()
+
     try:
         pose = {**START_ANGLES, **firefighting_pose()}
         fire.initialize()
@@ -1543,12 +1594,16 @@ def firefighter_task(
             calibration, TURN_90_FORWARD_TIME,
             speed=TURN_90_FORWARD_SPEED,
             max_speed=TURN_90_FORWARD_MAX_SPEED,
+            recover_connection=lambda stage: reconnect_fire(stage),
         ):
             return False
         print("\nF: initial shared L90.")
         ok, left_sign = pivot_90(bus, offset, "L", angle_target=TURN_90_ANGLE)
         if not ok or left_sign is None:
             return False
+        if not line_tracker.all_channels_fresh():
+            if not reconnect_fire("after initial L90"):
+                return False
 
         # До окончания позиционирования руки не движемся вперёд.
         stop()
@@ -1563,6 +1618,9 @@ def firefighter_task(
         arm.open_gripper()
         _return_home(arm, pose, AUTO_MAX_STEP_DEG, STEP_DELAY)
         time.sleep(0.3)
+        if not line_tracker.all_channels_fresh():
+            if not reconnect_fire("after arm positioning", restage=True):
+                return False
 
         # При подтверждении пламени тушим сразу; резерв — конец линии.
         deadline = time.monotonic() + FIRE_APPROACH_TIMEOUT
@@ -1570,8 +1628,14 @@ def firefighter_task(
         line_end_count = 0
         while time.monotonic() < deadline:
             if not line_tracker.all_channels_fresh():
-                print("\nF: ADC stale; stop.")
-                return False
+                stop()
+                remaining = max(0.0, deadline - time.monotonic())
+                if not reconnect_fire("approach", restage=True):
+                    print("\nF: reconnect failed during approach.")
+                    return False
+                deadline = time.monotonic() + remaining
+                line_end_count = 0
+                continue
             state = line_tracker.update(calibration)
             flame_detected = fire.detected()
             if flame_detected is True:
@@ -1605,7 +1669,12 @@ def firefighter_task(
                         "FIREFIGHTER: fallback spray at line end"
                     )
                 fire.spray()
-                if not firefighter_reverse_until_line(calibration):
+                if not firefighter_reverse_until_line(
+                    calibration,
+                    recover_connection=lambda stage: reconnect_fire(
+                        stage, require_line=False
+                    ),
+                ):
                     return False
                 break
             line_end_count = 0
@@ -1630,6 +1699,7 @@ def firefighter_task(
             label="FIREFIGHTER",
             accept_any_junction=True,
             line_loss_timeout=BUTTON_REVERSE_LINE_LOSS_TIMEOUT,
+            recover_connection=lambda stage: reconnect_fire(stage),
         ):
             return False
         print("\nF: advance 0.5s along line before final R90.")
@@ -1637,11 +1707,15 @@ def firefighter_task(
             calibration, TURN_90_FORWARD_TIME,
             speed=TURN_90_FORWARD_SPEED,
             max_speed=TURN_90_FORWARD_MAX_SPEED,
+            recover_connection=lambda stage: reconnect_fire(stage),
         ):
             return False
         print("\nF: final shared R90.")
         ok, _ = pivot_90(bus, offset, "R", angle_target=TURN_90_ANGLE)
-        return ok and reacquire_line(calibration)
+        return ok and reacquire_line(
+            calibration,
+            recover_connection=lambda stage: reconnect_fire(stage),
+        )
     finally:
         try:
             stop()
@@ -2005,7 +2079,7 @@ def load_route():
     return route
 
 
-def recover_stm32_connection(old_board, calibration):
+def recover_stm32_connection(old_board, calibration, require_line=True):
     """Повторно подключает STM32 и заново подписывается на ADC после потери данных.
     Вызывается только после остановки моторов. Если восстановление не удалось,
     движение прекращается; старое подключение не используется."""
@@ -2032,7 +2106,7 @@ def recover_stm32_connection(old_board, calibration):
             if time.monotonic() >= deadline:
                 raise RuntimeError("ADC remained stale after reconnect")
             time.sleep(LOOP_DELAY)
-        if line_tracker.update(calibration).get("position") is None:
+        if require_line and line_tracker.update(calibration).get("position") is None:
             raise RuntimeError("No track line after reconnect; stop safely")
         motors.initialize(board)
         motors.motor_stop()
@@ -2042,7 +2116,7 @@ def recover_stm32_connection(old_board, calibration):
         roboarm._shared_arm = None
         activate_arm_home(board)
         motors.motor_stop()
-        print("STM32 RECOVERY: all eight ADC channels fresh and line visible.")
+        print("STM32 RECOVERY: all eight ADC channels fresh; outputs restored.")
         return board
     except Exception:
         try:
@@ -2119,7 +2193,7 @@ def main():
         print("Starting route; line tracker will self-center the robot.")
         detector = JunctionDetector()
 
-        def recover_during_task(stage):
+        def recover_during_task(stage, require_line=True):
             nonlocal board, offset_90, stm32_recovery_count, adc_stale_since
             stop()
             if stm32_recovery_count >= STM32_RECOVERY_LIMIT:
@@ -2131,7 +2205,9 @@ def main():
                 f"({stm32_recovery_count}/{STM32_RECOVERY_LIMIT})."
             )
             try:
-                new_board = recover_stm32_connection(board, calibration)
+                new_board = recover_stm32_connection(
+                    board, calibration, require_line=require_line
+                )
             except Exception as exc:
                 print(f"STM32 RECOVERY: failed at {stage}: {exc}")
                 return None
@@ -2248,7 +2324,8 @@ def main():
 
                         # BUTTON едет 2 секунды по линии, без датчика расстояния.
                         ok = button_task(
-                            calibration, detector, sensor, bus, offset, board
+                            calibration, detector, sensor, bus, offset, board,
+                            recover_connection=recover_during_task,
                         )
                     elif cmd == "BUTTON_BOUNCE":
                         ok = button_bounce_task(
@@ -2257,7 +2334,8 @@ def main():
                         )
                     elif cmd == "FIREFIGHTER":
                         ok = firefighter_task(
-                            calibration, detector, bus, offset, board, camera_stream
+                            calibration, detector, bus, offset, board, camera_stream,
+                            recover_connection=recover_during_task,
                         )
                     elif cmd == "CUBE1":
                         board_state = {"board": board}
@@ -2278,6 +2356,7 @@ def main():
                             calibration, TURN_90_FORWARD_TIME,
                             speed=TURN_90_FORWARD_SPEED,
                             max_speed=TURN_90_FORWARD_MAX_SPEED,
+                            recover_connection=recover_during_task,
                         )
                         if ok:
                             ok, _ = pivot_90(
@@ -2286,11 +2365,15 @@ def main():
                                 cmd[0],
                                 angle_target=TURN_90_ANGLE,
                             )
-                        ok = ok and reacquire_line(calibration)
+                        ok = ok and reacquire_line(
+                            calibration, recover_connection=recover_during_task
+                        )
                     else:
                         # Обычные L/R выполняются без проезда вперёд.
                         ok, _ = pivot(bus, offset, cmd)
-                        ok = ok and reacquire_line(calibration)
+                        ok = ok and reacquire_line(
+                            calibration, recover_connection=recover_during_task
+                        )
                 else:
                     ok = follow_for(calibration, 0.5)
                 if not ok:
