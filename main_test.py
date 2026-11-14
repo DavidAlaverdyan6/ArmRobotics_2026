@@ -78,6 +78,9 @@ TURN_PWM_SLOW = 90
 TURN_90_FORWARD_SPEED = 80
 TURN_90_FORWARD_MAX_SPEED = 120
 TURN_90_FORWARD_TIME = 0.5
+SLOW_90_PWM_FAST = 110
+SLOW_90_REVERSE_SECONDS = 0.15
+SLOW_90_REVERSE_SPEED = 80
 TURN_TOLERANCE_DEG = 8.0
 TURN_CORRECTION_START_DEG = 4.0
 BUTTON_BUMPER_START_CM = 20.0
@@ -229,7 +232,7 @@ ROUTE = [
 
 ]
 ALLOWED_ROUTE_COMMANDS = {
-    "L", "R", "L90", "R90", "S",
+    "L", "R", "L90", "R90", "L90SLOW", "R90SLOW", "S", "SLOW",
     "BUTTON", "BUTTON_BOUNCE", "CHARGING", "FIREFIGHTER", "CUBE1", "COLOR", "Q",
 }
 line_follower = line_tracker.LineTrackingEngine(
@@ -596,7 +599,7 @@ def pivot(bus, offset, direction, angle_target=TURN_ANGLE):
         time.sleep(PIVOT_SETTLE_SECONDS)
 
 
-def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE):
+def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE, *, slow=False):
     """Поворот с проверенным алгоритмом коррекции до 90 градусов."""
     if direction not in ("L", "R"):
         raise ValueError("Turn direction must be L or R")
@@ -656,7 +659,8 @@ def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE):
             if now - start >= GYRO_TIMEOUT or (now - start > 0.7 and angle < 2):
                 print(f"\nGYRO_TURN timeout/no motion at {angle:.1f} degrees")
                 return False, None
-            pwm = TURN_PWM_SLOW if angle >= angle_target - 25 else TURN_PWM_FAST
+            pwm = (SLOW_90_PWM_FAST if slow else
+                   (TURN_PWM_SLOW if angle >= angle_target - 25 else TURN_PWM_FAST))
             motors.set_speeds(-pwm if left else pwm, pwm if left else -pwm)
             time.sleep(0.005)
         stop()
@@ -680,7 +684,11 @@ def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE):
                 previous = now
                 if abs(signed) >= angle_target - lead:
                     break
-                motors.set_speeds(-70 if left else 70, 70 if left else -70)
+                correction_pwm = 70 if not slow else min(70, SLOW_90_PWM_FAST)
+                motors.set_speeds(
+                    -correction_pwm if left else correction_pwm,
+                    correction_pwm if left else -correction_pwm,
+                )
                 time.sleep(0.005)
             stop()
             final_angle = abs(signed)
@@ -2121,6 +2129,18 @@ def button_bounce_task(
             indicator.close()
 
 
+def reverse_for_short_turn(seconds, speed):
+    """Короткий задний ход после медленного поворота, как в main.py."""
+    deadline = time.monotonic() + seconds
+    try:
+        while time.monotonic() < deadline:
+            line_follower.reverse_straight(speed)
+            time.sleep(LOOP_DELAY)
+    finally:
+        stop()
+    return True
+
+
 def load_route():
     """Проверяет маршрут ROUTE, заданный пользователем."""
     if not ROUTE:
@@ -2136,8 +2156,8 @@ def load_route():
         if cmd not in ALLOWED_ROUTE_COMMANDS:
             raise ValueError(
                 f"Invalid ROUTE entry #{index}: {command!r}. "
-                "Allowed: L, R, L90, R90, S, BUTTON, CHARGING, "
-                "FIREFIGHTER, CUBE1, COLOR, BUTTON_BOUNCE, Q."
+                "Allowed: L, R, L90, R90, L90SLOW, R90SLOW, S, SLOW, "
+                "BUTTON, CHARGING, FIREFIGHTER, CUBE1, COLOR, BUTTON_BOUNCE, Q."
             )
         if cmd == "Q" and index != len(ROUTE):
             raise ValueError("Q must be the last ROUTE entry.")
@@ -2374,8 +2394,11 @@ def main():
                     if offset_90 is None:
                         offset_90 = gyro_calibrate(bus, settle_seconds=0.05)
                     ok = color_marker_task(calibration, board, bus, offset_90, camera_stream)
+                elif cmd == "SLOW":
+                    # Как в main.py: не задерживаем обнаружение следующего перекрёстка.
+                    ok = True
                 elif cmd in (
-                    "L", "R", "L90", "R90", "BUTTON", "BUTTON_BOUNCE", "CHARGING",
+                    "L", "R", "L90", "R90", "L90SLOW", "R90SLOW", "BUTTON", "BUTTON_BOUNCE", "CHARGING",
                     "FIREFIGHTER", "CUBE1",
                 ):
 
@@ -2383,7 +2406,7 @@ def main():
                     if bus is None:
                         bus = smbus.SMBus(I2C_BUS)
                         gyro_setup(bus)
-                    if cmd in ("L90", "R90"):
+                    if cmd in ("L90", "R90", "L90SLOW", "R90SLOW"):
                         if offset_90 is None:
                             offset_90 = gyro_calibrate(bus, settle_seconds=0.05)
                         offset = offset_90
@@ -2421,7 +2444,8 @@ def main():
                             # Тот же поворот вправо и последующее центрирование, что в старом алгоритме.
                             ok, _ = pivot(bus, offset, "R")
                             ok = ok and reacquire_line(calibration)
-                    elif cmd in ("L90", "R90"):
+                    elif cmd in ("L90", "R90", "L90SLOW", "R90SLOW"): 
+                        slow_turn = cmd in ("L90SLOW", "R90SLOW")
                         ok = follow_for(
                             calibration, TURN_90_FORWARD_TIME,
                             speed=TURN_90_FORWARD_SPEED,
@@ -2434,6 +2458,15 @@ def main():
                                 offset,
                                 cmd[0],
                                 angle_target=TURN_90_ANGLE,
+                                slow=slow_turn,
+                            )
+                        if ok and slow_turn:
+                            print(
+                                f"\\nROUTE: slow {cmd}; reversing for "
+                                f"{SLOW_90_REVERSE_SECONDS:g} seconds."
+                            )
+                            ok = reverse_for_short_turn(
+                                SLOW_90_REVERSE_SECONDS, SLOW_90_REVERSE_SPEED
                             )
                         ok = ok and reacquire_line(
                             calibration, recover_connection=recover_during_task
@@ -2455,8 +2488,8 @@ def main():
                 straight_speed["previous_time"] = None
                 straight_speed["straight_since"] = None
                 if cmd in (
-                    "L", "R", "L90", "R90", "BUTTON", "CHARGING",
-                    "FIREFIGHTER", "CUBE1", "COLOR", "BUTTON_BOUNCE",
+                    "L", "R", "L90", "R90", "L90SLOW", "R90SLOW",
+                    "BUTTON", "CHARGING", "FIREFIGHTER", "CUBE1", "COLOR", "BUTTON_BOUNCE",
                 ):
                     junction_ignore_until = (
                         time.monotonic() + POST_TURN_JUNCTION_IGNORE_SECONDS
