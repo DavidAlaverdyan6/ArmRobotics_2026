@@ -183,7 +183,7 @@ COLOR_ARM_ANGLES = {
 }
 COLOR_LED_HOLD = None
 # BUTTON_BOUNCE: обычный PD; меняется только базовый PWM.
-BUTTON_BOUNCE_DRIVE_PWM = 130
+BUTTON_BOUNCE_DRIVE_PWM = 80
 BUTTON_BOUNCE_MIN_OBJECT_AREA = 140
 BUTTON_BOUNCE_CONFIRM_FRAMES = 3
 BUTTON_BOUNCE_TARGET_X = (0.35, 0.65)
@@ -1996,16 +1996,18 @@ def button_bounce_find_color(calibration, camera_stream, recover=None):
                 target = next((
                     obj for obj in objects
                     if obj["color"] == locked_color
-                    and x1 <= obj["center"][0] <= x2
-                    and y1 <= obj["center"][1] <= y2
+                    and obj["x"] < x2
+                    and obj["x"] + obj["w"] > x1
+                    and obj["y"] < y2
+                    and obj["y"] + obj["h"] > y1
                 ), None)
-                centered_frames = centered_frames + 1 if target else 0
+                centered_frames = 1 if target else 0
                 camera.publish_task_frame(
                     annotated,
                     f"BUTTON_BOUNCE: {locked_color or 'searching'} "
                     f"target {centered_frames}/{BUTTON_BOUNCE_CONFIRM_FRAMES}",
                 )
-                if centered_frames >= BUTTON_BOUNCE_CONFIRM_FRAMES:
+                if target is not None:
                     stop()
                     print(f"\\nBUTTON_BOUNCE: {locked_color} in lower center.")
                     return True
