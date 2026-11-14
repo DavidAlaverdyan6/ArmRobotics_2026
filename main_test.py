@@ -316,6 +316,10 @@ BUTTON_BOUNCE_START = (0.0, 150.0, 50.0)
 BUTTON_BOUNCE_PRESS = (0.0, 250.0, -50.0)
 BUTTON_BOUNCE_GRIPPER_CLOSED = 180.0
 BUTTON_BOUNCE_DRIVE_PWM = 130
+BUTTON_BOUNCE_MAX_SPEED = 130  # Wheel PWM ceiling during camera-guided approach.
+BUTTON_BOUNCE_LOOP_DELAY = 0.04  # Use the validated standalone PID test cadence.
+# KP=100, KI=0, KD=5 and MIN_SPEED=0 are inherited from line_follower.
+# MAX_CORRECTION=255 is a reference setting; wheel PWM is clamped to 0..130.
 BUTTON_BOUNCE_CENTER_FRACTION = 0.20
 BUTTON_BOUNCE_RED_AREA = 120
 BUTTON_BOUNCE_CONFIRM_FRAMES = 3
@@ -2945,9 +2949,9 @@ def button_bounce_find_red(calibration):
                     print("BUTTON_BOUNCE: camera stalled; stopping.")
                     return False
                 differential_drive(
-                    state, speed=BUTTON_BOUNCE_DRIVE_PWM, max_speed=MAX_SPEED
+                    state, speed=BUTTON_BOUNCE_DRIVE_PWM, max_speed=BUTTON_BOUNCE_MAX_SPEED
                 )
-                time.sleep(LOOP_DELAY)
+                time.sleep(BUTTON_BOUNCE_LOOP_DELAY)
                 continue
             last_frame_at = time.monotonic()
             sequence, frame = captured
@@ -2972,9 +2976,9 @@ def button_bounce_find_red(calibration):
                 print("\nBUTTON_BOUNCE: centered red confirmed.")
                 return True
             differential_drive(
-                state, speed=BUTTON_BOUNCE_DRIVE_PWM, max_speed=MAX_SPEED
+                state, speed=BUTTON_BOUNCE_DRIVE_PWM, max_speed=BUTTON_BOUNCE_MAX_SPEED
             )
-            time.sleep(LOOP_DELAY)
+            time.sleep(BUTTON_BOUNCE_LOOP_DELAY)
         print("\nBUTTON_BOUNCE: camera search timeout.")
         return False
     finally:
