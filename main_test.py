@@ -1917,8 +1917,11 @@ def button_bounce_find_red(calibration, camera_stream, recover=None):
                 ]
                 print(f"\nBUTTON_BOUNCE: stale ADC; channel ages={ages}; reconnecting.")
                 stop()
+                remaining = max(0.0, deadline - time.monotonic())
                 if recover is None or not recover():
                     return False
+                # Время переподключения не съедает оставшийся поиск кнопки.
+                deadline = time.monotonic() + remaining
                 # После переподключения кадры и подтверждения ищем заново,
                 # но R-поворот и уже завершённые этапы задания не повторяем.
                 sequence = camera.sequence
@@ -2212,6 +2215,9 @@ def main():
             board = new_board
             offset_90 = None
             adc_stale_since = None
+            # У старого экземпляра определителя могли остаться сработавшие S1/S8.
+            detector.left_black = False
+            detector.right_black = False
             # Сам ROUTE и выполненный поворот не сбрасываем.
             print(f"STM32 RECOVERY: resumed task at {stage}.")
             return board
