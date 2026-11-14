@@ -195,7 +195,7 @@ BUTTON_BOUNCE_REVERSE_LINE_TIMEOUT = 5.0
 
 # CHARGING, FIREFIGHTER, CUBE1 и COLOR — задания; Q завершает маршрут.
 
-# Пример маршрута: ROUTE = [
+ROUTE = [
     "BUTTON",
     "L",
     "CUBE1",
@@ -2159,7 +2159,14 @@ def main():
                             )
                         ok = ok and reacquire_line(calibration)
                     else:
-                        ok, _ = pivot(bus, offset, cmd)
+                        # Перед обычным L/R доезжаем до центра перекрёстка.
+                        ok = follow_for(
+                            calibration, TURN_90_FORWARD_TIME,
+                            speed=TURN_90_FORWARD_SPEED,
+                            max_speed=TURN_90_FORWARD_MAX_SPEED,
+                        )
+                        if ok:
+                            ok, _ = pivot(bus, offset, cmd)
                         ok = ok and reacquire_line(calibration)
                 else:
                     ok = follow_for(calibration, 0.5)
