@@ -2476,7 +2476,7 @@ def main():
                 if not ok:
                     print("\nManeuver failed. Robot stopped.")
                     break
-                slow_until_next_junction = cmd in ("L90SLOW", "R90SLOW")
+                slow_until_next_junction = cmd in ("SLOW", "L90SLOW", "R90SLOW")
                 acceleration_started = None if slow_until_next_junction else time.monotonic()
                 straight_speed["current_speed"] = MANEUVER_SPEED
                 straight_speed["previous_error"] = None
