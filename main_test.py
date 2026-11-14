@@ -2190,14 +2190,8 @@ def main():
                             )
                         ok = ok and reacquire_line(calibration)
                     else:
-                        # Перед обычным L/R доезжаем до центра перекрёстка.
-                        ok = follow_for(
-                            calibration, TURN_90_FORWARD_TIME,
-                            speed=TURN_90_FORWARD_SPEED,
-                            max_speed=TURN_90_FORWARD_MAX_SPEED,
-                        )
-                        if ok:
-                            ok, _ = pivot(bus, offset, cmd)
+                        # Обычные L/R выполняются без проезда вперёд.
+                        ok, _ = pivot(bus, offset, cmd)
                         ok = ok and reacquire_line(calibration)
                 else:
                     ok = follow_for(calibration, 0.5)
