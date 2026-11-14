@@ -875,6 +875,7 @@ def button_return(
     accept_any_junction=False,
     max_return_time=RETURN_MAX_TIME,
     line_loss_timeout=REVERSE_LINE_LOSS_TIMEOUT,
+    recover_connection=None,
 ):
     """Возврат назад с геометрически корректным регулятором."""
     heading = Heading(bus, offset, left_sign)
@@ -894,6 +895,24 @@ def button_return(
             max_return_time is None
             or time.monotonic() - start < max_return_time
         ):
+            if not line_tracker.all_channels_fresh():
+                stop()
+                print(f"\n{label}: ADC stopped updating during reverse.")
+                if recover_connection is None or not recover_connection(f"{label} reverse"):
+                    return False
+                # STM32 reset: новая серия данных, курс и поиск перекрёстка.
+                heading = Heading(bus, offset, left_sign)
+                reverse_controller = ReverseLineController(
+                    heading, line_loss_timeout=line_loss_timeout
+                )
+                start = time.monotonic()
+                cleared_count = 0
+                outer_confirm_count = 0
+                candidate_since = None
+                button_first_edge_at = None
+                button_seen_left = button_seen_right = False
+                button_confirm = 0
+                continue
             state = line_tracker.update(calibration)
             left, right, candidate = detector.read(state)
             now = time.monotonic()
@@ -1795,7 +1814,7 @@ def button_bounce_red_centered(objects, width, height):
     )
 
 
-def button_bounce_find_red(calibration, camera_stream):
+def button_bounce_find_red(calibration, camera_stream, recover=None):
     """Следует по линии на базовом PWM 130 и ищет красную точку."""
     import cv2
     from color_marker_detector import ColorMarkerDetector
@@ -1824,8 +1843,16 @@ def button_bounce_find_red(calibration, camera_stream):
                     None if t is None else round(time.monotonic() - t, 3)
                     for t in state["sample_times"]
                 ]
-                print(f"\nBUTTON_BOUNCE: stale ADC; channel ages={ages}; stopping.")
-                return False
+                print(f"\nBUTTON_BOUNCE: stale ADC; channel ages={ages}; reconnecting.")
+                stop()
+                if recover is None or not recover():
+                    return False
+                # После переподключения кадры и подтверждения ищем заново,
+                # но R-поворот и уже завершённые этапы задания не повторяем.
+                sequence = camera.sequence
+                confirmed = 0
+                last_frame_at = time.monotonic()
+                continue
             # Корректируем движение на каждом цикле, а не только при новом кадре.
             state = line_tracker.update(calibration)
             if state["position"] is None:
@@ -1878,30 +1905,66 @@ def button_bounce_find_red(calibration, camera_stream):
         camera.end_task()
 
 
-def button_bounce_task(calibration, detector, bus, offset, board, camera_stream=None):
+def button_bounce_task(
+    calibration, detector, bus, offset, board, camera_stream=None,
+    recover_connection=None,
+):
     """Обычный R, позиции руки, обнаружение красного, возврат и финальный R90."""
     indicator = None
     stop()
+
+    def recover_stage(stage, arm_pose=None):
+        nonlocal board
+        if recover_connection is None:
+            print(f"\nBUTTON_BOUNCE: no reconnect handler at {stage}.")
+            return False
+        recovered = recover_connection(f"BUTTON_BOUNCE {stage}")
+        if recovered is None:
+            return False
+        board = recovered
+        if arm_pose is not None and not button_bounce_arm_pose(board, arm_pose):
+            return False
+        return line_tracker.all_channels_fresh()
+
     try:
         print("\nBUTTON_BOUNCE: execute ordinary R.")
         ok, left_sign = pivot(bus, offset, "R")
         if not ok or left_sign is None or not reacquire_line(calibration):
             return False
+        if not line_tracker.all_channels_fresh():
+            if not recover_stage("before arm", None):
+                return False
         if not button_bounce_arm_pose(board, BUTTON_BOUNCE_START):
             return False
-        if not button_bounce_find_red(calibration, camera_stream):
+        if not line_tracker.all_channels_fresh():
+            if not recover_stage("after arm positioning", BUTTON_BOUNCE_START):
+                return False
+        if not button_bounce_find_red(
+            calibration, camera_stream,
+            recover=lambda: recover_stage("red search", BUTTON_BOUNCE_START),
+        ):
             return False
         indicator = create_robot_rgb_indicator()
         indicator.red()
         print("BUTTON_BOUNCE: red LED on.")
         if not button_bounce_arm_pose(board, BUTTON_BOUNCE_PRESS):
             return False
+        if not line_tracker.all_channels_fresh():
+            if not recover_stage("after button press", BUTTON_BOUNCE_PRESS):
+                return False
         if not button_return(
             calibration, detector, bus, offset, left_sign,
             label="BUTTON_BOUNCE",
             line_loss_timeout=BUTTON_BOUNCE_REVERSE_LINE_TIMEOUT,
+            recover_connection=lambda stage: (
+                board if recover_stage(stage) else None
+            ),
         ):
             return False
+        # Не дублируем возврат к перекрёстку после перезапуска STM32.
+        if not line_tracker.all_channels_fresh():
+            if not recover_stage("before final R90"):
+                return False
         # Тот же проезд 0,5 с на PWM 80, что и в завершённом CUBE1.
         if not cube1_final_turn_approach():
             return False
@@ -2055,6 +2118,30 @@ def main():
             camera_stream = None
         print("Starting route; line tracker will self-center the robot.")
         detector = JunctionDetector()
+
+        def recover_during_task(stage):
+            nonlocal board, offset_90, stm32_recovery_count, adc_stale_since
+            stop()
+            if stm32_recovery_count >= STM32_RECOVERY_LIMIT:
+                print(f"\nSTM32 RECOVERY: limit reached at {stage}; stopping.")
+                return None
+            stm32_recovery_count += 1
+            print(
+                f"\nSTM32 RECOVERY: {stage}; restarting Telemetrix "
+                f"({stm32_recovery_count}/{STM32_RECOVERY_LIMIT})."
+            )
+            try:
+                new_board = recover_stm32_connection(board, calibration)
+            except Exception as exc:
+                print(f"STM32 RECOVERY: failed at {stage}: {exc}")
+                return None
+            board = new_board
+            offset_90 = None
+            adc_stale_since = None
+            # Сам ROUTE и выполненный поворот не сбрасываем.
+            print(f"STM32 RECOVERY: resumed task at {stage}.")
+            return board
+
         print(
             f"Differential2 ready: target {TARGET_POSITION}, "
             f"base PWM {BASE_SPEED}, max PWM {MAX_SPEED}. "
@@ -2165,7 +2252,8 @@ def main():
                         )
                     elif cmd == "BUTTON_BOUNCE":
                         ok = button_bounce_task(
-                            calibration, detector, bus, offset, board, camera_stream
+                            calibration, detector, bus, offset, board, camera_stream,
+                            recover_connection=recover_during_task,
                         )
                     elif cmd == "FIREFIGHTER":
                         ok = firefighter_task(
