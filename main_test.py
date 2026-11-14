@@ -1573,8 +1573,9 @@ def firefighter_task(
         board = new_board
         fire = Firefighter(board)
         fire.initialize()
+        # Ссылку на руку обновляем на любом этапе, даже после тушения.
+        arm, _ = get_shared_arm(board)
         if restage:
-            arm, _ = get_shared_arm(board)
             arm.open_gripper()
             _return_home(arm, pose, AUTO_MAX_STEP_DEG, STEP_DELAY)
         return line_tracker.all_channels_fresh()
