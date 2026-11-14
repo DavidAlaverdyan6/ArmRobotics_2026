@@ -2039,16 +2039,32 @@ def button_bounce_task(
 
     def recover_stage(stage, arm_pose=None):
         nonlocal board
-        if recover_connection is None:
-            print(f"\nBUTTON_BOUNCE: no reconnect handler at {stage}.")
-            return False
-        recovered = recover_connection(f"BUTTON_BOUNCE {stage}")
-        if recovered is None:
-            return False
-        board = recovered
-        if arm_pose is not None and not button_bounce_arm_pose(board, arm_pose):
-            return False
-        return line_tracker.all_channels_fresh()
+        while True:
+            stop()
+            if recover_connection is None:
+                print(f"\nBUTTON_BOUNCE: no reconnect handler at {stage}.")
+                return False
+            recovered = recover_connection(f"BUTTON_BOUNCE {stage}")
+            if recovered is None:
+                print(f"\nBUTTON_BOUNCE: recovery failed at {stage}.")
+                return False
+            board = recovered
+            if arm_pose is not None:
+                if not button_bounce_arm_pose(board, arm_pose):
+                    print(f"\nBUTTON_BOUNCE: arm positioning failed at {stage}.")
+                    return False
+            if line_tracker.all_channels_fresh():
+                print(f"\nBUTTON_BOUNCE: ADC fresh; continuing {stage}.")
+                return True
+            state = line_tracker.update(calibration)
+            ages = [
+                None if t is None else round(time.monotonic() - t, 3)
+                for t in state["sample_times"]
+            ]
+            print(
+                f"\nBUTTON_BOUNCE: ADC stale again after {stage}; "
+                f"channel ages={ages}. Retrying within recovery limit."
+            )
 
     try:
         print("\nBUTTON_BOUNCE: execute ordinary R.")
