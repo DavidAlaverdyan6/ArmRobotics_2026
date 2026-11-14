@@ -1206,8 +1206,17 @@ def cube1_transport(calibration, detector, cube_sensor, indicator,
             state = line_tracker.update(calibration)
             values = state.get("normalized", ())
             if not line_tracker.all_channels_fresh() or len(values) != 8:
-                print("\\nCUBE1: ADC stale; STOP.")
-                return None
+                stop()
+                print("\\nCUBE1: ADC stale; restarting Telemetrix.")
+                if ir_recovery_attempted or recover_ir is None or not recover_ir():
+                    print("\\nCUBE1: cannot recover ADC; STOP.")
+                    return None
+                ir_recovery_attempted = True
+                # После перезапуска STM32 положение захвата неизвестно.
+                # Переключаемся на аварийный режим, не заявляя, что кубик ещё в руке.
+                cube_sensor = None
+                enter_emergency("ADC reset; cube grip lost", time.monotonic())
+                continue
             indicator.tick(now)
             left, right, candidate = detector.read(state)
             if not left and not right:
@@ -1339,14 +1348,21 @@ def cube1_transport(calibration, detector, cube_sensor, indicator,
         stop()
 
 
-def cube1_emergency_reverse_to_line(calibration):
+def cube1_emergency_reverse_to_line(
+    calibration, recover_connection=None,
+):
     """Движется назад до обнаружения линии после аварии или сброса кубика."""
     seen = 0
     try:
         while True:
             if not line_tracker.all_channels_fresh():
                 stop()
-                return False
+                if recover_connection is None or not recover_connection(
+                    "emergency reverse", require_line=False
+                ):
+                    return False
+                seen = 0
+                continue
             state = line_tracker.update(calibration)
             if state.get("position") is not None:
                 seen += 1
@@ -1380,11 +1396,37 @@ def cube1_final_turn_approach():
         stop()
 
 
-def cube1_task(calibration, detector, bus, offset, board, board_state=None):
+def cube1_task(
+    calibration, detector, bus, offset, board, board_state=None,
+    recover_connection=None,
+):
     """Ищет и переносит кубик с помощью оптического датчика."""
     from firefighter import Firefighter
     indicator = None
     stop()
+
+    def recover_cube(stage, require_line=True):
+        nonlocal board
+        stop()
+        try:
+            if recover_connection is None:
+                new_board = recover_stm32_connection(
+                    board, calibration, require_line=require_line
+                )
+            else:
+                new_board = recover_connection(
+                    f"CUBE1 {stage}", require_line=require_line
+                )
+            if new_board is None:
+                return None
+            board = new_board
+            if board_state is not None:
+                board_state["board"] = board
+            return board
+        except Exception as exc:
+            print(f"\\nCUBE1: reconnect failed at {stage}: {exc}")
+            return None
+
     try:
         print("\nCUBE1: execute R90.")
         if not follow_for(
@@ -1392,6 +1434,7 @@ def cube1_task(calibration, detector, bus, offset, board, board_state=None):
             TURN_90_FORWARD_TIME,
             speed=TURN_90_FORWARD_SPEED,
             max_speed=TURN_90_FORWARD_MAX_SPEED,
+            recover_connection=recover_cube,
         ):
             return False
         ok, left_sign = pivot_90(
@@ -1400,7 +1443,9 @@ def cube1_task(calibration, detector, bus, offset, board, board_state=None):
         if not ok or left_sign is None:
             print("CUBE1: initial turn/gyro check failed.")
             return False
-        if not reacquire_line(calibration):
+        if not reacquire_line(
+            calibration, recover_connection=recover_cube
+        ):
             return False
 
         # Во время поворота рука остаётся сложенной;
@@ -1408,6 +1453,11 @@ def cube1_task(calibration, detector, bus, offset, board, board_state=None):
         # захват опускается только после выравнивания по линии.
         if not cube1_arm_action(board):
             return False
+        if not line_tracker.all_channels_fresh():
+            if recover_cube("after arm positioning") is None:
+                return False
+            if not cube1_arm_action(board):
+                return False
         cube_sensor = Firefighter(board)
         cube_sensor.initialize()
         sensor_ready = True
@@ -1433,17 +1483,7 @@ def cube1_task(calibration, detector, bus, offset, board, board_state=None):
                 sensor_ready = False
 
         def recover_ir():
-            nonlocal board
-            # Корпус остановлен; переподключаем ADC и выходы сервоприводов.
-            stop()
-            try:
-                board = recover_stm32_connection(board, calibration)
-                if board_state is not None:
-                    board_state["board"] = board
-                return True
-            except Exception as exc:
-                print(f"CUBE1: STM32 reconnect failed: {exc}")
-                return False
+            return recover_cube("sensor or ADC failure") is not None
         indicator = Cube1Signal(cube1_create_indicator())
         status = cube1_transport(
             calibration, detector, cube_sensor if sensor_ready else None,
@@ -1456,7 +1496,9 @@ def cube1_task(calibration, detector, bus, offset, board, board_state=None):
         if not cube1_fold_arm(board, reason=status):
             return False
         if status in ("emergency", "drop_line_lost"):
-            if not cube1_emergency_reverse_to_line(calibration):
+            if not cube1_emergency_reverse_to_line(
+                calibration, recover_connection=recover_cube
+            ):
                 return False
         # Возвращаемся по линии к тому же перекрёстку.
         # Используем геометрический контроллер заднего хода и гироскоп.
@@ -1464,15 +1506,21 @@ def cube1_task(calibration, detector, bus, offset, board, board_state=None):
             calibration, detector, bus, offset, left_sign,
             label="CUBE1", accept_s8_only=True,
             max_return_time=None, line_loss_timeout=None,
+            recover_connection=recover_cube,
         ):
             return False
+        if not line_tracker.all_channels_fresh():
+            if recover_cube("before final R90") is None:
+                return False
         if not cube1_final_turn_approach():
             return False
         print("\nCUBE1: final R90 using main_test.py's existing pivot.")
         ok, _ = pivot_90(
             bus, offset, "R", angle_target=TURN_90_ANGLE
         )
-        return ok and reacquire_line(calibration)
+        return ok and reacquire_line(
+            calibration, recover_connection=recover_cube
+        )
     finally:
         stop()
         if indicator is not None:
@@ -2347,6 +2395,7 @@ def main():
                         ok = cube1_task(
                             calibration, detector, bus, offset, board,
                             board_state=board_state,
+                            recover_connection=recover_during_task,
                         )
                         board = board_state["board"]
                     elif cmd == "CHARGING":
