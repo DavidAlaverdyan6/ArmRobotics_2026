@@ -125,6 +125,9 @@ REVERSE_GYRO_SPEED = 90
 REVERSE_STEER_SIGN = 1
 RETURN_MAX_TIME = 24.0
 RETURN_FORWARD_TIME = 0.5
+BUTTON_RETURN_JUNCTION_WINDOW = 0.40
+BUTTON_RETURN_JUNCTION_CONFIRM = 2
+BUTTON_RETURN_JUNCTION_SLOW_SPEED = 100
 CUBE_LOST_FINAL_RIGHT_ANGLE = 80.0
 FIRE_APPROACH_SPEED = 255
 FIRE_APPROACH_MAX_SPEED = 255
@@ -880,6 +883,10 @@ def button_return(
     cleared_count = 0
     outer_confirm_count = 0
     candidate_since = None
+    button_first_edge_at = None
+    button_seen_left = False
+    button_seen_right = False
+    button_confirm = 0
     try:
         while (
             max_return_time is None
@@ -915,7 +922,34 @@ def button_return(
                     )
                     return True
 
-            # Сохраняем исходное правило возврата для BUTTON и FIREFIGHTER.
+            # BUTTON: запоминаем срабатывания краёв в коротком окне.
+            # Не требуем одновременной чёрной линии на S1 и S8.
+            elif label == "BUTTON":
+                if cleared_count >= JUNCTION_CLEAR:
+                    if button_first_edge_at is not None and (
+                        now - button_first_edge_at > BUTTON_RETURN_JUNCTION_WINDOW
+                        or (not left and not right)
+                    ):
+                        button_first_edge_at = None
+                        button_seen_left = button_seen_right = False
+                        button_confirm = 0
+                    if left or right:
+                        if button_first_edge_at is None:
+                            button_first_edge_at = now
+                        button_seen_left |= left
+                        button_seen_right |= right
+                        if button_seen_left and button_seen_right:
+                            button_confirm += 1
+                            if button_confirm >= BUTTON_RETURN_JUNCTION_CONFIRM:
+                                print(f"\n{label}: return junction found (S1/S8 confirmed).")
+                                return True
+                        else:
+                            button_confirm = 0
+                else:
+                    button_first_edge_at = None
+                    button_seen_left = button_seen_right = False
+                    button_confirm = 0
+            # Остальные задания сохраняют исходное правило обоих краёв.
             elif cleared_count >= JUNCTION_CLEAR and left and right:
                 print(f"\n{label}: return junction found (both outer sensors).")
                 return True
@@ -924,19 +958,16 @@ def button_return(
 
             # Не используем его для распознавания перекрёстка и выбора скорости.
             candidate_visible = right if accept_s8_only else left != right
+            if label == "BUTTON" and button_first_edge_at is not None:
+                candidate_visible = True
             if candidate_visible:
                 if candidate_since is None:
                     candidate_since = now
             elif accept_s8_only or (not left and not right):
                 candidate_since = None
-            if state["position"] is not None:
-                speed = (
-                    RETURN_SLOW_SPEED if candidate_since is not None else RETURN_SPEED
-                )
-            else:
-                speed = (
-                    RETURN_SLOW_SPEED if candidate_since is not None else RETURN_SPEED
-                )
+            speed = RETURN_SLOW_SPEED if candidate_since is not None else RETURN_SPEED
+            if label == "BUTTON" and button_first_edge_at is not None:
+                speed = BUTTON_RETURN_JUNCTION_SLOW_SPEED
             if not differential_reverse(state, speed, reverse_controller):
                 print(f"\n{label}: line lost too long while reversing.")
                 return False
