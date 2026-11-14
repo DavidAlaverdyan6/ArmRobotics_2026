@@ -280,6 +280,7 @@ CUBE1_Y_MM = 0.0
 CUBE1_Z_MM = -180.0
 CUBE1_TOOL_PITCH_DEG = -90.0
 CUBE1_PIT_ALL_BLACK_MIN = 0.85
+CUBE1_PIT_ALL_WHITE_MAX = 0.15  # Entire sensor row is white.
 CUBE1_PIT_CONFIRM_FRAMES = 4
 CUBE1_EMERGENCY_TIMEOUT = 8.0
 CUBE1_BLINK_HALF_PERIOD = 0.25
@@ -2115,6 +2116,7 @@ def cube1_transport(calibration, detector, cube_sensor, indicator):
     missing_count = 0
     line_loss_count = 0
     pit_count = 0
+    pit_kind = None
     emergency_deadline = None
     last_status = 0.0
 
@@ -2164,11 +2166,12 @@ def cube1_transport(calibration, detector, cube_sensor, indicator):
 
             # Suppress pit recognition across the width of the crossing.
             # Demand confirmed non-crossing after the second crossing,
-            # and only then start checking the all-black condition.
+            # and only then check for either all-black or all-white.
             if second_crossing_seen and not second_crossing_cleared:
                 if (
                     not candidate and not left and not right
                     and not all(v >= CUBE1_PIT_ALL_BLACK_MIN for v in values)
+                    and not all(v <= CUBE1_PIT_ALL_WHITE_MAX for v in values)
                 ):
                     post_cross_clear_count += 1
                     if post_cross_clear_count >= JUNCTION_CLEAR:
@@ -2176,6 +2179,7 @@ def cube1_transport(calibration, detector, cube_sensor, indicator):
                         if phase == "emergency":
                             emergency_deadline = now + CUBE1_EMERGENCY_TIMEOUT
                         pit_count = 0
+                        pit_kind = None
                         print("\\nCUBE1: second crossing cleared; PIT detection armed.")
                 else:
                     post_cross_clear_count = 0
@@ -2217,9 +2221,12 @@ def cube1_transport(calibration, detector, cube_sensor, indicator):
 
             if phase == "emergency" and second_crossing_cleared:
                 black = all(value >= CUBE1_PIT_ALL_BLACK_MIN for value in values)
-                pit_count = pit_count + 1 if black else 0
+                white = all(value <= CUBE1_PIT_ALL_WHITE_MAX for value in values)
+                kind = "black" if black else ("white" if white else None)
+                pit_count = pit_count + 1 if kind and kind == pit_kind else (1 if kind else 0)
+                pit_kind = kind
                 if pit_count >= CUBE1_PIT_CONFIRM_FRAMES:
-                    print("\\nCUBE1: all 8 black AFTER crossing; reversing to find line.")
+                    print(f"\\nCUBE1: all 8 {kind} AFTER crossing; reversing to find line.")
                     return "emergency"
 
             if state.get("position") is None:
