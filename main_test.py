@@ -136,6 +136,8 @@ FIRE_FINAL_ADVANCE_SECONDS = 0.3
 FIRE_LINE_RECOVERY_SPEED = 80
 FIRE_LINE_RECOVERY_TIMEOUT = 5.0
 FIRE_LINE_RECOVERY_CONFIRM = 2
+FIRE_LINE_BLACKNESS_MIN = 0.80
+FIRE_LINE_END_CONFIRM = 3
 FIRE_RETURN_MAX_TIME = 40.0
 
 # CUBE1: рука сохраняет указанную позицию XYZ с открытым захватом.
@@ -1373,7 +1375,8 @@ def cube1_task(calibration, detector, bus, offset, board, board_state=None):
         except TimeoutError:
             stop()
             print("\nCUBE1: PB0 reported no fresh ADC data; resubscribing once.")
-            cube_sensor.initialize()
+            # Не подписываем PB0 повторно на той же связи: сначала
+            # проверяем, появятся ли отчёты у существующей подписки.
             try:
                 cube_sensor.wait_for_sample()
             except TimeoutError:
@@ -1497,7 +1500,7 @@ def firefighter_reverse_until_line(calibration):
 def firefighter_task(
     calibration, detector, bus, offset, board, camera_stream=None,
 ):
-    """Следует по линии до её конца; сигнал огня только выводится в терминал."""
+    """Тушит найденное пламя; при отсутствии сигнала тушит в конце линии."""
     from firefighter import (
         Firefighter,
         firefighting_pose,
@@ -1506,11 +1509,16 @@ def firefighter_task(
     from arm_web import START_ANGLES, AUTO_MAX_STEP_DEG, STEP_DELAY
     from button_arm import _return_home
     fire = Firefighter(board)
+    indicator = None
     stop()
     try:
         pose = {**START_ANGLES, **firefighting_pose()}
         fire.initialize()
-        # Показания огня не блокируют движение; диагностируем их в цикле.
+        try:
+            indicator = create_robot_rgb_indicator()
+        except Exception as exc:
+            print(f"F: RGB unavailable ({exc}); continuing without indication.")
+        # Перед входным поворотом сохраняем проверенный проезд 0,5 с.
         print("\nF: advance 0.5s along line before initial L90.")
         if not follow_for(
             calibration, TURN_90_FORWARD_TIME,
@@ -1537,40 +1545,58 @@ def firefighter_task(
         _return_home(arm, pose, AUTO_MAX_STEP_DEG, STEP_DELAY)
         time.sleep(0.3)
 
-        # Датчик огня только сообщает о появлении сигнала и не управляет шасси.
+        # При подтверждении пламени тушим сразу; резерв — конец линии.
         deadline = time.monotonic() + FIRE_APPROACH_TIMEOUT
-        flame_was_visible = False
+        line_end_fallback = False
+        line_end_count = 0
         while time.monotonic() < deadline:
+            if not line_tracker.all_channels_fresh():
+                print("\nF: ADC stale; stop.")
+                return False
+            state = line_tracker.update(calibration)
             flame_detected = fire.detected()
-            if flame_detected is True and not flame_was_visible:
-                print("\nF: flame detected (information only).")
+            if flame_detected is True:
+                stop()
+                print("\nF: flame detected; GREEN indicator, water ON.")
+                if indicator is not None:
+                    indicator.green()
                 if camera_stream is not None:
                     camera_stream.save_latest_task_frame("FIREFIGHTER: flame detected")
-            flame_was_visible = flame_detected is True
-            state = line_tracker.update(calibration)
+                fire.spray()
+                try:
+                    fire.wait_for_sample(after=time.monotonic())
+                    if fire.detected() is True:
+                        print("\nF: flame remains; second and final spray.")
+                        fire.spray()
+                except TimeoutError:
+                    print("\nF: flame status unavailable after spray; no second spray.")
+                break
             if state["position"] is None:
                 stop()
+                line_end_count += 1
+                if line_end_count < FIRE_LINE_END_CONFIRM:
+                    time.sleep(LOOP_DELAY)
+                    continue
+                line_end_fallback = True
+                print("\nF: no flame found at end of line; RED indicator, water ON.")
+                if indicator is not None:
+                    indicator.red()
                 if camera_stream is not None:
                     camera_stream.save_latest_task_frame(
                         "FIREFIGHTER: fallback spray at line end"
                     )
-                print(
-                    "\nF: end of line reached without confirmed flame; "
-                    "fallback water spray ON for 5 seconds."
-                )
                 fire.spray()
                 if not firefighter_reverse_until_line(calibration):
                     return False
-                line_end_fallback = True
                 break
+            line_end_count = 0
             differential_drive(
-                state,
-                speed=FIRE_APPROACH_SPEED,
+                state, speed=FIRE_APPROACH_SPEED,
                 max_speed=FIRE_APPROACH_MAX_SPEED,
             )
             time.sleep(LOOP_DELAY)
         else:
-            print("\nF: flame approach timeout.")
+            print("\nF: flame approach timeout; stopped.")
             return False
         if line_end_fallback:
             print("\nF: fallback spray complete; returning along the line.")
@@ -1600,8 +1626,14 @@ def firefighter_task(
     finally:
         try:
             stop()
-        finally:
             fire.off()
+        finally:
+            if indicator is not None:
+                try:
+                    indicator.off()
+                    indicator.close()
+                except Exception as exc:
+                    print(f"F: RGB shutdown error: {exc}")
 
 
 def charging_task():
@@ -1787,7 +1819,12 @@ def button_bounce_find_red(calibration, camera_stream):
         last_frame_at = time.monotonic()
         while time.monotonic() < deadline:
             if not line_tracker.all_channels_fresh():
-                print("\nBUTTON_BOUNCE: stale ADC; stopping.")
+                state = line_tracker.update(calibration)
+                ages = [
+                    None if t is None else round(time.monotonic() - t, 3)
+                    for t in state["sample_times"]
+                ]
+                print(f"\nBUTTON_BOUNCE: stale ADC; channel ages={ages}; stopping.")
                 return False
             # Корректируем движение на каждом цикле, а не только при новом кадре.
             state = line_tracker.update(calibration)
@@ -1975,20 +2012,8 @@ def main():
         )
         reset_stm32()
 
-        # Соблюдаем тот же порядок соединения с STM32 и подписки ADC, что в ADC.py:
-
-        # одно подключение, нулевые сигналы моторам, затем разрешение руки.
+        # Сначала подключаем все ADC, как в проверенных ADC.py и differential2.py.
         board = telemetrix.Telemetrix(com_port=SERIAL_PORT)
-
-        # Делаем это до движения сервоприводов или ожидания callback,
-
-        # чтобы прежний PWM не запустил корпус при пробуждении руки.
-        motors.initialize(board)
-        motors_on = True
-        stop()
-        activate_arm_home(board)
-
-        # Только после безопасной начальной позы подписываем датчики ADC.
         line_tracker.initialize(board)
         tracker_on = True
         calibration = line_tracker.load_calibration()
@@ -2009,6 +2034,14 @@ def main():
         startup_state = line_tracker.update(calibration)
         print(f"All eight ADC channels ready: {startup_state['raw']}")
         print(f"Initial line position: {startup_state['position']}")
+        if not line_tracker.all_channels_fresh():
+            print("ERROR: ADC samples are stale after startup; motors not enabled.")
+            return
+        # Только после свежих данных всех 8 каналов включаем выходы моторов и руку.
+        motors.initialize(board)
+        motors_on = True
+        stop()
+        activate_arm_home(board)
 
         # Одна камера для всех заданий, без повторного запуска Picamera2.
         try:
