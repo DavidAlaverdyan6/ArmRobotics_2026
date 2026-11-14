@@ -1,20 +1,14 @@
 #!/usr/bin/env python3
 
-"""ArmRobotics main route: navigation and fixed robot tasks."""
-
-
+"""Основной маршрут ArmRobotics: навигация и задания робота."""
 
 import math
 
 import time
 
-
-
 import smbus
 
 from telemetrix import telemetrix
-
-
 
 import line_tracker
 
@@ -22,15 +16,11 @@ import motors
 
 from stm32_reset import STM32_RESET_GPIO, reset_stm32
 
-# BUTTON now uses two seconds of line tracking; no VL53L0X import needed.
-
-
+# BUTTON использует двухсекундное следование по линии; VL53L0X не нужен.
 
 PROGRAM_BUILD = "cube-fire-2026-11-10.1"
 
-
-
-# Previously tested differential2 line-following speeds.
+# Ранее проверенные скорости контроллера differential2.
 
 SERIAL_PORT = "/dev/serial0"
 
@@ -46,27 +36,23 @@ MANEUVER_MAX_SPEED = 170
 
 KP = 100.0
 
-KI = 0.0  # Existing LineTrackingEngine is PD; integral contribution remains zero.
+KI = 0.0  # Существующий LineTrackingEngine использует PD; интегральный член равен нулю.
 
 KD = 5.0
 
-MAX_CORRECTION = 255  # Reference differential2 setting; current LineTrackingEngine handles clamping.
+MAX_CORRECTION = 255  # Справочное значение; ограничение PWM выполняет LineTrackingEngine.
 
 TARGET_POSITION = line_tracker.CENTER_POSITION
 
 LOOP_DELAY = 0.02
 
-
-
-# Line-strength limits reused by the button positioning task.
+# Пороги интенсивности линии для позиционирования возле кнопки.
 
 START_CENTER_BLACK_MIN = 0.30
 
 START_OUTER_BLACK_MAX = 0.70
 
-
-
-# Junction recognition is separate from line tracking.
+# Распознавание перекрёстков отдельно от управления линией.
 
 BLACK_ON = 0.85
 
@@ -100,9 +86,7 @@ STRAIGHT_POSITION_TOLERANCE = 0.35
 
 STRAIGHT_DERROR_LIMIT = 8.0
 
-
-
-# After any gyro turn, differential2 centers the robot again.
+# После поворота по гироскопу робот возвращается к управлению differential2.
 
 REACQUIRE_TIMEOUT = 1.2
 
@@ -115,8 +99,6 @@ REACQUIRE_SPEED = 80
 REACQUIRE_MAX_SPEED = 170
 
 REACQUIRE_STEER_GAIN = 1.6
-
-
 
 I2C_BUS = 1
 
@@ -152,9 +134,9 @@ TURN_PWM_FAST = 255
 
 TURN_PWM_SLOW = 90
 
-# main_old's uncalibrated alignment PWM and 0.50 s travel.
+# Настройки предварительного выравнивания из main_old: PWM и проезд 0,5 с.
 
-# Keep this independent of BASE_SPEED and MANEUVER_SPEED.
+# Эти параметры независимы от BASE_SPEED и MANEUVER_SPEED.
 
 TURN_90_FORWARD_SPEED = 80
 
@@ -165,8 +147,6 @@ TURN_90_FORWARD_TIME = 0.5
 TURN_TOLERANCE_DEG = 8.0
 
 TURN_CORRECTION_START_DEG = 4.0
-
-
 
 BUTTON_BUMPER_START_CM = 20.0
 
@@ -180,9 +160,7 @@ BUTTON_BUMPER_SPEED = 255
 
 BUTTON_BUMPER_STATUS_SECONDS = 0.25
 
-
-
-# Charging: 9 s red blink, then 2 s solid green; total 11 s before R.
+# Зарядка: красный мигает 9 с, затем зелёный горит 2 с; всего 11 с перед R.
 
 CHARGE_SECONDS = 11.0
 
@@ -190,11 +168,11 @@ CHARGE_RED_SECONDS = 9.0
 
 CHARGE_BLINK_HALF_PERIOD = 0.5
 
-# Reverse line-following geometry (all distances are millimetres).  The line
+# Геометрия следования по линии задним ходом (размеры в миллиметрах).
 
-# tracker is 70 mm in front of the axle, so it becomes a trailing sensor while
+# Линейный датчик находится на 70 мм впереди колёсной оси, поэтому при
 
-# reversing; it cannot use the forward controller unchanged.
+# движении назад он становится задним и требует другого регулятора.
 
 RETURN_SPEED = 130
 
@@ -212,19 +190,17 @@ REVERSE_SENSOR_SPAN_MM = 60.0
 
 REVERSE_POSITION_MM_PER_UNIT = REVERSE_SENSOR_SPAN_MM / 7.0
 
+# Отдельный PD-регулятор и наблюдатель гироскопа для заднего хода; настройка на роботе.
 
+REVERSE_LATERAL_KP = 2.6          # PWM на мм ошибки, оценённой у оси.
 
-# Separate reverse PD/gyro observer.  Tune these on the real robot only.
+REVERSE_LATERAL_KD = 0.055        # PWM на (мм/с); подавляет колебания.
 
-REVERSE_LATERAL_KP = 2.6          # PWM / mm from estimated axle error
+REVERSE_HEADING_KP = 0.70         # PWM на градус ошибки курса MPU.
 
-REVERSE_LATERAL_KD = 0.055        # PWM / (mm/s), suppresses oscillation
+REVERSE_YAW_RATE_KD = 0.12        # PWM на (градус/с); подавляет рыскание.
 
-REVERSE_HEADING_KP = 0.70         # PWM / degree from MPU heading error
-
-REVERSE_YAW_RATE_KD = 0.12        # PWM / (degree/s), damps yaw rate
-
-REVERSE_REFERENCE_FOLLOW = 2.5    # 1/s: lets course reference follow curves
+REVERSE_REFERENCE_FOLLOW = 2.5    # 1/с: скорость подстройки опорного курса на поворотах.
 
 REVERSE_REFERENCE_WINDOW_MM = 7.0
 
@@ -238,21 +214,17 @@ BUTTON_REVERSE_LINE_LOSS_TIMEOUT = 5.0
 
 REVERSE_GYRO_SPEED = 90
 
-# Set to -1 only if a brief bench test proves the physical motor sides are
+# Установить -1 только если тест подтвердит обратное подключение
 
-# wired opposite to the documented LEFT/RIGHT convention.
+# левой и правой сторон моторов.
 
 REVERSE_STEER_SIGN = 1
 
 RETURN_MAX_TIME = 24.0
 
-
-
 RETURN_FORWARD_TIME = 0.5
 
 CUBE_LOST_FINAL_RIGHT_ANGLE = 80.0
-
-
 
 FIRE_APPROACH_SPEED = 255
 
@@ -269,9 +241,7 @@ FIRE_LINE_RECOVERY_CONFIRM = 2
 
 FIRE_RETURN_MAX_TIME = 40.0
 
-
-
-# CUBE1: arm stays at this XYZ with the gripper open while the chassis moves.
+# CUBE1: рука сохраняет указанную позицию XYZ с открытым захватом.
 
 CUBE1_STAGE_X_MM = 250.0
 CUBE1_STAGE_Y_MM = 0.0
@@ -281,7 +251,7 @@ CUBE1_Y_MM = 0.0
 CUBE1_Z_MM = -180.0
 CUBE1_TOOL_PITCH_DEG = -90.0
 CUBE1_PIT_ALL_BLACK_MIN = 0.85
-CUBE1_PIT_ALL_WHITE_MAX = 0.15  # Entire sensor row is white.
+CUBE1_PIT_ALL_WHITE_MAX = 0.15  # Все восемь датчиков видят белое.
 CUBE1_PIT_CONFIRM_FRAMES = 4
 CUBE1_EMERGENCY_TIMEOUT = 8.0
 CUBE1_BLINK_HALF_PERIOD = 0.25
@@ -293,11 +263,11 @@ CUBE1_SENSOR_CONFIRM = 3
 CUBE1_LINE_LOSS_CONFIRM = 5
 CUBE1_EMERGENCY_REVERSE_CONFIRM = 3
 CUBE1_EMERGENCY_REVERSE_SPEED = 80
-# After CUBE1 returns to its starting junction, advance before the final R90.
+# После возврата CUBE1 на исходный перекрёсток выполнить проезд перед R90.
 CUBE1_RETURN_FORWARD_SECONDS = 0.5
 CUBE1_RETURN_FORWARD_PWM = 80
 
-# COLOR: stop, find a stable colored marker, and show that color on the RGB LED.
+# COLOR: остановиться, найти цветной маркер и включить соответствующий RGB.
 
 COLOR_MARKER_TIMEOUT = 10.0
 
@@ -318,30 +288,29 @@ BUTTON_BOUNCE_START = (0.0, 150.0, 50.0)
 BUTTON_BOUNCE_PRESS = (0.0, 250.0, -50.0)
 BUTTON_BOUNCE_GRIPPER_CLOSED = 180.0
 BUTTON_BOUNCE_DRIVE_PWM = 130
-BUTTON_BOUNCE_MAX_SPEED = 130  # Wheel PWM ceiling during camera-guided approach.
+BUTTON_BOUNCE_MAX_SPEED = 130  # Максимальный PWM колеса при поиске красной точки.
 BUTTON_BOUNCE_LOOP_DELAY = 0.04
 BUTTON_BOUNCE_KP = 65.0
-BUTTON_BOUNCE_KD = 2.0  # Use the validated standalone PID test cadence.
-# KP=100, KI=0, KD=5 and MIN_SPEED=0 are inherited from line_follower.
-# MAX_CORRECTION=255 is a reference setting; wheel PWM is clamped to 0..130.
+BUTTON_BOUNCE_KD = 2.0  # Временный коэффициент D для уменьшения виляния.
+# Обычный контроллер использует KP=100, KI=0, KD=5 и MIN_SPEED=0.
+# MAX_CORRECTION=255 — справочное значение; PWM колёс ограничен 0..130.
 BUTTON_BOUNCE_CENTER_FRACTION = 0.20
 BUTTON_BOUNCE_RED_AREA = 120
 BUTTON_BOUNCE_CONFIRM_FRAMES = 3
 BUTTON_BOUNCE_SEARCH_TIMEOUT = 20.0
 BUTTON_BOUNCE_REVERSE_LINE_TIMEOUT = 5.0
 
+# Автоматический маршрут: по одной команде на каждый найденный перекрёсток.
 
-# Automatic route: one entry for each detected junction, in order.
+# L/R/S и L90/R90 задают движение; именованные команды запускают задания.
 
-# L/R/S and L90/R90 are movement commands. Named robot tasks are BUTTON,
+# CHARGING, FIREFIGHTER, CUBE1 и COLOR — задания; Q завершает маршрут.
 
-# CHARGING, FIREFIGHTER, CUBE1 and COLOR. Q stops the route.
-
-# Example: ROUTE = ["L", "S", "BUTTON", "R", "CHARGING", "CUBE1",
+# Пример маршрута: ROUTE = ["L", "S", "BUTTON", "R", "CHARGING", "CUBE1",
 
 #                   "FIREFIGHTER", "Q"]
 
-# The commented entries below are placeholders: edit them before launching.
+# Закомментированные записи ниже — примеры, измените ROUTE перед запуском.
 
 ROUTE = [
 
@@ -395,10 +364,6 @@ ROUTE = [
 
     "Q",
 
-
-
-
-
 ]
 
 ALLOWED_ROUTE_COMMANDS = {
@@ -408,10 +373,6 @@ ALLOWED_ROUTE_COMMANDS = {
     "BUTTON", "BUTTON_BOUNCE", "CHARGING", "FIREFIGHTER", "CUBE1", "COLOR", "Q",
 
 }
-
-
-
-
 
 line_follower = line_tracker.LineTrackingEngine(
 
@@ -430,30 +391,21 @@ line_follower = line_tracker.LineTrackingEngine(
 )
 
 
-
-
-
 def stop():
 
     line_follower.stop()
 
 
-
-
-
 def differential_drive(state, speed=BASE_SPEED, max_speed=MAX_SPEED):
 
-    """Compatibility wrapper around the separate line-following engine."""
+    """Совместимый интерфейс для отдельного контроллера следования по линии."""
 
     return line_follower.drive(state, speed=speed, max_speed=max_speed)
 
 
-
-
-
 def post_junction_drive_limits(elapsed):
 
-    """Ramp both base PWM and the wheel PWM ceiling after a maneuver."""
+    """Плавно увеличивает базовый PWM и максимальный PWM колёс после манёвра."""
 
     fraction = max(0.0, min(1.0, elapsed / POST_JUNCTION_ACCEL_SECONDS))
 
@@ -468,12 +420,9 @@ def post_junction_drive_limits(elapsed):
     return speed, max_speed
 
 
-
-
-
 def update_straight_speed(state, left, right, candidate, controller, now):
 
-    """Raise speed only while the line is stably centered and branch-free."""
+    """Ускоряет робот только на устойчивой прямой без ответвлений."""
 
     position = state.get("position") if state else None
 
@@ -482,8 +431,6 @@ def update_straight_speed(state, left, right, candidate, controller, now):
     dt = 0.0 if previous_time is None else max(0.0, now - previous_time)
 
     controller["previous_time"] = now
-
-
 
     if position is None:
 
@@ -494,8 +441,6 @@ def update_straight_speed(state, left, right, candidate, controller, now):
         controller["straight_since"] = None
 
         return BASE_SPEED, MAX_SPEED
-
-
 
     error = position - TARGET_POSITION
 
@@ -508,8 +453,6 @@ def update_straight_speed(state, left, right, candidate, controller, now):
         derivative = (error - previous_error) / dt
 
     controller["previous_error"] = error
-
-
 
     stable = (
 
@@ -549,8 +492,6 @@ def update_straight_speed(state, left, right, candidate, controller, now):
 
         )
 
-
-
     return controller["current_speed"], min(
 
         STRAIGHT_MAX_SPEED,
@@ -560,12 +501,9 @@ def update_straight_speed(state, left, right, candidate, controller, now):
     )
 
 
-
-
-
 def differential_reverse(state, speed, controller=None):
 
-    """Drive the dedicated reverse controller (legacy fallback for tests)."""
+    """Запускает отдельный контроллер заднего хода (совместимость с тестами)."""
 
     if controller is not None:
 
@@ -574,14 +512,9 @@ def differential_reverse(state, speed, controller=None):
     return line_follower.reverse(state, speed)
 
 
-
-
-
 class JunctionDetector:
 
-    """Only branch sensing. It never calculates line position or steers motors."""
-
-
+    """Определяет только ответвления; не рассчитывает положение линии и не управляет моторами."""
 
     def __init__(self):
 
@@ -589,15 +522,11 @@ class JunctionDetector:
 
         self.right_black = False
 
-
-
     @staticmethod
 
     def hysteresis(previous, value):
 
         return value > BLACK_OFF if previous else value >= BLACK_ON
-
-
 
     def read(self, state):
 
@@ -606,8 +535,6 @@ class JunctionDetector:
         if len(values) != 8:
 
             raise ValueError("Expected eight line sensor values")
-
-
 
         left_edge = self.hysteresis(self.left_black, values[0])
 
@@ -633,13 +560,9 @@ class JunctionDetector:
 
         self.right_black = right_edge and right_support
 
-
-
         side_pattern = self.left_black or self.right_black
 
-
-
-        # An outer sensor alone means the robot is off-center, NOT a junction.
+        # Срабатывание одного крайнего датчика означает смещение, а не перекрёсток.
 
         center_present = any(
 
@@ -659,19 +582,12 @@ class JunctionDetector:
 
         )
 
-
-
         return self.left_black, self.right_black, candidate
-
-
-
 
 
 class JunctionRearmGate:
 
-    """Require a stable centered line before accepting another junction."""
-
-
+    """Разрешает новый перекрёсток только после устойчивого центрирования."""
 
     def __init__(self):
 
@@ -679,15 +595,11 @@ class JunctionRearmGate:
 
         self.clear_count = 0
 
-
-
     def mark_junction(self):
 
         self.armed = False
 
         self.clear_count = 0
-
-
 
     def update(self, left, right, position):
 
@@ -722,9 +634,6 @@ class JunctionRearmGate:
             self.clear_count = 0
 
 
-
-
-
 def gyro_raw(bus):
 
     hi = bus.read_byte_data(MPU_ADDR, GYRO_Z_REG)
@@ -736,15 +645,9 @@ def gyro_raw(bus):
     return value - 65536 if value >= 32768 else value
 
 
-
-
-
 def gyro_rate(bus, offset):
 
     return (gyro_raw(bus) - offset) / GYRO_SCALE
-
-
-
 
 
 def gyro_setup(bus):
@@ -754,9 +657,6 @@ def gyro_setup(bus):
     bus.write_byte_data(MPU_ADDR, 0x1B, 0)
 
     time.sleep(0.2)
-
-
-
 
 
 def gyro_calibrate(bus, settle_seconds=GYRO_CALIBRATION_SETTLE_SECONDS):
@@ -775,9 +675,6 @@ def gyro_calibrate(bus, settle_seconds=GYRO_CALIBRATION_SETTLE_SECONDS):
     return sum(values) / len(values)
 
 
-
-
-
 class Heading:
 
     def __init__(self, bus, offset, left_positive):
@@ -794,8 +691,6 @@ class Heading:
 
         self.last_rate = 0.0
 
-
-
     def read(self):
 
         now = time.monotonic()
@@ -811,38 +706,21 @@ class Heading:
         return self.angle
 
 
-
-
-
 def _wrap_degrees(angle):
 
-    """Keep a heading difference in [-180, 180) degrees."""
+    """Приводит разницу углов к диапазону [-180, 180) градусов."""
 
     return (angle + 180.0) % 360.0 - 180.0
 
 
-
-
-
 class ReverseLineController:
 
-    """Geometry-aware line controller for a tracker ahead of the axle.
+    """Контроллер движения назад с учётом положения датчиков относительно оси.
 
-
-
-    The tracker measures the line at x=+70 mm.  During reverse motion that
-
-    point trails the axle, so raw sensor error alone is phase-lagged and makes
-
-    an ordinary PD loop oscillate.  The MPU heading supplies the missing
-
-    orientation term; while centred, its reference slowly follows bends in
-
-    the track instead of forcing the robot to a fixed global compass course.
-
-    """
-
-
+    Датчики находятся на 70 мм впереди оси, а при заднем ходе оказываются позади.
+    Поэтому обычный PD-регулятор запаздывает и вызывает колебания.
+    Гироскоп компенсирует поворот корпуса; на поворотах трассы опорный курс
+    постепенно подстраивается, когда боковая ошибка небольшая."""
 
     def __init__(self, heading, line_loss_timeout=REVERSE_LINE_LOSS_TIMEOUT):
 
@@ -866,8 +744,6 @@ class ReverseLineController:
 
         self.mode = "LINE"
 
-
-
     @staticmethod
 
     def _slew(previous, target):
@@ -880,11 +756,9 @@ class ReverseLineController:
 
         return max(previous - step, min(previous + step, target))
 
-
-
     def _wheel_command(self, base_pwm, steering):
 
-        """Brake one reverse wheel only; slew-rate-limit both PWM values."""
+        """При движении назад подтормаживает только одно колесо и ограничивает изменение PWM."""
 
         base = max(REVERSE_MIN_PWM, min(REVERSE_MAX_PWM, round(base_pwm)))
 
@@ -892,13 +766,11 @@ class ReverseLineController:
 
         left = right = -base
 
+        # Положительная коррекция тормозит правое колесо. При движении назад
 
+        # реакция корпуса обратная движению вперёд; знак коррекции
 
-        # Positive steering means brake the right wheel.  With reverse motion
-
-        # this yields the opposite body reaction to forward travel.  The sign
-
-        # is a single hardware calibration point, not a PWM swap workaround.
+        # задаётся калибровкой оборудования, а не перестановкой значений PWM.
 
         if steering * REVERSE_STEER_SIGN >= 0:
 
@@ -907,8 +779,6 @@ class ReverseLineController:
         else:
 
             left = -max(REVERSE_MIN_PWM, base - round(brake))
-
-
 
         old_left, old_right = self.previous_pwm or (None, None)
 
@@ -922,8 +792,6 @@ class ReverseLineController:
 
         return True
 
-
-
     def drive(self, state, speed):
 
         now = time.monotonic()
@@ -936,15 +804,11 @@ class ReverseLineController:
 
         position = state.get("position") if state else None
 
-
-
         if position is None:
 
-            # A short gyro-only bridge prevents an ADC gap from causing a
+            # Краткое движение только по гироскопу перекрывает пропуски ADC,
 
-            # sudden stop.  Most tasks bound this interval; CUBE1 deliberately
-
-            # keeps its gyro-only return active until S8 sees the junction.
+            # движется назад по гироскопу до обнаружения перекрёстка датчиком S8.
 
             if self.line_lost_since is None:
 
@@ -980,8 +844,6 @@ class ReverseLineController:
 
             return self._wheel_command(REVERSE_GYRO_SPEED, steering)
 
-
-
         self.line_lost_since = None
 
         sensor_error_mm = position * REVERSE_POSITION_MM_PER_UNIT
@@ -992,11 +854,9 @@ class ReverseLineController:
 
         heading_error = _wrap_degrees(angle - self.reference_heading)
 
+        # Датчик расположен в x=+70 мм от оси колёс.
 
-
-        # The tracker displacement is measured at x=+70 mm, not at the axle.
-
-        # Project the heading component away to obtain the axle-line error.
+        # Вычитаем составляющую курса для оценки ошибки у оси.
 
         axle_error = sensor_error_mm - (
 
@@ -1007,8 +867,6 @@ class ReverseLineController:
         )
 
         self.last_axle_error = axle_error
-
-
 
         dt = 0.0 if self.previous_time is None else now - self.previous_time
 
@@ -1024,11 +882,9 @@ class ReverseLineController:
 
         self.previous_time = now
 
+        # На изгибе трассы опорный курс должен следовать направлению линии,
 
-
-        # On a curve the compass heading must be allowed to follow the local
-
-        # track direction, but only once the lateral error is near centre.
+        # но только при небольшом боковом отклонении.
 
         if abs(sensor_error_mm) <= REVERSE_REFERENCE_WINDOW_MM and dt > 0:
 
@@ -1037,8 +893,6 @@ class ReverseLineController:
             self.reference_heading += heading_error * follow
 
             heading_error = _wrap_degrees(angle - self.reference_heading)
-
-
 
         steering = (
 
@@ -1052,9 +906,9 @@ class ReverseLineController:
 
         )
 
-        # Slow somewhat on large deviations, preserving room for differential
+        # При большом отклонении снижаем скорость, сохраняя запас
 
-        # braking while never exceeding the specified 150-PWM reverse limit.
+        # для дифференциального торможения и предел заднего PWM 150.
 
         base = max(
 
@@ -1069,18 +923,13 @@ class ReverseLineController:
         return self._wheel_command(base, steering)
 
 
-
-
-
 def pivot(bus, offset, direction, angle_target=TURN_ANGLE):
 
-    """Original L/R pivot, also used by the existing B/C/F tasks."""
+    """Исходный поворот L/R, также применяемый в заданиях B/C/F."""
 
     if direction not in ("L", "R"):
 
         raise ValueError("Turn direction must be L or R")
-
-
 
     left = direction == "L"
 
@@ -1120,11 +969,11 @@ def pivot(bus, offset, direction, angle_target=TURN_ANGLE):
 
             time.sleep(0.005)
 
-        # Always return the gyro polarity for a physical LEFT turn.  For a
+        # Возвращаем полярность гироскопа для реального поворота влево.
 
-        # right turn the observed polarity is the opposite.  Reverse driving
+        # При правом повороте знак обратный; поэтому на заднем ходе
 
-        # can therefore use the same heading correction after either turn.
+        # одна и та же коррекция курса применима к обоим направлениям.
 
         left_sign = None
 
@@ -1143,18 +992,13 @@ def pivot(bus, offset, direction, angle_target=TURN_ANGLE):
         time.sleep(PIVOT_SETTLE_SECONDS)
 
 
-
-
-
 def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE):
 
-    """Controlled pivot with the tested 90-degree correction logic."""
+    """Поворот с проверенным алгоритмом коррекции до 90 градусов."""
 
     if direction not in ("L", "R"):
 
         raise ValueError("Turn direction must be L or R")
-
-
 
     stop()
 
@@ -1176,8 +1020,6 @@ def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE):
 
     lead = 5.6425 if left else 6.125
 
-
-
     try:
 
         while True:
@@ -1194,9 +1036,9 @@ def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE):
 
                 raise RuntimeError("GYRO_TURN: invalid angular rate")
 
-            # Ignore pre-drive/coasting samples. Learn polarity only from a
+            # Игнорируем измерения до начала движения и во время инерции.
 
-            # consistent response after the pivot motors have started.
+            # Определяем полярность только после устойчивой реакции моторов.
 
             if gyro_sign is None:
 
@@ -1272,8 +1114,6 @@ def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE):
 
             time.sleep(0.005)
 
-
-
         stop()
 
         settle_until = time.monotonic() + 0.05
@@ -1291,8 +1131,6 @@ def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE):
             previous = now
 
             time.sleep(0.005)
-
-
 
         final_angle = abs(signed)
 
@@ -1326,8 +1164,6 @@ def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE):
 
             final_angle = abs(signed)
 
-
-
         tolerance = min(TURN_TOLERANCE_DEG, angle_target * 0.2)
 
         print(
@@ -1348,8 +1184,6 @@ def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE):
 
         return abs(final_angle - angle_target) <= tolerance, left_sign
 
-
-
     finally:
 
         stop()
@@ -1357,12 +1191,9 @@ def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE):
         time.sleep(0.02)
 
 
-
-
-
 def aggressive_reacquire_drive(state):
 
-    """Steer sharply at low speed until the sensor array is centered."""
+    """Резко корректирует положение на небольшой скорости до центрирования датчиков."""
 
     position = state.get("position") if state else None
 
@@ -1377,8 +1208,6 @@ def aggressive_reacquire_drive(state):
         )
 
         return False
-
-
 
     correction = (
 
@@ -1407,12 +1236,9 @@ def aggressive_reacquire_drive(state):
     return True
 
 
-
-
-
 def reacquire_line(calibration):
 
-    """Use differential2 driving after EVERY turn, including edge-only line."""
+    """После поворота восстанавливает линию с использованием differential2."""
 
     state = line_tracker.update(calibration)
     if state.get("position") is not None:
@@ -1422,8 +1248,6 @@ def reacquire_line(calibration):
 
     stable = 0
 
-
-
     try:
 
         while time.monotonic() < deadline:
@@ -1431,8 +1255,6 @@ def reacquire_line(calibration):
             state = line_tracker.update(calibration)
 
             position = state["position"]
-
-
 
             if not aggressive_reacquire_drive(state):
 
@@ -1454,8 +1276,6 @@ def reacquire_line(calibration):
 
                     stable = 0
 
-
-
             print(
 
                 f"\rREACQUIRE pos={position} N=["
@@ -1474,31 +1294,22 @@ def reacquire_line(calibration):
 
             )
 
-
-
             time.sleep(LOOP_DELAY)
-
-
 
         print("\nREACQUIRE timeout: line is not centered; stopping maneuver.")
 
         return False
-
-
 
     finally:
 
         stop()
 
 
-
-
-
 def follow_for(calibration, seconds, *, speed=MANEUVER_SPEED,
 
                max_speed=MANEUVER_MAX_SPEED):
 
-    """Timed forward movement: unchanged differential2 line-following."""
+    """Движение вперёд заданное время с сохранением регулятора differential2."""
 
     deadline = time.monotonic() + seconds
 
@@ -1536,18 +1347,13 @@ def follow_for(calibration, seconds, *, speed=MANEUVER_SPEED,
         time.sleep(0.15)
 
 
-
-
-
 def activate_arm_home(board):
 
-    """Enable all arm servos once and command the safe base pose."""
+    """Один раз включает сервоприводы и устанавливает руку в безопасное начальное положение."""
 
     from arm_web import START_ANGLES
 
     from roboarm import get_shared_arm
-
-
 
     arm, _ = get_shared_arm(board)
 
@@ -1556,12 +1362,9 @@ def activate_arm_home(board):
     print("ARM: active in base pose (90, 170, 180, 0, 170).")
 
 
-
-
-
 def button_bumper_approach(calibration, sensor):
 
-    """Use the chassis bumper to press the button; the arm never moves."""
+    """Нажимает кнопку бампером корпуса без движения руки (устаревший вариант)."""
 
     deadline = time.monotonic() + BUTTON_BUMPER_APPROACH_TIMEOUT
 
@@ -1570,8 +1373,6 @@ def button_bumper_approach(calibration, sensor):
     ram_deadline = None
 
     last_status = 0.0
-
-
 
     try:
 
@@ -1585,13 +1386,11 @@ def button_bumper_approach(calibration, sensor):
 
                 return False
 
-
-
             state = line_tracker.update(calibration)
 
             if not ram_started:
 
-                # Begin the full-speed bumper run at 20 ± 1 cm.
+                # Полный таран начинается с расстояния 20 ± 1 см (старый вариант).
 
                 if distance_cm <= (
 
@@ -1641,8 +1440,6 @@ def button_bumper_approach(calibration, sensor):
 
                     continue
 
-
-
             if time.monotonic() >= ram_deadline:
 
                 stop()
@@ -1656,8 +1453,6 @@ def button_bumper_approach(calibration, sensor):
                 )
 
                 return True
-
-
 
             now = time.monotonic()
 
@@ -1677,7 +1472,7 @@ def button_bumper_approach(calibration, sensor):
 
             if state["position"] is None:
 
-                # Continue straight only during the bounded two-second press.
+                # Во время ограниченного тарана можно продолжать прямо при потере линии.
 
                 line_follower.drive_straight(
 
@@ -1701,8 +1496,6 @@ def button_bumper_approach(calibration, sensor):
 
             time.sleep(LOOP_DELAY)
 
-
-
         print("\nBUTTON: bumper approach timeout.")
 
         return False
@@ -1710,11 +1503,6 @@ def button_bumper_approach(calibration, sensor):
     finally:
 
         stop()
-
-
-
-
-
 
 
 def button_return(
@@ -1741,7 +1529,7 @@ def button_return(
 
 ):
 
-    """Return using the geometry-aware reverse line controller."""
+    """Возврат назад с геометрически корректным регулятором."""
 
     heading = Heading(bus, offset, left_sign)
 
@@ -1759,8 +1547,6 @@ def button_return(
 
     candidate_since = None
 
-
-
     try:
 
         while (
@@ -1777,13 +1563,9 @@ def button_return(
 
             now = time.monotonic()
 
-
-
             if not left and not right:
 
                 cleared_count += 1
-
-
 
             if accept_any_junction:
 
@@ -1833,7 +1615,7 @@ def button_return(
 
                     return True
 
-            # Preserve the original BUTTON/FIREFIGHTER return rule.
+            # Сохраняем исходное правило возврата для BUTTON и FIREFIGHTER.
 
             elif cleared_count >= JUNCTION_CLEAR and left and right:
 
@@ -1841,11 +1623,9 @@ def button_return(
 
                 return True
 
+            # При возврате CUBE1 датчик S1 не видит ответвление.
 
-
-            # S1 has no road to detect on the CUBE1 return.  Do not let it
-
-            # affect either junction detection or the approach speed.
+            # Не используем его для распознавания перекрёстка и выбора скорости.
 
             candidate_visible = right if accept_s8_only else left != right
 
@@ -1858,8 +1638,6 @@ def button_return(
             elif accept_s8_only or (not left and not right):
 
                 candidate_since = None
-
-
 
             if state["position"] is not None:
 
@@ -1883,8 +1661,6 @@ def button_return(
 
                 return False
 
-
-
             print(
 
                 f'\r{label} BACK {reverse_controller.mode} '
@@ -1901,24 +1677,17 @@ def button_return(
 
             time.sleep(LOOP_DELAY)
 
-
-
         print(f"\n{label}: reverse timeout.")
 
         return False
-
-
 
     finally:
 
         stop()
 
 
-
-
-
 def button_task(calibration, detector, sensor, bus, offset, board):
-    """Existing verified pivots, with fixed two-second line-following approach."""
+    """Проверенные повороты и двухсекундное движение по линии."""
     print("\nBUTTON: turn LEFT.")
     ok, left_sign = pivot(bus, offset, "L")
     if not ok or left_sign is None or not reacquire_line(calibration):
@@ -1939,7 +1708,7 @@ def button_task(calibration, detector, sensor, bus, offset, board):
 
 
 def cube1_arm_action(board):
-    """Two exact requested poses; no chassis centering between R90 and arm."""
+    """Две заданные позиции руки без дополнительного центрирования корпуса."""
     from roboarm import get_shared_arm
     from button_arm import _execute_plan
     import arm_web
@@ -1948,7 +1717,7 @@ def cube1_arm_action(board):
     arm, _ = get_shared_arm(board)
     arm_web.arm = arm
     try:
-        # Pre-position with automatic / free wrist, open gripper throughout.
+        # Предварительное положение с автоматическим углом кисти и открытым захватом.
         arm.write(gripper=0)
         first, free_pitch = arm_web.plan_auto_path({
             "x": CUBE1_STAGE_X_MM, "y": CUBE1_STAGE_Y_MM,
@@ -1958,7 +1727,7 @@ def cube1_arm_action(board):
         _execute_plan(arm, first, arm_web.STEP_DELAY)
         arm.write(gripper=0)
 
-        # Final posture locks the gripper's absolute pitch at -90 degrees.
+        # Конечная позиция фиксирует абсолютный угол захвата -90 градусов.
         second = arm_web.plan_target_pitch_path({
             "x": CUBE1_X_MM, "y": CUBE1_Y_MM, "z": CUBE1_Z_MM,
             "tool_pitch": CUBE1_TOOL_PITCH_DEG,
@@ -1974,7 +1743,7 @@ def cube1_arm_action(board):
 
 
 def cube1_fold_arm(board, reason="task endpoint reached"):
-    """Raise and fold the arm after either CUBE1 completion condition."""
+    """Поднимает и складывает руку после завершения CUBE1."""
     from arm_web import START_ANGLES, AUTO_MAX_STEP_DEG, STEP_DELAY
     from button_arm import _return_home
     from roboarm import get_shared_arm
@@ -1989,7 +1758,7 @@ def cube1_fold_arm(board, reason="task endpoint reached"):
             _return_home(
                 arm, START_ANGLES, AUTO_MAX_STEP_DEG, STEP_DELAY
             )
-        # _return_home also applies the configured home gripper angle.
+        # _return_home также применяет начальный угол захвата.
         print("CUBE1: arm is home; ready for the final right turn.")
         return True
     except Exception as exc:
@@ -2000,24 +1769,24 @@ def cube1_fold_arm(board, reason="task endpoint reached"):
 
 
 def cube1_create_indicator():
-    """Create the RGB indicator using this robot's swapped red/blue wiring."""
+    """Создаёт RGB-индикатор с учётом перепутанных красного и синего проводов."""
     return create_robot_rgb_indicator()
 
 
 def create_robot_rgb_indicator():
-    """Create the physical RGB LED with its measured red/blue wire swap."""
+    """Подключает физический RGB-индикатор с учётом измеренной распиновки."""
     import led
     import robot_pin_config as pins
 
     rgb = led.RGBLED(pins.LED_BLUE, pins.LED_GREEN, pins.LED_RED)
-    # gpiozero already initializes to off; repeat it explicitly before use so
-    # no task can inherit a previous color while ownership changes.
+    # gpiozero уже выключает индикатор при создании; повторно выключаем его,
+    # чтобы новое задание не унаследовало цвет предыдущего.
     rgb.off()
     return rgb
 
 
 class Cube1Signal:
-    """Non-blocking, continuously refreshed RGB status; no background GPIO writes."""
+    """Неблокирующий индикатор состояния RGB без фоновых записей GPIO."""
     def __init__(self, led):
         self.led = led
         self.mode = "off"
@@ -2054,13 +1823,12 @@ class Cube1Signal:
 
 def cube1_transport(calibration, detector, cube_sensor, indicator,
                     force_emergency=False, recover_ir=None):
-    """Perform CUBE1 search, carry, and bounded pit emergency.
+    """Поиск и перенос кубика CUBE1 с ограниченным аварийным сценарием.
 
-    Return "drop" when cube disappears AFTER the second crossing, or
-    "drop_line_lost" when the line disappears after that crossing.
-    "emergency" applies only when the PIT is confirmed in emergency mode.
-    A full-black junction must never be mistaken for the pit.
-    """
+    «drop» — кубик исчез после второго перекрёстка.
+    «drop_line_lost» — после него пропала линия.
+    «emergency» — подтверждена яма в аварийном режиме.
+    Полностью чёрный перекрёсток нельзя принимать за яму."""
     deadline = time.monotonic() + CUBE1_DROP_TIMEOUT
     phase = "search"
     clear_count = 0
@@ -2083,7 +1851,7 @@ def cube1_transport(calibration, detector, cube_sensor, indicator,
             print(f"\\nCUBE1 EMERGENCY: {reason}; RED blink until pit after second crossing.")
             phase = "emergency"
             indicator.set_mode("red_blink")
-            # Give time to reach the second crossing before the pit timer.
+            # Оставляем время добраться до второго перекрёстка перед поиском ямы.
             emergency_deadline = now + CUBE1_DROP_TIMEOUT
 
     if force_emergency:
@@ -2125,9 +1893,9 @@ def cube1_transport(calibration, detector, cube_sensor, indicator,
                     indicator.set_mode("green")
                     print("\\nCUBE1: GREEN solid, keep moving until cube disappears.")
 
-            # Suppress pit recognition across the width of the crossing.
-            # Demand confirmed non-crossing after the second crossing,
-            # and only then check for either all-black or all-white.
+            # Не распознаём яму непосредственно на перекрёстке.
+            # Сначала подтверждаем, что второй перекрёсток закончился,
+            # и только затем ищем все белые или все чёрные датчики.
             if second_crossing_seen and not second_crossing_cleared:
                 if (
                     not candidate and not left and not right
@@ -2153,8 +1921,8 @@ def cube1_transport(calibration, detector, cube_sensor, indicator,
                     if not recover_ir():
                         print("\nCUBE1: STM32 recovery failed; stopping safely.")
                         return None
-                # After reset the arm returns home, so completing the ordinary
-                # cube-carry routine is not reliable. Use emergency pit behavior.
+                # После сброса STM32 рука возвращается домой, поэтому обычный
+                # перенос кубика ненадёжен; используем аварийный поиск ямы.
                 enter_emergency("IR input unavailable", now)
             if cube_visible is None:
                 cube_visible = False
@@ -2200,9 +1968,9 @@ def cube1_transport(calibration, detector, cube_sensor, indicator,
                     return "emergency"
 
             if state.get("position") is None:
-                # A confirmed line loss after the second crossing is an
-                # alternative successful drop. Stop during confirmation:
-                # do not drive blindly past the end of the track.
+                # Подтверждённая потеря линии после второго перекрёстка
+                # может означать успешный сброс. На время проверки останавливаемся,
+                # чтобы не проехать вслепую за край трассы.
                 if (
                     phase == "past_junction" and second_crossing_seen
                     and not candidate and not left and not right
@@ -2240,7 +2008,7 @@ def cube1_transport(calibration, detector, cube_sensor, indicator,
 
 
 def cube1_emergency_reverse_to_line(calibration):
-    """Reverse until line is visible after an emergency OR a confirmed drop."""
+    """Движется назад до обнаружения линии после аварии или сброса кубика."""
     seen = 0
     try:
         while True:
@@ -2262,10 +2030,9 @@ def cube1_emergency_reverse_to_line(calibration):
 
 
 def cube1_final_turn_approach():
-    """After reversing to the junction, move forward 0.5s PWM80 before R90.
+    """После возвращения к перекрёстку едет 0,5 с на PWM 80 перед R90.
 
-    No trailing-edge search and no line PID during this short calibrated move.
-    """
+    Во время этого короткого откалиброванного проезда поиск края линии и PD не используются."""
     if not line_tracker.all_channels_fresh():
         print("\nCUBE1: ADC stale before final forward pulse; stopping.")
         stop()
@@ -2284,11 +2051,9 @@ def cube1_final_turn_approach():
 
 def cube1_task(calibration, detector, bus, offset, board, board_state=None):
 
-    """Find and carry CUBE1 with the optical sensor, stopping at junction."""
+    """Ищет и переносит кубик с помощью оптического датчика."""
 
     from firefighter import Firefighter
-
-
 
     indicator = None
     stop()
@@ -2327,11 +2092,9 @@ def cube1_task(calibration, detector, bus, offset, board, board_state=None):
 
             return False
 
+        # Во время поворота рука остаётся сложенной;
 
-
-        # Keep the arm folded while entering and completing the turn.  The
-
-        # gripper is lowered only after the robot is aligned on the new line.
+        # захват опускается только после выравнивания по линии.
 
         if not cube1_arm_action(board):
             return False
@@ -2339,9 +2102,9 @@ def cube1_task(calibration, detector, bus, offset, board, board_state=None):
         cube_sensor = Firefighter(board)
         cube_sensor.initialize()
         sensor_ready = True
-        # This subscription is new, so accepting its first fresh PB0 report
-        # is sufficient. Waiting for a *later* report can time out on an
-        # unchanged analog signal even if the initial report was valid.
+        # Это новая подписка: достаточно первого свежего значения PB0.
+        # Ожидание последующего отчёта может привести к тайм-ауту,
+        # если аналоговое значение не изменяется.
         try:
             cube_sensor.wait_for_sample()
         except TimeoutError:
@@ -2361,7 +2124,7 @@ def cube1_task(calibration, detector, bus, offset, board, board_state=None):
 
         def recover_ir():
             nonlocal board
-            # Chassis stopped; reattach all ADC inputs and servo outputs.
+            # Корпус остановлен; переподключаем ADC и выходы сервоприводов.
             stop()
             try:
                 board = recover_stm32_connection(board, calibration)
@@ -2380,14 +2143,14 @@ def cube1_task(calibration, detector, bus, offset, board, board_state=None):
         if status not in ("drop", "drop_line_lost", "emergency"):
             return False
 
-        # Fold arm before reverse; it is no longer holding the cube.
+        # Перед обратным ходом складываем руку — кубик уже не удерживается.
         if not cube1_fold_arm(board, reason=status):
             return False
         if status in ("emergency", "drop_line_lost"):
             if not cube1_emergency_reverse_to_line(calibration):
                 return False
-        # Return on the line to the same junction. Keep the existing
-        # geometry-aware reverse controller with gyro heading protection.
+        # Возвращаемся по линии к тому же перекрёстку.
+        # Используем геометрический контроллер заднего хода и гироскоп.
         if not button_return(
             calibration, detector, bus, offset, left_sign,
             label="CUBE1", accept_s8_only=True,
@@ -2407,10 +2170,8 @@ def cube1_task(calibration, detector, bus, offset, board, board_state=None):
             indicator.close()
 
 
-
-
 def firefighter_reverse_until_line(calibration):
-    """Emergency slow reverse after the flame approach loses the line."""
+    """Аварийный медленный задний ход для восстановления линии при тушении."""
     stop()
     print(
         "\nF: line lost during flame search; emergency stop. "
@@ -2476,7 +2237,7 @@ def firefighter_reverse_until_line(calibration):
 def firefighter_task(
     calibration, detector, bus, offset, board, camera_stream=None,
 ):
-    """Approach fire; spray on confirmation or once at the line endpoint."""
+    """Приближается к пламени; включает воду при подтверждении или в конце линии."""
     from firefighter import (
         Firefighter,
         firefighting_pose,
@@ -2497,7 +2258,7 @@ def firefighter_task(
         if not ok or left_sign is None:
             return False
 
-        # No forward movement until arm positioning completes.
+        # До окончания позиционирования руки не движемся вперёд.
         stop()
         arm, newly_attached = get_shared_arm(board)
         if newly_attached:
@@ -2505,21 +2266,21 @@ def firefighter_task(
         else:
             _return_home(arm, START_ANGLES, AUTO_MAX_STEP_DEG, STEP_DELAY)
         time.sleep(0.6)
-        # Open before moving into the firefighting pose so the gripper cannot
-        # obstruct the water stream while the arm is being positioned.
+        # Открываем захват перед позой тушения, чтобы
+        # он не мешал струе воды.
         arm.open_gripper()
         _return_home(arm, pose, AUTO_MAX_STEP_DEG, STEP_DELAY)
         time.sleep(0.3)
 
-        # Servo movement can outlast the flame sample taken before the turn.
-        # Wait for a new report before the robot starts approaching the flame.
+        # Движение сервоприводов может закончиться позже показания датчика.
+        # Перед приближением к пламени ждём новый отчёт.
         fire.wait_for_sample(after=time.monotonic())
         deadline = time.monotonic() + FIRE_APPROACH_TIMEOUT
         line_end_fallback = False
         while time.monotonic() < deadline:
             flame_detected = fire.detected()
             if flame_detected is None:
-                # Never keep driving while the flame input is stale.
+                # При устаревших данных датчика пламени движение запрещено.
                 stop()
                 fire.wait_for_sample()
                 continue
@@ -2549,14 +2310,14 @@ def firefighter_task(
                         return False
                     print("\nF: final advance complete. Water ON.")
                     fire.spray()
-                    # Discard reports taken during spraying. Keep the input
-                    # subscribed: there is no sensor power-control pin.
+                    # После подачи воды игнорируем устаревшие показания,
+                    # но оставляем подписку, поскольку питание датчика не отключается отдельно.
                     fire.wait_for_sample(after=time.monotonic())
                     if fire.confirm_flame():
                         print("\nF: flame remains. Second and final 5 s spray.")
                         fire.spray()
                     break
-                # A transient signal and an empty scan must not trigger water.
+                # Случайный сигнал и пустое сканирование не запускают воду.
                 continue
             state = line_tracker.update(calibration)
             if state["position"] is None:
@@ -2611,11 +2372,10 @@ def firefighter_task(
 
 
 def charging_task():
-    """Honor the 11-second charging pause even if its visual LED fails.
+    """Сохраняет 11-секундную остановку зарядки даже при отказе RGB-индикатора.
 
-    A display-only failure must not cancel the route. Motors remain stopped
-    throughout the pause; navigation still validates the subsequent turn.
-    """
+    Ошибка индикации не прерывает маршрут. Моторы стоят до конца зарядки;
+    последующий поворот по-прежнему проверяется."""
     stop()
     rgb = None
     try:
@@ -2668,7 +2428,7 @@ def charging_task():
 
 
 def create_color_rgb_indicator():
-    """Same measured red/blue-swapped LED wiring as the current main.py."""
+    """Создаёт RGB-индикатор с измеренным обменом красного и синего каналов."""
     import led
     import robot_pin_config as pins
     rgb = led.RGBLED(pins.LED_BLUE, pins.LED_GREEN, pins.LED_RED)
@@ -2677,10 +2437,9 @@ def create_color_rgb_indicator():
 
 
 def color_marker_task(calibration, board, bus, offset, camera_stream=None):
-    """Current COLOR behavior adapted to this file's existing R90 maneuver.
-    Turn right using this file's existing 90-degree maneuver, center on line,
-    pose the arm, then detect color and hold the indicator until next junction.
-    """
+    """Задание COLOR с проверенным поворотом R90 из этого файла.
+    После поворота рука занимает заданное положение, камера распознаёт цвет,
+    а индикатор сохраняет его до следующего перекрёстка."""
     from color_marker_detector import run_color_marker_task
     from roboarm import get_shared_arm
     global COLOR_LED_HOLD
@@ -2746,9 +2505,8 @@ def color_marker_task(calibration, board, bus, offset, camera_stream=None):
         stop()
 
 
-
 def button_bounce_arm_pose(board, xyz):
-    """Move the closed gripper using the existing auto-pitch IK."""
+    """Перемещает закрытый захват с автоматическим подбором угла кисти."""
     import arm_web
     from roboarm import get_shared_arm
     from button_arm import _execute_plan
@@ -2768,7 +2526,7 @@ def button_bounce_arm_pose(board, xyz):
 
 
 def button_bounce_red_centered(objects, width, height):
-    """Require the red blob's centroid in the central 20% x 20% rectangle."""
+    """Проверяет, что центр красного объекта попал в центральные 20% кадра."""
     half_w = width * BUTTON_BOUNCE_CENTER_FRACTION / 2
     half_h = height * BUTTON_BOUNCE_CENTER_FRACTION / 2
     return any(
@@ -2781,7 +2539,7 @@ def button_bounce_red_centered(objects, width, height):
 
 
 def button_bounce_find_red(calibration, camera_stream):
-    """Follow the line at base PWM130 while watching for centered red."""
+    """Следует по линии на базовом PWM 130 и ищет красную точку."""
     import cv2
     from color_marker_detector import ColorMarkerDetector
     if camera_stream is None:
@@ -2807,7 +2565,7 @@ def button_bounce_find_red(calibration, camera_stream):
             if not line_tracker.all_channels_fresh():
                 print("\nBUTTON_BOUNCE: stale ADC; stopping.")
                 return False
-            # Correct steering every loop, not only when camera FPS permits.
+            # Корректируем движение на каждом цикле, а не только при новом кадре.
             state = line_tracker.update(calibration)
             if state["position"] is None:
                 stop()
@@ -2860,7 +2618,7 @@ def button_bounce_find_red(calibration, camera_stream):
 
 
 def button_bounce_task(calibration, detector, bus, offset, board, camera_stream=None):
-    """Normal R, closed-gripper poses, centered red, reverse, CUBE1-style R90."""
+    """Обычный R, позиции руки, обнаружение красного, возврат и финальный R90."""
     indicator = None
     stop()
     try:
@@ -2883,7 +2641,7 @@ def button_bounce_task(calibration, detector, bus, offset, board, camera_stream=
             line_loss_timeout=BUTTON_BOUNCE_REVERSE_LINE_TIMEOUT,
         ):
             return False
-        # Same PWM80 0.5-second forward pulse as the completed CUBE1.
+        # Тот же проезд 0,5 с на PWM 80, что и в завершённом CUBE1.
         if not cube1_final_turn_approach():
             return False
         print("\nBUTTON_BOUNCE: final R90.")
@@ -2901,7 +2659,7 @@ def button_bounce_task(calibration, detector, bus, offset, board, camera_stream=
 
 def load_route():
 
-    """Read the user-edited ROUTE list before starting the robot."""
+    """Проверяет маршрут ROUTE, заданный пользователем."""
 
     if not ROUTE:
 
@@ -2912,8 +2670,6 @@ def load_route():
             "in main_test.py before starting main_test.py."
 
         )
-
-
 
     route = []
 
@@ -2946,15 +2702,11 @@ def load_route():
     return route
 
 
-
-
-
 def recover_stm32_connection(old_board, calibration):
-    """Reopen the STM32 and resubscribe ADC after an actual stale-data fault.
+    """Повторно подключает STM32 и заново подписывается на ADC после потери данных.
 
-    Only called from ordinary route following, not during an arm task. If
-    recovery fails, the caller aborts; never blindly arm the old connection.
-    """
+    Вызывается только после остановки моторов. Если восстановление не удалось,
+    движение прекращается; старое подключение не используется."""
     try:
         stop()
     except Exception:
@@ -2965,11 +2717,11 @@ def recover_stm32_connection(old_board, calibration):
     except Exception as exc:
         print(f"STM32 RECOVERY: old connection close error: {exc}")
     reset_stm32()
-    time.sleep(3.0)  # Allow STM32 to boot after a real connection fault.
+    time.sleep(3.0)  # Пауза для загрузки STM32 после сброса.
     board = None
     try:
         board = telemetrix.Telemetrix(com_port=SERIAL_PORT)
-        # Preserve the differential2.py order during recovery as well.
+        # При восстановлении сохраняем порядок подключения из differential2.py.
         line_tracker.initialize(board)
         if not line_tracker.wait_for_callbacks(timeout=6.0):
             raise RuntimeError("Not all eight ADC callbacks returned")
@@ -2982,7 +2734,7 @@ def recover_stm32_connection(old_board, calibration):
             raise RuntimeError("No track line after reconnect; stop safely")
         motors.initialize(board)
         motors.motor_stop()
-        # Reset shared STM32-backed servo handles before reattaching.
+        # Сбрасываем общие объекты сервоприводов STM32 перед подключением.
         import roboarm
         roboarm._shared_board = None
         roboarm._shared_arm = None
@@ -3033,15 +2785,15 @@ def main():
 
         reset_stm32()
 
-        # Use the same connection and ADC subscription order as ADC.py:
+        # Соблюдаем тот же порядок соединения с STM32 и подписки ADC, что в ADC.py:
 
-        # connect once, force the drive outputs to zero, then enable the arm.
+        # одно подключение, нулевые сигналы моторам, затем разрешение руки.
 
         board = telemetrix.Telemetrix(com_port=SERIAL_PORT)
 
-        # Do this before any servo motion or callback wait.  It prevents a
+        # Делаем это до движения сервоприводов или ожидания callback,
 
-        # previous PWM state from moving the chassis while servos wake up.
+        # чтобы прежний PWM не запустил корпус при пробуждении руки.
 
         motors.initialize(board)
 
@@ -3051,15 +2803,11 @@ def main():
 
         activate_arm_home(board)
 
-
-
-        # Only after the arm is held safely at home, register all ADC inputs.
+        # Только после безопасной начальной позы подписываем датчики ADC.
 
         line_tracker.initialize(board)
 
         tracker_on = True
-
-
 
         calibration = line_tracker.load_calibration()
 
@@ -3068,8 +2816,6 @@ def main():
             print("No calibration found; run python calibrate.py.")
 
             return
-
-
 
         print("Waiting for all eight ADC callbacks...")
 
@@ -3093,17 +2839,13 @@ def main():
 
             return
 
-
-
         startup_state = line_tracker.update(calibration)
 
         print(f"All eight ADC channels ready: {startup_state['raw']}")
 
         print(f"Initial line position: {startup_state['position']}")
 
-
-
-        # Shared camera: avoid reopening Picamera2 on each task.
+        # Одна камера для всех заданий, без повторного запуска Picamera2.
         try:
             from color_marker_detector import ContinuousCamera
             camera_stream = ContinuousCamera(port=8000)
@@ -3114,8 +2856,6 @@ def main():
                 camera_stream.stop()
             camera_stream = None
         print("Starting route; line tracker will self-center the robot.")
-
-
 
         detector = JunctionDetector()
 
@@ -3128,8 +2868,6 @@ def main():
             "Automatic route active."
 
         )
-
-
 
         route_index = 0
 
@@ -3155,11 +2893,9 @@ def main():
 
         }
 
-
-
         while True:
 
-            # Never reuse old ADC values to command motors.
+            # Не используем устаревшие данные ADC для управления моторами.
             state = line_tracker.update(calibration)
             if not line_tracker.all_channels_fresh():
                 stop()
@@ -3192,8 +2928,6 @@ def main():
 
             junction_gate.update(left, right, position)
 
-
-
             if (now >= junction_ignore_until
 
                     and junction_gate.armed and candidate):
@@ -3203,8 +2937,6 @@ def main():
             else:
 
                 candidate_count = 0
-
-
 
             if candidate_count >= JUNCTION_CONFIRM:
 
@@ -3216,7 +2948,7 @@ def main():
 
                 junction_count += 1
 
-                # The confirmed COLOR LED remains lit until the next junction.
+                # Подтверждённый цвет COLOR горит до следующего перекрёстка.
                 if COLOR_LED_HOLD is not None:
                     try:
                         COLOR_LED_HOLD.off()
@@ -3250,8 +2982,6 @@ def main():
 
                     break
 
-
-
                 if cmd == "COLOR":
 
                     if bus is None:
@@ -3269,7 +2999,7 @@ def main():
 
                 ):
 
-                    # Gyro stays unloaded until a maneuver requires it.
+                    # Гироскоп включаем только при необходимости поворота.
 
                     if bus is None:
 
@@ -3289,11 +3019,9 @@ def main():
 
                         offset = gyro_calibrate(bus)
 
-
-
                     if cmd == "BUTTON":
 
-                        # No ToF setup: BUTTON uses two seconds of line tracking.
+                        # BUTTON едет 2 секунды по линии, без датчика расстояния.
                         ok = button_task(
 
                             calibration, detector, sensor, bus, offset, board
@@ -3327,7 +3055,7 @@ def main():
 
                         if ok:
 
-                            # Same 80-degree R turn and differential reacquire.
+                            # Тот же поворот вправо и последующее центрирование, что в старом алгоритме.
 
                             ok, _ = pivot(bus, offset, "R")
 
@@ -3371,8 +3099,6 @@ def main():
 
                     ok = follow_for(calibration, 0.5)
 
-
-
                 if not ok:
 
                     print("\nManeuver failed. Robot stopped.")
@@ -3413,13 +3139,9 @@ def main():
 
                     break
 
-
-
                 continue
 
-
-
-            # Only the tested differential2.py decides how to follow the line.
+            # Только проверенный differential2.py управляет движением по линии.
 
             if position is None:
 
@@ -3493,11 +3215,7 @@ def main():
 
                 )
 
-
-
             time.sleep(LOOP_DELAY)
-
-
 
     except KeyboardInterrupt:
 
@@ -3574,10 +3292,6 @@ def main():
                 pass
 
         print("\nRobot stopped.")
-
-
-
-
 
 if __name__ == "__main__":
 
