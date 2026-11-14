@@ -2503,9 +2503,14 @@ def main():
 
             # Только проверенный differential2.py управляет движением по линии.
             if position is None:
-                next_cmd = route[route_index] if route_index < len(route) else None
                 stop()
-                print(f'\\rNO LINE: waiting; next ROUTE={next_cmd}', end="", flush=True)
+                if acceleration_started is not None:
+                    acceleration_started = time.monotonic()
+                print(
+                    '\rNO LINE: paused; route resumes when line returns. '
+                    f'raw={state["raw"]}',
+                    end="", flush=True,
+                )
             else:
                 if slow_until_next_junction:
                     differential_drive(state, speed=150, max_speed=150)
