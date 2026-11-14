@@ -12,7 +12,9 @@ DURATION = 10.0
 POLL_INTERVAL = 0.005
 CONTROL_INTERVAL = 0.04
 STARTUP_TIMEOUT = 6.0
-MAX_SAMPLE_AGE = 0.25
+MAX_SAMPLE_AGE = 0.50
+STARTUP_OBSERVE_SECONDS = 2.0
+MIN_STARTUP_UPDATES = 3
 MAX_NO_LINE_SECONDS = 0.12
 
 def main():
@@ -33,6 +35,18 @@ def main():
     next_control = 0.0
     next_report = 0.0
     reason = "10 seconds completed"
+    def print_adc_diagnostic(label, before=None):
+        snapshot = line_tracker.update(calibration)
+        now = time.monotonic()
+        ages = [None if t is None else round(now - t, 3)
+                for t in snapshot["sample_times"]]
+        print(label)
+        print("ADC ages (seconds):", ages)
+        print("ADC counts:", snapshot["sample_ids"])
+        if before is not None:
+            print("New callbacks:", [a - b for a, b in
+                  zip(snapshot["sample_ids"], before)])
+        return snapshot
     try:
         reset_stm32()
         board = telemetrix.Telemetrix(com_port=PORT)
@@ -45,23 +59,29 @@ def main():
         if not line_tracker.wait_for_callbacks(timeout=STARTUP_TIMEOUT):
             print("Missing ADC callbacks:", line_tracker.callback_status())
             return
-        if not line_tracker.all_channels_fresh(max_age=MAX_SAMPLE_AGE):
-            print("ADC samples not fresh. Motors remain off.")
-            return
-        initial = line_tracker.update(calibration)
+        initial = print_adc_diagnostic("Initial ADC status:")
         if initial["position"] is None:
             print("No line at start. Motors remain off.")
+            return
+        print("ADC TEST: base PWM=255, max PWM=255, PID from differential2.")
+        print("Checking ADC callback activity before enabling motors...")
+        before = initial["sample_ids"][:]
+        time.sleep(STARTUP_OBSERVE_SECONDS)
+        latest = print_adc_diagnostic("ADC status after observation:", before)
+        increments = [a - b for a, b in zip(latest["sample_ids"], before)]
+        if min(increments) < MIN_STARTUP_UPDATES:
+            print("ADC updates too sparse for a safe PWM 255 moving test.")
+            print("Telemetrix analog callbacks may be change-triggered, not periodic.")
+            print("Motors remain off; investigate ADC reporting first.")
+            return
+        if not line_tracker.all_channels_fresh(max_age=MAX_SAMPLE_AGE):
+            print("ADC stale before start; motors remain off.")
             return
         motors.initialize(board)
         motors_ready = True
         motors.motor_stop()
         motors.enable_guard(lambda: line_tracker.all_channels_fresh(max_age=MAX_SAMPLE_AGE))
-        print("ADC TEST: base PWM=255, max PWM=255, PID from differential2.")
         print("10-second run. Keep the track clear. Ctrl+C stops immediately.")
-        time.sleep(1.0)
-        if not line_tracker.all_channels_fresh(max_age=MAX_SAMPLE_AGE):
-            print("ADC stale before start.")
-            return
         state = line_tracker.update(calibration)
         if state["position"] is None:
             print("Line lost before start.")
