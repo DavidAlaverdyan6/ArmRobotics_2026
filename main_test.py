@@ -2,6 +2,8 @@
 """Основной маршрут ArmRobotics: навигация и задания робота."""
 import math
 import time
+from simple_pid import PID
+from navigation_core import FreshFrames
 import smbus
 from telemetrix import telemetrix
 import line_tracker
@@ -13,15 +15,15 @@ PROGRAM_BUILD = "cube-fire-2026-11-10.1"
 
 # Ранее проверенные скорости контроллера differential2.
 SERIAL_PORT = "/dev/serial0"
-BASE_SPEED = 220
+BASE_SPEED = 190
 MAX_SPEED = 255
 MIN_SPEED = 0
-MANEUVER_SPEED = 100
-MANEUVER_MAX_SPEED = 170
+MANEUVER_SPEED = 190
+MANEUVER_MAX_SPEED = 255
 KP = 100.0
 KI = 0.0  # Существующий LineTrackingEngine использует PD; интегральный член равен нулю.
 KD = 5.0
-MAX_CORRECTION = 255  # Справочное значение; ограничение PWM выполняет LineTrackingEngine.
+MAX_CORRECTION = 255  # Реальное ограничение выхода simple_pid.PID.
 TARGET_POSITION = line_tracker.CENTER_POSITION
 LOOP_DELAY = 0.04
 # Восстановление пропущенного перекрёстка.
@@ -38,6 +40,7 @@ JUNCTION_SIDE_SUPPORT_OFF = 0.35
 JUNCTION_CENTER_MIN = 0.50
 JUNCTION_CONFIRM = 2
 JUNCTION_CLEAR = 3
+RETURN_JUNCTION_CLEAR = 1
 JUNCTION_REARM_CLEAR_FRAMES = 3
 POST_TURN_JUNCTION_IGNORE_SECONDS = 1.5
 POST_SLOW_JUNCTION_IGNORE_SECONDS = 0.2
@@ -223,75 +226,70 @@ ALLOWED_ROUTE_COMMANDS = {
     "L", "R", "L90", "R90", "L90SLOW", "R90SLOW", "S", "SLOW",
     "BUTTON", "BUTTON_BOUNCE", "CHARGING", "FIREFIGHTER", "CUBE1", "COLOR", "Q",
 }
-line_follower = line_tracker.LineTrackingEngine(
-    base_speed=BASE_SPEED,
-    max_speed=MAX_SPEED,
-    min_speed=MIN_SPEED,
-    kp=KP,
-    kd=KD,
-    target_position=TARGET_POSITION,
+# Старый LineTrackingEngine оставлен исключительно для резервных режимов заднего хода.
+reverse_follower = line_tracker.LineTrackingEngine(
+    base_speed=BASE_SPEED, max_speed=MAX_SPEED, min_speed=MIN_SPEED,
+    kp=KP, kd=KD, target_position=TARGET_POSITION,
 )
+
+
+class Differential2Forward:
+    """Тот же simple_pid + FreshFrames + PWM, что в differential2.py."""
+
+    def __init__(self):
+        self.pid = PID(
+            KP, KI, KD, setpoint=TARGET_POSITION,
+            sample_time=None,
+            output_limits=(-MAX_CORRECTION, MAX_CORRECTION),
+            differential_on_measurement=True,
+        )
+        self.freshness = FreshFrames()
+
+    def reset_steering(self):
+        self.pid.reset()
+        self.freshness = FreshFrames()
+
+    def stop(self):
+        self.reset_steering()
+        motors.motor_stop()
+
+    def drive(self, state, speed=BASE_SPEED, max_speed=MAX_SPEED):
+        if state is None or state.get("position") is None:
+            self.stop()
+            return False
+        if not self.freshness.accept(state, time.monotonic()):
+            return True  # Как в differential2.py: не вычислять PID на повторном кадре.
+        correction = -self.pid(state["position"])
+        left = round(max(MIN_SPEED, min(max_speed, speed + correction)))
+        right = round(max(MIN_SPEED, min(max_speed, speed - correction)))
+        motors.set_speeds(left, right)
+        return True
+
+    def drive_straight(self, speed=BASE_SPEED, max_speed=MAX_SPEED):
+        self.reset_steering()
+        pwm = round(max(MIN_SPEED, min(max_speed, speed)))
+        motors.set_speeds(pwm, pwm)
+        return True
+
+    def reverse(self, state, speed):
+        return reverse_follower.reverse(state, speed)
+
+    def reverse_straight(self, speed):
+        return reverse_follower.reverse_straight(speed)
+
+
+line_follower = Differential2Forward()
 
 
 def stop():
     line_follower.stop()
+    reverse_follower.reset_steering()
 
 
 def differential_drive(state, speed=BASE_SPEED, max_speed=MAX_SPEED):
-    """Совместимый интерфейс для отдельного контроллера следования по линии."""
+    """Точная схема управления колёсами из differential2.py."""
     return line_follower.drive(state, speed=speed, max_speed=max_speed)
 
-
-def post_junction_drive_limits(elapsed):
-    """Плавно увеличивает базовый PWM и максимальный PWM колёс после манёвра."""
-    fraction = max(0.0, min(1.0, elapsed / POST_JUNCTION_ACCEL_SECONDS))
-    start_speed = min(MANEUVER_SPEED, BASE_SPEED)
-    start_max = min(MANEUVER_MAX_SPEED, MAX_SPEED)
-    speed = start_speed + (BASE_SPEED - start_speed) * fraction
-    max_speed = start_max + (MAX_SPEED - start_max) * fraction
-    return speed, max_speed
-
-
-def update_straight_speed(state, left, right, candidate, controller, now):
-    """Ускоряет робот только на устойчивой прямой без ответвлений."""
-    position = state.get("position") if state else None
-    previous_time = controller["previous_time"]
-    dt = 0.0 if previous_time is None else max(0.0, now - previous_time)
-    controller["previous_time"] = now
-    if position is None:
-        controller["current_speed"] = BASE_SPEED
-        controller["previous_error"] = None
-        controller["straight_since"] = None
-        return BASE_SPEED, MAX_SPEED
-    error = position - TARGET_POSITION
-    previous_error = controller["previous_error"]
-    derivative = 0.0
-    if previous_error is not None and dt > 0.0:
-        derivative = (error - previous_error) / dt
-    controller["previous_error"] = error
-    stable = (
-        not left and not right and not candidate
-        and abs(error) <= STRAIGHT_POSITION_TOLERANCE
-        and abs(derivative) <= STRAIGHT_DERROR_LIMIT
-    )
-    if stable:
-        if controller["straight_since"] is None:
-            controller["straight_since"] = now
-        if now - controller["straight_since"] >= STRAIGHT_CONFIRM_SECONDS:
-            controller["current_speed"] = min(
-                STRAIGHT_MAX_SPEED,
-                controller["current_speed"] + STRAIGHT_ACCEL_RATE * dt,
-            )
-    else:
-        controller["straight_since"] = None
-        controller["current_speed"] = max(
-            BASE_SPEED,
-            controller["current_speed"] - STRAIGHT_DECEL_RATE * dt,
-        )
-    return controller["current_speed"], min(
-        STRAIGHT_MAX_SPEED,
-        max(MANEUVER_MAX_SPEED, controller["current_speed"]),
-    )
 
 
 def differential_reverse(state, speed, controller=None):
@@ -689,8 +687,8 @@ def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE, *, slow=False):
         time.sleep(0.02)
 
 
-def follow_for(calibration, seconds, *, speed=MANEUVER_SPEED,
-               max_speed=MANEUVER_MAX_SPEED, recover_connection=None):
+def follow_for(calibration, seconds, *, speed=BASE_SPEED,
+               max_speed=MAX_SPEED, recover_connection=None):
     """Движение вперёд заданное время с сохранением регулятора differential2."""
     deadline = time.monotonic() + seconds
     try:
@@ -764,8 +762,8 @@ def button_bumper_approach(calibration, sensor):
                 else:
                     differential_drive(
                         state,
-                        speed=MANEUVER_SPEED,
-                        max_speed=MANEUVER_MAX_SPEED,
+                        speed=BASE_SPEED,
+                        max_speed=MAX_SPEED,
                     )
                     time.sleep(LOOP_DELAY)
                     continue
@@ -788,14 +786,14 @@ def button_bumper_approach(calibration, sensor):
 
                 # Во время ограниченного тарана можно продолжать прямо при потере линии.
                 line_follower.drive_straight(
-                    speed=BUTTON_BUMPER_SPEED,
-                    max_speed=BUTTON_BUMPER_SPEED,
+                    speed=BASE_SPEED,
+                    max_speed=MAX_SPEED,
                 )
             else:
                 differential_drive(
                     state,
-                    speed=BUTTON_BUMPER_SPEED,
-                    max_speed=BUTTON_BUMPER_SPEED,
+                    speed=BASE_SPEED,
+                    max_speed=MAX_SPEED,
                 )
             time.sleep(LOOP_DELAY)
         print("\nBUTTON: bumper approach timeout.")
@@ -862,7 +860,7 @@ def button_return(
                 outer_confirm_count = (
                     outer_confirm_count + 1
                     if (
-                        cleared_count >= JUNCTION_CLEAR
+                        cleared_count >= RETURN_JUNCTION_CLEAR
                         and (candidate or left or right)
                     )
                     else 0
@@ -885,7 +883,7 @@ def button_return(
 
             # BUTTON: запоминаем срабатывания краёв в коротком окне.
             # Не требуем одновременной чёрной линии на S1 и S8.
-            elif label == "BUTTON":
+            elif label in ("BUTTON", "BUTTON_BOUNCE", "FIREFIGHTER"):
                 if cleared_count >= JUNCTION_CLEAR:
                     if button_first_edge_at is not None and (
                         now - button_first_edge_at > BUTTON_RETURN_JUNCTION_WINDOW
@@ -919,7 +917,7 @@ def button_return(
 
             # Не используем его для распознавания перекрёстка и выбора скорости.
             candidate_visible = right if accept_s8_only else left != right
-            if label == "BUTTON" and button_first_edge_at is not None:
+            if label in ("BUTTON", "BUTTON_BOUNCE", "FIREFIGHTER") and button_first_edge_at is not None:
                 candidate_visible = True
             if candidate_visible:
                 if candidate_since is None:
@@ -927,7 +925,7 @@ def button_return(
             elif accept_s8_only or (not left and not right):
                 candidate_since = None
             speed = RETURN_SLOW_SPEED if candidate_since is not None else RETURN_SPEED
-            if label == "BUTTON" and button_first_edge_at is not None:
+            if label in ("BUTTON", "BUTTON_BOUNCE", "FIREFIGHTER") and button_first_edge_at is not None:
                 speed = BUTTON_RETURN_JUNCTION_SLOW_SPEED
             if not differential_reverse(state, speed, reverse_controller):
                 print(f"\n{label}: line lost too long while reversing.")
@@ -1251,8 +1249,8 @@ def cube1_transport(calibration, detector, cube_sensor, indicator,
                     print("\\nCUBE1: line lost before drop; STOP.")
                     return None
                 line_follower.drive_straight(
-                    speed=MANEUVER_SPEED,
-                    max_speed=MANEUVER_MAX_SPEED,
+                    speed=BASE_SPEED,
+                    max_speed=MAX_SPEED,
                 )
             else:
                 line_loss_count = 0
@@ -1637,8 +1635,8 @@ def firefighter_task(
                 break
             line_end_count = 0
             differential_drive(
-                state, speed=FIRE_APPROACH_SPEED,
-                max_speed=FIRE_APPROACH_MAX_SPEED,
+                state, speed=BASE_SPEED,
+                max_speed=MAX_SPEED,
             )
             time.sleep(LOOP_DELAY)
         else:
@@ -1655,7 +1653,7 @@ def firefighter_task(
             offset,
             left_sign,
             label="FIREFIGHTER",
-            accept_any_junction=True,
+            accept_any_junction=False,
             line_loss_timeout=BUTTON_REVERSE_LINE_LOSS_TIMEOUT,
             recover_connection=lambda stage: reconnect_fire(stage),
         ):
@@ -2162,14 +2160,7 @@ def main():
         candidate_count = 0
         junction_gate = JunctionRearmGate()
         junction_ignore_until = 0.0
-        acceleration_started = None
         slow_until_next_junction = False
-        straight_speed = {
-            "current_speed": BASE_SPEED,
-            "previous_error": None,
-            "previous_time": None,
-            "straight_since": None,
-        }
         while True:
 
             # Не используем устаревшие данные ADC для управления моторами.
@@ -2294,8 +2285,8 @@ def main():
                     elif cmd in ("L90", "R90", "L90SLOW", "R90SLOW"):
                         ok = follow_for(
                             calibration, TURN_90_FORWARD_TIME,
-                            speed=TURN_90_FORWARD_SPEED,
-                            max_speed=TURN_90_FORWARD_MAX_SPEED,
+                            speed=BASE_SPEED,
+                            max_speed=MAX_SPEED,
                             recover_connection=recover_during_task,
                         )
                         if ok:
@@ -2317,11 +2308,6 @@ def main():
                     print("\nManeuver failed. Robot stopped.")
                     break
                 slow_until_next_junction = cmd in ("SLOW", "L90SLOW", "R90SLOW")
-                acceleration_started = None if slow_until_next_junction else time.monotonic()
-                straight_speed["current_speed"] = MANEUVER_SPEED
-                straight_speed["previous_error"] = None
-                straight_speed["previous_time"] = None
-                straight_speed["straight_since"] = None
                 if cmd in (
                     "L", "R", "L90", "R90", "L90SLOW", "R90SLOW",
                     "BUTTON", "CHARGING", "FIREFIGHTER", "CUBE1", "COLOR", "BUTTON_BOUNCE",
@@ -2341,35 +2327,16 @@ def main():
                     break
                 continue
 
-            # Только проверенный differential2.py управляет движением по линии.
+            # Везде один и тот же differential2 PID; PWM 190, кроме BUTTON_BOUNCE (80).
             if position is None:
                 stop()
-                if acceleration_started is not None:
-                    acceleration_started = time.monotonic()
                 print(
-                    '\rNO LINE: paused; route resumes when line returns. '
+                    '\\rNO LINE: paused; route resumes when line returns. '
                     f'raw={state["raw"]}',
                     end="", flush=True,
                 )
             else:
-                if slow_until_next_junction:
-                    differential_drive(state, speed=150, max_speed=MAX_SPEED)
-                elif acceleration_started is None:
-                    speed, max_speed = update_straight_speed(
-                        state, left, right, candidate,
-                        straight_speed, time.monotonic(),
-                    )
-                    differential_drive(state, speed=speed, max_speed=max_speed)
-                else:
-                    elapsed = time.monotonic() - acceleration_started
-                    speed, max_speed = post_junction_drive_limits(elapsed)
-                    differential_drive(state, speed=speed, max_speed=max_speed)
-                    if elapsed >= POST_JUNCTION_ACCEL_SECONDS:
-                        acceleration_started = None
-                        straight_speed["current_speed"] = speed
-                        straight_speed["previous_error"] = None
-                        straight_speed["previous_time"] = None
-                        straight_speed["straight_since"] = None
+                differential_drive(state, speed=BASE_SPEED, max_speed=MAX_SPEED)
                 print(
                     f"\rLINE pos={position:+.3f} "
                     f"S1={int(left)} S8={int(right)} "
