@@ -13,7 +13,7 @@ PROGRAM_BUILD = "cube-fire-2026-11-10.1"
 
 # Ранее проверенные скорости контроллера differential2.
 SERIAL_PORT = "/dev/serial0"
-BASE_SPEED = 255
+BASE_SPEED = 220
 MAX_SPEED = 255
 MIN_SPEED = 0
 MANEUVER_SPEED = 100
@@ -23,7 +23,7 @@ KI = 0.0  # Существующий LineTrackingEngine использует PD;
 KD = 5.0
 MAX_CORRECTION = 255  # Справочное значение; ограничение PWM выполняет LineTrackingEngine.
 TARGET_POSITION = line_tracker.CENTER_POSITION
-LOOP_DELAY = 0.02
+LOOP_DELAY = 0.04
 # Восстановление пропущенного перекрёстка.
 
 # Пороги интенсивности линии для позиционирования возле кнопки.
@@ -182,20 +182,13 @@ COLOR_ARM_ANGLES = {
     "gripper": 0.0,
 }
 COLOR_LED_HOLD = None
-BUTTON_BOUNCE_START = (0.0, 150.0, 50.0)
-BUTTON_BOUNCE_PRESS = (0.0, 250.0, -50.0)
-BUTTON_BOUNCE_GRIPPER_CLOSED = 180.0
+# BUTTON_BOUNCE: обычный PD; меняется только базовый PWM.
 BUTTON_BOUNCE_DRIVE_PWM = 130
-BUTTON_BOUNCE_MAX_SPEED = 130  # Максимальный PWM колеса при поиске красной точки.
-BUTTON_BOUNCE_LOOP_DELAY = 0.04
-BUTTON_BOUNCE_KP = 65.0
-BUTTON_BOUNCE_KD = 2.0  # Временный коэффициент D для уменьшения виляния.
-# Обычный контроллер использует KP=100, KI=0, KD=5 и MIN_SPEED=0.
-# MAX_CORRECTION=255 — справочное значение; PWM колёс ограничен 0..130.
-BUTTON_BOUNCE_CENTER_FRACTION = 0.20
-BUTTON_BOUNCE_RED_AREA = 120
+BUTTON_BOUNCE_MIN_OBJECT_AREA = 140
 BUTTON_BOUNCE_CONFIRM_FRAMES = 3
-BUTTON_BOUNCE_SEARCH_TIMEOUT = 20.0
+BUTTON_BOUNCE_TARGET_X = (0.35, 0.65)
+BUTTON_BOUNCE_TARGET_Y = (0.65, 0.90)
+BUTTON_BOUNCE_PRESS = (0.0, 250.0, -20.0)
 BUTTON_BOUNCE_REVERSE_LINE_TIMEOUT = 5.0
 
 # Автоматический маршрут: по одной команде на каждый найденный перекрёсток.
@@ -1912,128 +1905,120 @@ def color_marker_task(calibration, board, bus, offset, camera_stream=None):
         stop()
 
 
-def button_bounce_arm_pose(board, xyz):
-    """Перемещает закрытый захват с автоматическим подбором угла кисти."""
-    import arm_web
+def button_bounce_prepare_arm(board):
+    """Сначала BASE 180, затем SHOULDER 130; захват закрыт."""
     from roboarm import get_shared_arm
-    from button_arm import _execute_plan
     stop()
     arm, _ = get_shared_arm(board)
+    arm.write(gripper=180)
+    arm.write(base=180)
+    time.sleep(0.3)
+    arm.write(shoulder=130)
+    time.sleep(0.3)
+    return arm
+
+
+def button_bounce_press_and_home(board):
+    """Поднять плечо, нажать по IK с автоматической кистью, сложить руку."""
+    import arm_web
+    from button_arm import _execute_plan, _return_home
+    from roboarm import get_shared_arm
+    stop()
+    arm, _ = get_shared_arm(board)
+    arm.write(gripper=180)
+    arm.write(shoulder=180)
+    time.sleep(0.3)
     arm_web.arm = arm
-    x, y, z = xyz
+    x, y, z = BUTTON_BOUNCE_PRESS
     path, pitch = arm_web.plan_auto_path({
         "x": x, "y": y, "z": z, "orientation_mode": "auto",
     })
-    arm.write(gripper=BUTTON_BOUNCE_GRIPPER_CLOSED)
-    print(f"BUTTON_BOUNCE: arm ({x:g},{y:g},{z:g}), auto pitch {pitch:.1f}.")
+    print(f"BUTTON_BOUNCE: press ({x:g}, {y:g}, {z:g}), auto wrist {pitch:.1f}.")
     _execute_plan(arm, path, arm_web.STEP_DELAY)
-    arm.write(gripper=BUTTON_BOUNCE_GRIPPER_CLOSED)
+    arm.write(gripper=180)
+    _return_home(
+        arm, arm_web.START_ANGLES, arm_web.AUTO_MAX_STEP_DEG,
+        arm_web.STEP_DELAY,
+    )
     return True
 
 
-def button_bounce_red_centered(objects, width, height):
-    """Проверяет, что центр красного объекта попал в центральные 20% кадра."""
-    half_w = width * BUTTON_BOUNCE_CENTER_FRACTION / 2
-    half_h = height * BUTTON_BOUNCE_CENTER_FRACTION / 2
-    return any(
-        obj["color"] == "red"
-        and obj["area"] >= BUTTON_BOUNCE_RED_AREA
-        and abs(obj["center"][0] - width / 2) <= half_w
-        and abs(obj["center"][1] - height / 2) <= half_h
-        for obj in objects
-    )
-
-
-def button_bounce_find_red(calibration, camera_stream, recover=None):
-    """Следует по линии на базовом PWM 130 и ищет красную точку."""
+def button_bounce_find_color(calibration, camera_stream, recover=None):
+    """Следовать по линии с PWM 130/255 до цветного объекта в нижней центральной зоне."""
     import cv2
     from color_marker_detector import ColorMarkerDetector
     if camera_stream is None:
-        print("BUTTON_BOUNCE: shared camera unavailable.")
+        print("BUTTON_BOUNCE: camera unavailable.")
         return False
     camera = camera_stream
-    color_detector = ColorMarkerDetector(
-        min_object_area=BUTTON_BOUNCE_RED_AREA,
-        allowed_colors={"red"},
+    detector = ColorMarkerDetector(
+        min_object_area=BUTTON_BOUNCE_MIN_OBJECT_AREA,
+        stable_frames=BUTTON_BOUNCE_CONFIRM_FRAMES,
+        allowed_colors={"red", "green", "blue"},
     )
-    stop()
-    old_kp, old_kd = line_follower.kp, line_follower.kd
-    line_follower.kp, line_follower.kd = BUTTON_BOUNCE_KP, BUTTON_BOUNCE_KD
+    sequence = camera.sequence
+    locked_color = None
+    centered_frames = 0
+    last_frame_at = time.monotonic()
     line_follower.reset_steering()
+    camera.start_task("BUTTON_BOUNCE: searching red/green/blue")
     try:
-        sequence = camera.sequence
-        confirmed = 0
-        deadline = time.monotonic() + BUTTON_BOUNCE_SEARCH_TIMEOUT
-        camera.start_task("BUTTON_BOUNCE: searching centered red")
-        last_frame_at = time.monotonic()
-        while time.monotonic() < deadline:
+        while True:
             if not line_tracker.all_channels_fresh():
-                state = line_tracker.update(calibration)
-                ages = [
-                    None if t is None else round(time.monotonic() - t, 3)
-                    for t in state["sample_times"]
-                ]
-                print(f"\nBUTTON_BOUNCE: stale ADC; channel ages={ages}; reconnecting.")
                 stop()
-                remaining = max(0.0, deadline - time.monotonic())
                 if recover is None or not recover():
                     return False
-                # Время переподключения не съедает оставшийся поиск кнопки.
-                deadline = time.monotonic() + remaining
-                # После переподключения кадры и подтверждения ищем заново,
-                # но R-поворот и уже завершённые этапы задания не повторяем.
                 sequence = camera.sequence
-                confirmed = 0
                 last_frame_at = time.monotonic()
+                detector.reset()
+                locked_color = None
+                centered_frames = 0
                 continue
-            # Корректируем движение на каждом цикле, а не только при новом кадре.
             state = line_tracker.update(calibration)
             if state["position"] is None:
                 stop()
-                print("BUTTON_BOUNCE: line lost; stopping.")
+                print("\\nBUTTON_BOUNCE: line lost.")
                 return False
             captured = camera.get_frame(after_sequence=sequence, timeout=0.01)
-            if captured is None:
-                if time.monotonic() - last_frame_at > 0.5:
-                    stop()
-                    print("BUTTON_BOUNCE: camera stalled; stopping.")
-                    return False
-                differential_drive(
-                    state, speed=BUTTON_BOUNCE_DRIVE_PWM, max_speed=BUTTON_BOUNCE_MAX_SPEED
+            if captured is not None:
+                sequence, frame = captured
+                last_frame_at = time.monotonic()
+                objects, annotated, confirmed_color = detector.process_frame(frame)
+                if locked_color is None and confirmed_color in ("red", "green", "blue"):
+                    locked_color = confirmed_color
+                    print(f"\\nBUTTON_BOUNCE: locked {locked_color}.")
+                height, width = frame.shape[:2]
+                x1 = int(width * BUTTON_BOUNCE_TARGET_X[0])
+                x2 = int(width * BUTTON_BOUNCE_TARGET_X[1])
+                y1 = int(height * BUTTON_BOUNCE_TARGET_Y[0])
+                y2 = int(height * BUTTON_BOUNCE_TARGET_Y[1])
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 255, 255), 2)
+                target = next((
+                    obj for obj in objects
+                    if obj["color"] == locked_color
+                    and x1 <= obj["center"][0] <= x2
+                    and y1 <= obj["center"][1] <= y2
+                ), None)
+                centered_frames = centered_frames + 1 if target else 0
+                camera.publish_task_frame(
+                    annotated,
+                    f"BUTTON_BOUNCE: {locked_color or 'searching'} "
+                    f"target {centered_frames}/{BUTTON_BOUNCE_CONFIRM_FRAMES}",
                 )
-                time.sleep(BUTTON_BOUNCE_LOOP_DELAY)
-                continue
-            last_frame_at = time.monotonic()
-            sequence, frame = captured
-            objects, annotated, _ = color_detector.process_frame(frame)
-            height, width = frame.shape[:2]
-            centered = button_bounce_red_centered(objects, width, height)
-            confirmed = confirmed + 1 if centered else 0
-            half_w = int(width * BUTTON_BOUNCE_CENTER_FRACTION / 2)
-            half_h = int(height * BUTTON_BOUNCE_CENTER_FRACTION / 2)
-            cv2.rectangle(
-                annotated,
-                (width // 2 - half_w, height // 2 - half_h),
-                (width // 2 + half_w, height // 2 + half_h),
-                (255, 255, 255), 2,
-            )
-            camera.publish_task_frame(
-                annotated,
-                f"BUTTON_BOUNCE: red center {confirmed}/{BUTTON_BOUNCE_CONFIRM_FRAMES}",
-            )
-            if confirmed >= BUTTON_BOUNCE_CONFIRM_FRAMES:
+                if centered_frames >= BUTTON_BOUNCE_CONFIRM_FRAMES:
+                    stop()
+                    print(f"\\nBUTTON_BOUNCE: {locked_color} in lower center.")
+                    return True
+            elif time.monotonic() - last_frame_at > 0.5:
                 stop()
-                print("\nBUTTON_BOUNCE: centered red confirmed.")
-                return True
+                print("\\nBUTTON_BOUNCE: camera frames stopped.")
+                return False
             differential_drive(
-                state, speed=BUTTON_BOUNCE_DRIVE_PWM, max_speed=BUTTON_BOUNCE_MAX_SPEED
+                state, speed=BUTTON_BOUNCE_DRIVE_PWM, max_speed=MAX_SPEED
             )
-            time.sleep(BUTTON_BOUNCE_LOOP_DELAY)
-        print("\nBUTTON_BOUNCE: camera search timeout.")
-        return False
+            time.sleep(LOOP_DELAY)
     finally:
         stop()
-        line_follower.kp, line_follower.kd = old_kp, old_kd
         line_follower.reset_steering()
         camera.end_task()
 
@@ -2042,92 +2027,47 @@ def button_bounce_task(
     calibration, detector, bus, offset, board, camera_stream=None,
     recover_connection=None,
 ):
-    """Обычный R, позиции руки, обнаружение красного, возврат и финальный R90."""
-    indicator = None
+    """R, подготовка руки, цвет в нижней части кадра, нажатие, возврат, L90."""
     stop()
-
-    def recover_stage(stage, arm_pose=None):
-        nonlocal board
-        while True:
-            stop()
-            if recover_connection is None:
-                print(f"\nBUTTON_BOUNCE: no reconnect handler at {stage}.")
-                return False
-            recovered = recover_connection(f"BUTTON_BOUNCE {stage}")
-            if recovered is None:
-                print(f"\nBUTTON_BOUNCE: recovery failed at {stage}.")
-                return False
-            board = recovered
-            if arm_pose is not None:
-                if not button_bounce_arm_pose(board, arm_pose):
-                    print(f"\nBUTTON_BOUNCE: arm positioning failed at {stage}.")
-                    return False
-            if line_tracker.all_channels_fresh():
-                print(f"\nBUTTON_BOUNCE: ADC fresh; continuing {stage}.")
-                return True
-            state = line_tracker.update(calibration)
-            ages = [
-                None if t is None else round(time.monotonic() - t, 3)
-                for t in state["sample_times"]
-            ]
-            print(
-                f"\nBUTTON_BOUNCE: ADC stale again after {stage}; "
-                f"channel ages={ages}. Retrying within recovery limit."
-            )
-
     try:
-        print("\nBUTTON_BOUNCE: execute ordinary R.")
-        ok, left_sign = pivot(bus, offset, "R")
-        if not ok or left_sign is None or not reacquire_line(calibration):
-            return False
-        if not line_tracker.all_channels_fresh():
-            if not recover_stage("before arm", None):
-                return False
-        if not button_bounce_arm_pose(board, BUTTON_BOUNCE_START):
-            return False
-        if not line_tracker.all_channels_fresh():
-            if not recover_stage("after arm positioning", BUTTON_BOUNCE_START):
-                return False
-        if not button_bounce_find_red(
-            calibration, camera_stream,
-            recover=lambda: recover_stage("red search", BUTTON_BOUNCE_START),
+        print("\\nBUTTON_BOUNCE: ordinary R.")
+        ok, turn_sign = pivot(bus, offset, "R")
+        if not ok or turn_sign is None or not reacquire_line(
+            calibration, recover_connection=recover_connection
         ):
             return False
-        indicator = create_robot_rgb_indicator()
-        indicator.red()
-        print("BUTTON_BOUNCE: red LED on.")
-        if not button_bounce_arm_pose(board, BUTTON_BOUNCE_PRESS):
+        stop()
+        button_bounce_prepare_arm(board)
+        if not button_bounce_find_color(
+            calibration, camera_stream,
+            recover=(lambda: recover_connection("BUTTON_BOUNCE color search")
+                     is not None) if recover_connection else None,
+        ):
             return False
-        if not line_tracker.all_channels_fresh():
-            if not recover_stage("after button press", BUTTON_BOUNCE_PRESS):
-                return False
+        if not button_bounce_press_and_home(board):
+            return False
         if not button_return(
-            calibration, detector, bus, offset, left_sign,
+            calibration, detector, bus, offset, turn_sign,
             label="BUTTON_BOUNCE",
             line_loss_timeout=BUTTON_BOUNCE_REVERSE_LINE_TIMEOUT,
-            recover_connection=lambda stage: (
-                board if recover_stage(stage) else None
-            ),
+            recover_connection=recover_connection,
         ):
             return False
-        # Не дублируем возврат к перекрёстку после перезапуска STM32.
-        if not line_tracker.all_channels_fresh():
-            if not recover_stage("before final R90"):
-                return False
-        # Тот же проезд 0,5 с на PWM 80, что и в завершённом CUBE1.
-        if not cube1_final_turn_approach():
+        if not follow_for(
+            calibration, RETURN_FORWARD_TIME,
+            recover_connection=recover_connection,
+        ):
             return False
-        print("\nBUTTON_BOUNCE: final R90.")
-        ok, _ = pivot_90(bus, offset, "R", angle_target=TURN_90_ANGLE)
-        return ok and reacquire_line(calibration)
+        print("\\nBUTTON_BOUNCE: final L90.")
+        ok, _ = pivot_90(bus, offset, "L", angle_target=TURN_90_ANGLE)
+        return ok and reacquire_line(
+            calibration, recover_connection=recover_connection
+        )
     except Exception as exc:
-        print(f"\nBUTTON_BOUNCE: error: {exc}")
+        print(f"\\nBUTTON_BOUNCE: {exc}")
         return False
     finally:
         stop()
-        if indicator is not None:
-            indicator.off()
-            indicator.close()
 
 
 def reverse_for_short_turn(seconds, speed):
