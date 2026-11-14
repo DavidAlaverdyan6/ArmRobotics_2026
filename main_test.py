@@ -871,7 +871,7 @@ def button_return(
             elif accept_s8_only:
                 outer_confirm_count = (
                     outer_confirm_count + 1
-                    if cleared_count >= JUNCTION_CLEAR and right
+                    if cleared_count >= RETURN_JUNCTION_CLEAR and right
                     else 0
                 )
                 if outer_confirm_count >= JUNCTION_CONFIRM:
@@ -884,7 +884,7 @@ def button_return(
             # BUTTON: запоминаем срабатывания краёв в коротком окне.
             # Не требуем одновременной чёрной линии на S1 и S8.
             elif label in ("BUTTON", "BUTTON_BOUNCE", "FIREFIGHTER"):
-                if cleared_count >= JUNCTION_CLEAR:
+                if cleared_count >= RETURN_JUNCTION_CLEAR:
                     if button_first_edge_at is not None and (
                         now - button_first_edge_at > BUTTON_RETURN_JUNCTION_WINDOW
                         or (not left and not right)
@@ -909,7 +909,7 @@ def button_return(
                     button_seen_left = button_seen_right = False
                     button_confirm = 0
             # Остальные задания сохраняют исходное правило обоих краёв.
-            elif cleared_count >= JUNCTION_CLEAR and left and right:
+            elif cleared_count >= RETURN_JUNCTION_CLEAR and left and right:
                 print(f"\n{label}: return junction found (both outer sensors).")
                 return True
 
