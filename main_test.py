@@ -1497,11 +1497,10 @@ def firefighter_reverse_until_line(calibration):
 def firefighter_task(
     calibration, detector, bus, offset, board, camera_stream=None,
 ):
-    """Приближается к пламени; включает воду при подтверждении или в конце линии."""
+    """Следует по линии до её конца; сигнал огня только выводится в терминал."""
     from firefighter import (
         Firefighter,
         firefighting_pose,
-        scan_for_confirmed_flame,
     )
     from roboarm import get_shared_arm
     from arm_web import START_ANGLES, AUTO_MAX_STEP_DEG, STEP_DELAY
@@ -1511,7 +1510,14 @@ def firefighter_task(
     try:
         pose = {**START_ANGLES, **firefighting_pose()}
         fire.initialize()
-        fire.wait_for_sample()
+        # Показания огня не блокируют движение; диагностируем их в цикле.
+        print("\nF: advance 0.5s along line before initial L90.")
+        if not follow_for(
+            calibration, TURN_90_FORWARD_TIME,
+            speed=TURN_90_FORWARD_SPEED,
+            max_speed=TURN_90_FORWARD_MAX_SPEED,
+        ):
+            return False
         print("\nF: initial shared L90.")
         ok, left_sign = pivot_90(bus, offset, "L", angle_target=TURN_90_ANGLE)
         if not ok or left_sign is None:
@@ -1531,52 +1537,16 @@ def firefighter_task(
         _return_home(arm, pose, AUTO_MAX_STEP_DEG, STEP_DELAY)
         time.sleep(0.3)
 
-        # Движение сервоприводов может закончиться позже показания датчика.
-        # Перед приближением к пламени ждём новый отчёт.
-        fire.wait_for_sample(after=time.monotonic())
+        # Датчик огня только сообщает о появлении сигнала и не управляет шасси.
         deadline = time.monotonic() + FIRE_APPROACH_TIMEOUT
-        line_end_fallback = False
+        flame_was_visible = False
         while time.monotonic() < deadline:
             flame_detected = fire.detected()
-            if flame_detected is None:
-                # При устаревших данных датчика пламени движение запрещено.
-                stop()
-                fire.wait_for_sample()
-                continue
-            if flame_detected:
-                stop()
-                confirmed = fire.confirm_flame()
-                if not confirmed:
-                    confirmed = scan_for_confirmed_flame(
-                        fire, arm, pose["base"]
-                    )
-                if confirmed:
-                    if camera_stream is not None:
-                        camera_stream.save_latest_task_frame(
-                            "FIREFIGHTER: flame confirmed"
-                        )
-                    print(
-                        "\nF: flame confirmed for 0.5 seconds; advancing "
-                        f"for {FIRE_FINAL_ADVANCE_SECONDS:g} seconds."
-                    )
-                    if not follow_for(
-                        calibration,
-                        FIRE_FINAL_ADVANCE_SECONDS,
-                        speed=FIRE_APPROACH_SPEED,
-                        max_speed=FIRE_APPROACH_MAX_SPEED,
-                    ):
-                        return False
-                    print("\nF: final advance complete. Water ON.")
-                    fire.spray()
-                    # После подачи воды игнорируем устаревшие показания,
-                    # но оставляем подписку, поскольку питание датчика не отключается отдельно.
-                    fire.wait_for_sample(after=time.monotonic())
-                    if fire.confirm_flame():
-                        print("\nF: flame remains. Second and final 5 s spray.")
-                        fire.spray()
-                    break
-                # Случайный сигнал и пустое сканирование не запускают воду.
-                continue
+            if flame_detected is True and not flame_was_visible:
+                print("\nF: flame detected (information only).")
+                if camera_stream is not None:
+                    camera_stream.save_latest_task_frame("FIREFIGHTER: flame detected")
+            flame_was_visible = flame_detected is True
             state = line_tracker.update(calibration)
             if state["position"] is None:
                 stop()
@@ -1615,6 +1585,13 @@ def firefighter_task(
             label="FIREFIGHTER",
             accept_any_junction=True,
             line_loss_timeout=BUTTON_REVERSE_LINE_LOSS_TIMEOUT,
+        ):
+            return False
+        print("\nF: advance 0.5s along line before final R90.")
+        if not follow_for(
+            calibration, TURN_90_FORWARD_TIME,
+            speed=TURN_90_FORWARD_SPEED,
+            max_speed=TURN_90_FORWARD_MAX_SPEED,
         ):
             return False
         print("\nF: final shared R90.")
