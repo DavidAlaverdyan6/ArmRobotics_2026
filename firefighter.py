@@ -21,8 +21,8 @@ POLL_SECONDS = 0.02
 
 FIRE_X_MM = 300.0
 FIRE_Y_MM = 0.0
-FIRE_Z_MM = 50.0
-FIRE_TOOL_PITCH_DEG = -30.0
+FIRE_Z_MM = 80.0
+FIRE_TOOL_PITCH_DEG = -15.0
 
 
 def firefighting_pose():

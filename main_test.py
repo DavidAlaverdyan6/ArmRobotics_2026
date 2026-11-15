@@ -14,11 +14,11 @@ PROGRAM_BUILD = "cube-fire-2026-11-10.1"
 # Ранее проверенные скорости контроллера differential2.
 SERIAL_PORT = "/dev/serial0"
 BASE_SPEED = 180
-MAX_SPEED = 255
+MAX_SPEED = 230
 MIN_SPEED = 0
-MANEUVER_SPEED = 255
-MANEUVER_MAX_SPEED = 255
-KP = 100.0
+MANEUVER_SPEED = 230
+MANEUVER_MAX_SPEED = 230
+KP = 70.0
 KD = 10.0
 TARGET_POSITION = line_tracker.CENTER_POSITION
 LOOP_DELAY = 0.04
@@ -35,8 +35,12 @@ JUNCTION_CENTER_MIN = 0.50
 JUNCTION_CONFIRM = 1
 JUNCTION_CLEAR = 1
 POST_TURN_JUNCTION_IGNORE_SECONDS = 0.8
-POST_SLOW_JUNCTION_IGNORE_SECONDS = 0.1
-POST_STRAIGHT_JUNCTION_IGNORE_SECONDS = 0.8
+BUTTON_POST_TURN_IGNORE_SECONDS = 1.2
+BUTTON_BOUNCE_POST_TURN_IGNORE_SECONDS = 0.5
+FIREFIGHTER_POST_TURN_IGNORE_SECONDS = 0.3
+CUBE1_POST_TURN_IGNORE_SECONDS = 1
+POST_SLOW_JUNCTION_IGNORE_SECONDS = 0.3
+POST_STRAIGHT_JUNCTION_IGNORE_SECONDS = 0.5
 POST_JUNCTION_ACCEL_SECONDS = 0.5
 STRAIGHT_MAX_SPEED = 255
 STRAIGHT_ACCEL_RATE = 180.0
@@ -116,8 +120,6 @@ RETURN_FORWARD_TIME = 0.5
 BUTTON_RETURN_JUNCTION_WINDOW = 1
 BUTTON_RETURN_JUNCTION_CONFIRM = 1
 BUTTON_RETURN_JUNCTION_SLOW_SPEED = 80
-FIRE_APPROACH_SPEED = 130
-FIRE_APPROACH_MAX_SPEED = 130
 FIRE_APPROACH_TIMEOUT = 12.0
 FIRE_LINE_RECOVERY_SPEED = 80
 FIRE_LINE_RECOVERY_TIMEOUT = 5.0
@@ -195,14 +197,14 @@ ROUTE = [
     "LSLOW",
     "FIREFIGHTER",
     "L",
-    "R",
+    "RSLOW",
     "BUTTON_BOUNCE",
-    "R",
+    "RSLOW",
     "L",
-    "R",
+    "RSLOW",
     "R",
     "S",
-    "L",
+    "LSLOW",
     "L",
     "S",
     "FINISH",
@@ -589,6 +591,17 @@ def activate_arm_home(board):
     print("ARM: active in base pose (90, 170, 180, 0, 170).")
 
 
+def wait_for_reverse_adc(timeout=0.75):
+    """Stop and allow transient ADC gaps to recover before STM32 restart."""
+    stop()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if line_tracker.all_channels_fresh():
+            return True
+        time.sleep(LOOP_DELAY)
+    return line_tracker.all_channels_fresh()
+
+
 def button_return(
     calibration,
     detector,
@@ -621,8 +634,11 @@ def button_return(
             or time.monotonic() - start < max_return_time
         ):
             if not line_tracker.all_channels_fresh():
-                stop()
-                print(f"\n{label}: ADC stopped updating during reverse.")
+                print(f"\n{label}: ADC stale during reverse; waiting up to 0.75 s.")
+                if wait_for_reverse_adc():
+                    print(f"{label}: ADC resumed; continuing reverse without restart.")
+                    continue
+                print(f"{label}: ADC still stale; recovering Telemetrix.")
                 if recover_connection is None or not recover_connection(f"{label} reverse"):
                     return False
                 # STM32 reset: новая серия данных, курс и поиск перекрёстка.
@@ -876,6 +892,7 @@ def cube1_transport(calibration, detector, cube_sensor, indicator,
     junction_armed = False
     crossing_count = 0
     second_crossing_seen = False
+    second_crossing_seen_at = None
     second_crossing_cleared = False
     post_cross_clear_count = 0
     present_count = 0
@@ -929,6 +946,9 @@ def cube1_transport(calibration, detector, cube_sensor, indicator,
             crossing_count = crossing_count + 1 if at_junction else 0
             if crossing_count >= JUNCTION_CONFIRM and not second_crossing_seen:
                 second_crossing_seen = True
+                second_crossing_seen_at = now
+                if phase == "emergency":
+                    emergency_deadline = now + CUBE1_EMERGENCY_TIMEOUT
                 post_cross_clear_count = 0
                 print("\\nCUBE1: second crossing reached.")
                 if phase == "search":
@@ -951,8 +971,6 @@ def cube1_transport(calibration, detector, cube_sensor, indicator,
                     post_cross_clear_count += 1
                     if post_cross_clear_count >= JUNCTION_CLEAR:
                         second_crossing_cleared = True
-                        if phase == "emergency":
-                            emergency_deadline = now + CUBE1_EMERGENCY_TIMEOUT
                         pit_count = 0
                         pit_kind = None
                         print("\\nCUBE1: second crossing cleared; PIT detection armed.")
@@ -1000,15 +1018,36 @@ def cube1_transport(calibration, detector, cube_sensor, indicator,
                         )
                 else:
                     missing_count = 0
-            if phase == "emergency" and second_crossing_cleared:
-                black = all(value >= CUBE1_PIT_ALL_BLACK_MIN for value in values)
+            # После второго перекрёстка белая зона означает конец
+            # тренировочной линии. Чёрная зона считается ямой только
+            # спустя 0.5 с, чтобы не спутать её с перекрёстком.
+            if phase == "emergency" and second_crossing_seen:
                 white = all(value <= CUBE1_PIT_ALL_WHITE_MAX for value in values)
-                kind = "black" if black else ("white" if white else None)
+                black = (
+                    second_crossing_seen_at is not None
+                    and now - second_crossing_seen_at >= 0.5
+                    and all(value >= CUBE1_PIT_ALL_BLACK_MIN for value in values)
+                )
+                kind = "white" if white else ("black" if black else None)
                 pit_count = pit_count + 1 if kind and kind == pit_kind else (1 if kind else 0)
                 pit_kind = kind
                 if pit_count >= CUBE1_PIT_CONFIRM_FRAMES:
-                    print(f"\\nCUBE1: all 8 {kind} AFTER crossing; reversing to find line.")
+                    print(f"\nCUBE1: all 8 {kind} AFTER second crossing; reversing to find line.")
                     return "emergency"
+            if phase == "past_junction" and second_crossing_seen:
+                # Резерв для настоящей чёрной ямы, если кубик застрял
+                # на датчике: игнорируем первые 0.5 с после перекрёстка.
+                if (
+                    second_crossing_seen_at is not None
+                    and now - second_crossing_seen_at >= 0.5
+                    and all(value >= CUBE1_PIT_ALL_BLACK_MIN for value in values)
+                ):
+                    pit_count += 1
+                    if pit_count >= CUBE1_PIT_CONFIRM_FRAMES:
+                        print("\nCUBE1: all black after second crossing; fallback return.")
+                        return "drop_line_lost"
+                else:
+                    pit_count = 0
             if state.get("position") is None:
                 # Подтверждённая потеря линии после второго перекрёстка
                 # может означать успешный сброс. На время проверки останавливаемся,
@@ -1056,7 +1095,10 @@ def cube1_emergency_reverse_to_line(
     try:
         while True:
             if not line_tracker.all_channels_fresh():
-                stop()
+                print("CUBE1: ADC stale during emergency reverse; waiting up to 0.75 s.")
+                if wait_for_reverse_adc():
+                    print("CUBE1: ADC resumed without reconnect.")
+                    continue
                 if recover_connection is None or not recover_connection(
                     "emergency reverse", require_line=False
                 ):
@@ -1199,8 +1241,11 @@ def firefighter_reverse_until_line(calibration, recover_connection=None):
     try:
         while time.monotonic() < deadline:
             if not line_tracker.all_channels_fresh():
-                stop()
-                print("F: ADC stale during emergency line search; reconnecting.")
+                print("F: ADC stale during emergency reverse; waiting up to 0.75 s.")
+                if wait_for_reverse_adc():
+                    print("F: ADC resumed without reconnect.")
+                    continue
+                print("F: ADC still stale; reconnecting.")
                 if recover_connection is None or not recover_connection("reverse line"):
                     return False
                 deadline = time.monotonic() + FIRE_LINE_RECOVERY_TIMEOUT
@@ -1341,8 +1386,13 @@ def firefighter_task(
                 if indicator is not None:
                     indicator.green()
                 if camera_stream is not None:
-                    camera_stream.save_latest_task_frame("FIREFIGHTER: flame detected")
+                    try:
+                        camera_stream.save_latest_task_frame("FIREFIGHTER: flame detected")
+                    except Exception as exc:
+                        print(f"F: camera snapshot failed ({exc}); spray continues.")
+                print("F: calling Firefighter.spray() now.")
                 fire.spray()
+                print("F: Firefighter.spray() returned.")
                 try:
                     fire.wait_for_sample(after=time.monotonic())
                     if fire.detected() is True:
@@ -1358,14 +1408,14 @@ def firefighter_task(
                     time.sleep(LOOP_DELAY)
                     continue
                 line_end_fallback = True
-                print("\nF: no flame found at end of line; RED indicator, water ON.")
+                print("\nF: no flame found at end of line; RED indicator, pump OFF.")
                 if indicator is not None:
                     indicator.red()
                 if camera_stream is not None:
-                    camera_stream.save_latest_task_frame(
-                        "FIREFIGHTER: fallback spray at line end"
-                    )
-                fire.spray()
+                    try:
+                        camera_stream.save_latest_task_frame("FIREFIGHTER: no flame at line end")
+                    except Exception as exc:
+                        print(f"F: camera snapshot failed ({exc}); continuing return.")
                 if not firefighter_reverse_until_line(
                     calibration,
                     recover_connection=lambda stage: reconnect_fire(
@@ -1375,16 +1425,13 @@ def firefighter_task(
                     return False
                 break
             line_end_count = 0
-            differential_drive(
-                state, speed=FIRE_APPROACH_SPEED,
-                max_speed=FIRE_APPROACH_MAX_SPEED,
-            )
+            differential_drive(state)
             time.sleep(LOOP_DELAY)
         else:
             print("\nF: flame approach timeout; stopped.")
             return False
         if line_end_fallback:
-            print("\nF: fallback spray complete; returning along the line.")
+            print("\nF: no-flame fallback complete; returning along the line.")
         stop()
         _return_home(arm, START_ANGLES, AUTO_MAX_STEP_DEG, STEP_DELAY)
         if not button_return(
@@ -1544,7 +1591,7 @@ def button_bounce_prepare_arm(board):
     arm.write(gripper=180)
     arm.write(base=180)
     time.sleep(0.3)
-    arm.write(shoulder=130)
+    arm.write(shoulder=140)
     time.sleep(0.3)
     return arm
 
@@ -2080,10 +2127,16 @@ def main():
                 straight_speed["previous_error"] = None
                 straight_speed["previous_time"] = None
                 straight_speed["straight_since"] = None
+                task_post_turn_ignore = {
+                    "BUTTON": BUTTON_POST_TURN_IGNORE_SECONDS,
+                    "BUTTON_BOUNCE": BUTTON_BOUNCE_POST_TURN_IGNORE_SECONDS,
+                    "FIREFIGHTER": FIREFIGHTER_POST_TURN_IGNORE_SECONDS,
+                    "CUBE1": CUBE1_POST_TURN_IGNORE_SECONDS,
+                }
                 ignore_seconds = (
                     POST_STRAIGHT_JUNCTION_IGNORE_SECONDS if cmd == "S"
                     else POST_SLOW_JUNCTION_IGNORE_SECONDS if slow_until_next_junction
-                    else POST_TURN_JUNCTION_IGNORE_SECONDS
+                    else task_post_turn_ignore.get(cmd, POST_TURN_JUNCTION_IGNORE_SECONDS)
                 )
                 junction_diag_started = time.monotonic()
                 junction_ignore_until = junction_diag_started + ignore_seconds
