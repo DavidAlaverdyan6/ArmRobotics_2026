@@ -2,8 +2,6 @@
 """Основной маршрут ArmRobotics: навигация и задания робота."""
 import math
 import time
-from simple_pid import PID
-from navigation_core import FreshFrames
 import smbus
 from telemetrix import telemetrix
 import line_tracker
@@ -15,22 +13,18 @@ PROGRAM_BUILD = "cube-fire-2026-11-10.1"
 
 # Ранее проверенные скорости контроллера differential2.
 SERIAL_PORT = "/dev/serial0"
-BASE_SPEED = 190
+BASE_SPEED = 180
 MAX_SPEED = 255
 MIN_SPEED = 0
-MANEUVER_SPEED = 190
+MANEUVER_SPEED = 255
 MANEUVER_MAX_SPEED = 255
 KP = 100.0
-KI = 0.0  # Существующий LineTrackingEngine использует PD; интегральный член равен нулю.
-KD = 5.0
-MAX_CORRECTION = 255  # Реальное ограничение выхода simple_pid.PID.
+KD = 10.0
 TARGET_POSITION = line_tracker.CENTER_POSITION
 LOOP_DELAY = 0.04
 # Восстановление пропущенного перекрёстка.
 
 # Пороги интенсивности линии для позиционирования возле кнопки.
-START_CENTER_BLACK_MIN = 0.30
-START_OUTER_BLACK_MAX = 0.70
 
 # Распознавание перекрёстков отдельно от управления линией.
 BLACK_ON = 0.85
@@ -38,12 +32,11 @@ BLACK_OFF = 0.65
 JUNCTION_SIDE_SUPPORT_ON = 0.55
 JUNCTION_SIDE_SUPPORT_OFF = 0.35
 JUNCTION_CENTER_MIN = 0.50
-JUNCTION_CONFIRM = 2
-JUNCTION_CLEAR = 3
-RETURN_JUNCTION_CLEAR = 1
-JUNCTION_REARM_CLEAR_FRAMES = 3
-POST_TURN_JUNCTION_IGNORE_SECONDS = 1.5
-POST_SLOW_JUNCTION_IGNORE_SECONDS = 0.2
+JUNCTION_CONFIRM = 1
+JUNCTION_CLEAR = 1
+POST_TURN_JUNCTION_IGNORE_SECONDS = 0.8
+POST_SLOW_JUNCTION_IGNORE_SECONDS = 0.1
+POST_STRAIGHT_JUNCTION_IGNORE_SECONDS = 0.8
 POST_JUNCTION_ACCEL_SECONDS = 0.5
 STRAIGHT_MAX_SPEED = 255
 STRAIGHT_ACCEL_RATE = 180.0
@@ -64,38 +57,33 @@ GYRO_DIRECTION_SETTLE_SECONDS = 0.03
 GYRO_DIRECTION_MIN_RATE = 8.0
 GYRO_DIRECTION_CONFIRM_SAMPLES = 3
 GYRO_REVERSE_CONFIRM_SECONDS = 0.05
-PIVOT_SETTLE_SECONDS = 0.1
+PIVOT_SETTLE_SECONDS = 0.0
 TURN_ANGLE = 75.0
-TURN_90_ANGLE = 90.0
+TURN_90_ANGLE = 85.0
 TURN_PWM_FAST = 255
 TURN_PWM_SLOW = 90
 
-# Настройки предварительного выравнивания из main_old: PWM и проезд 0,5 с.
+# Исторические настройки прежнего проезда перед 90-градусными поворотами.
 
 # Эти параметры независимы от BASE_SPEED и MANEUVER_SPEED.
 TURN_90_FORWARD_SPEED = 80
-TURN_90_FORWARD_MAX_SPEED = 120
+TURN_90_FORWARD_MAX_SPEED = 80
 TURN_90_FORWARD_TIME = 0.5
 SLOW_90_PWM_FAST = 110
-SLOW_90_REVERSE_SECONDS = 0.15
-SLOW_90_REVERSE_SPEED = 80
-TURN_TOLERANCE_DEG = 8.0
+TURN_TOLERANCE_DEG = 20
 TURN_CORRECTION_START_DEG = 4.0
-BUTTON_BUMPER_START_CM = 20.0
-BUTTON_BUMPER_START_TOLERANCE_CM = 1.0
-BUTTON_BUMPER_RAM_SECONDS = 1.0
-BUTTON_BUMPER_APPROACH_TIMEOUT = 18.0
-BUTTON_BUMPER_SPEED = 255
-BUTTON_BUMPER_STATUS_SECONDS = 0.25
 
 # Зарядка: красный мигает 9 с, затем зелёный горит 2 с; всего 11 с перед R.
-CHARGE_SECONDS = 11.0
+CHARGE_SECONDS = 10.0
 CHARGE_RED_SECONDS = 9.0
-CHARGE_BLINK_HALF_PERIOD = 0.5
+CHARGE_BLINK_HALF_PERIOD = 0.25
 
 # Геометрия следования по линии задним ходом (размеры в миллиметрах).
 
 # Линейный датчик находится на 70 мм впереди колёсной оси, поэтому при
+
+
+
 
 # движении назад он становится задним и требует другого регулятора.
 RETURN_SPEED = 130
@@ -103,7 +91,6 @@ RETURN_SLOW_SPEED = 115
 REVERSE_MIN_PWM = 80
 REVERSE_MAX_PWM = 150
 REVERSE_TRACKER_OFFSET_MM = 70.0
-REVERSE_WHEELBASE_MM = 226.0
 REVERSE_SENSOR_SPAN_MM = 60.0
 REVERSE_POSITION_MM_PER_UNIT = REVERSE_SENSOR_SPAN_MM / 7.0
 
@@ -116,30 +103,27 @@ REVERSE_REFERENCE_FOLLOW = 2.5    # 1/с: скорость подстройки 
 REVERSE_REFERENCE_WINDOW_MM = 7.0
 REVERSE_MAX_BRAKE_PWM = 70
 REVERSE_PWM_SLEW_PER_LOOP = 7
-REVERSE_LINE_LOSS_TIMEOUT = 0.8
-BUTTON_REVERSE_LINE_LOSS_TIMEOUT = 5.0
+REVERSE_LINE_LOSS_TIMEOUT = 0.5 #?
+BUTTON_REVERSE_LINE_LOSS_TIMEOUT = 0.5 #?
 REVERSE_GYRO_SPEED = 90
 
 # Установить -1 только если тест подтвердит обратное подключение
 
 # левой и правой сторон моторов.
 REVERSE_STEER_SIGN = 1
-RETURN_MAX_TIME = 24.0
+RETURN_MAX_TIME = 15
 RETURN_FORWARD_TIME = 0.5
-BUTTON_RETURN_JUNCTION_WINDOW = 0.40
-BUTTON_RETURN_JUNCTION_CONFIRM = 2
-BUTTON_RETURN_JUNCTION_SLOW_SPEED = 100
-CUBE_LOST_FINAL_RIGHT_ANGLE = 80.0
-FIRE_APPROACH_SPEED = 255
-FIRE_APPROACH_MAX_SPEED = 255
+BUTTON_RETURN_JUNCTION_WINDOW = 1
+BUTTON_RETURN_JUNCTION_CONFIRM = 1
+BUTTON_RETURN_JUNCTION_SLOW_SPEED = 80
+FIRE_APPROACH_SPEED = 130
+FIRE_APPROACH_MAX_SPEED = 130
 FIRE_APPROACH_TIMEOUT = 12.0
-FIRE_FINAL_ADVANCE_SECONDS = 0.3
 FIRE_LINE_RECOVERY_SPEED = 80
 FIRE_LINE_RECOVERY_TIMEOUT = 5.0
-FIRE_LINE_RECOVERY_CONFIRM = 2
+FIRE_LINE_RECOVERY_CONFIRM = 1
 FIRE_LINE_BLACKNESS_MIN = 0.80
-FIRE_LINE_END_CONFIRM = 3
-FIRE_RETURN_MAX_TIME = 40.0
+FIRE_LINE_END_CONFIRM = 1
 
 # CUBE1: рука сохраняет указанную позицию XYZ с открытым захватом.
 CUBE1_STAGE_X_MM = 250.0
@@ -147,54 +131,56 @@ CUBE1_STAGE_Y_MM = 0.0
 CUBE1_STAGE_Z_MM = 100.0
 CUBE1_X_MM = 200.0
 CUBE1_Y_MM = 0.0
-CUBE1_Z_MM = -180.0
-CUBE1_TOOL_PITCH_DEG = -90.0
+CUBE1_Z_MM = -170.0
+CUBE1_TOOL_PITCH_DEG = -80.0
 CUBE1_PIT_ALL_BLACK_MIN = 0.85
-CUBE1_PIT_ALL_WHITE_MAX = 0.15  # Все восемь датчиков видят белое.
-CUBE1_PIT_CONFIRM_FRAMES = 4
-CUBE1_EMERGENCY_TIMEOUT = 8.0
+CUBE1_PIT_ALL_WHITE_MAX = 0.25  # Все восемь датчиков видят белое.
+CUBE1_PIT_CONFIRM_FRAMES = 1
+CUBE1_EMERGENCY_TIMEOUT = 15
 CUBE1_BLINK_HALF_PERIOD = 0.25
-CUBE1_DROP_CONFIRM_FRAMES = 3
-CUBE1_DROP_TIMEOUT = 20.0
-CUBE1_APPROACH_SPEED = 255
-CUBE1_APPROACH_MAX_SPEED = 255
-CUBE1_SENSOR_CONFIRM = 3
-CUBE1_LINE_LOSS_CONFIRM = 5
-CUBE1_EMERGENCY_REVERSE_CONFIRM = 3
+CUBE1_DROP_CONFIRM_FRAMES = 1
+CUBE1_DROP_TIMEOUT = 10.0
+CUBE1_SENSOR_CONFIRM = 1
+CUBE1_LINE_LOSS_CONFIRM = 2
+CUBE1_EMERGENCY_REVERSE_CONFIRM = 2
 CUBE1_EMERGENCY_REVERSE_SPEED = 80
-# После возврата CUBE1 на исходный перекрёсток выполнить проезд перед R90.
+# Исторические настройки прежнего проезда CUBE1; новый поворот их не использует.
 CUBE1_RETURN_FORWARD_SECONDS = 0.5
 CUBE1_RETURN_FORWARD_PWM = 80
 
 # COLOR: остановиться, найти цветной маркер и включить соответствующий RGB.
-COLOR_MARKER_TIMEOUT = 10.0
-COLOR_MARKER_HOLD_SECONDS = 1.0
+COLOR_MARKER_TIMEOUT = 5.0
+COLOR_MARKER_HOLD_SECONDS = 0
 COLOR_MARKER_MIN_AREA = 700
-COLOR_MARKER_STABLE_FRAMES = 3
+COLOR_MARKER_STABLE_FRAMES = 2
 COLOR_ARM_ANGLES = {
     "base": 90.0,
     "shoulder": 160.0,
     "elbow": 180.0,
     "wrist": 0.0,
-    "gripper": 0.0,
+    "gripper": 180.0,
 }
 COLOR_LED_HOLD = None
-# BUTTON_BOUNCE: обычный PD; меняется только базовый PWM.
+# BUTTON_BOUNCE: отдельные настройки PD только во время поиска цвета.
 BUTTON_BOUNCE_DRIVE_PWM = 80
-BUTTON_BOUNCE_MIN_OBJECT_AREA = 140
-BUTTON_BOUNCE_CONFIRM_FRAMES = 3
+BUTTON_BOUNCE_MAX_PWM = 150
+BUTTON_BOUNCE_KP = 45.0
+BUTTON_BOUNCE_KD = 3.0
+BUTTON_BOUNCE_MIN_OBJECT_AREA = 300
+BUTTON_BOUNCE_CONFIRM_FRAMES = 1
 BUTTON_BOUNCE_TARGET_X = (0.35, 0.65)
 BUTTON_BOUNCE_TARGET_Y = (0.65, 0.90)
 BUTTON_BOUNCE_PRESS = (0.0, 250.0, -20.0)
-BUTTON_BOUNCE_REVERSE_LINE_TIMEOUT = 5.0
+BUTTON_BOUNCE_REVERSE_LINE_TIMEOUT = 0.5 #?
 
 # Автоматический маршрут: по одной команде на каждый найденный перекрёсток.
 
-# L/R/S и L90/R90 задают движение; именованные команды запускают задания.
+# L/R/LSLOW/RSLOW/S/SLOW задают движение; именованные команды запускают задания.
 
-# CHARGING, FIREFIGHTER, CUBE1 и COLOR — задания; Q завершает маршрут.
+# CHARGING, FIREFIGHTER, CUBE1 и COLOR — задания; FINISH завершает маршрут.
 
 ROUTE = [
+    "START",
     "BUTTON",
     "L",
     "CUBE1",
@@ -203,15 +189,15 @@ ROUTE = [
     "R",
     "CHARGING",
     "COLOR",
-    "L90",
+    "L",
     "R",
     "R",
-    "L90",
+    "LSLOW",
     "FIREFIGHTER",
     "L",
-    "R90",
+    "R",
     "BUTTON_BOUNCE",
-    "R90",
+    "R",
     "L",
     "R",
     "R",
@@ -219,77 +205,83 @@ ROUTE = [
     "L",
     "L",
     "S",
-    "Q",
+    "FINISH",
+
 
 ]
 ALLOWED_ROUTE_COMMANDS = {
-    "L", "R", "L90", "R90", "L90SLOW", "R90SLOW", "S", "SLOW",
-    "BUTTON", "BUTTON_BOUNCE", "CHARGING", "FIREFIGHTER", "CUBE1", "COLOR", "Q",
+    "L", "R", "LSLOW", "RSLOW", "S", "SLOW",
+    "BUTTON", "BUTTON_BOUNCE", "CHARGING", "FIREFIGHTER", "CUBE1", "COLOR", "START", "FINISH",
 }
-# Старый LineTrackingEngine оставлен исключительно для резервных режимов заднего хода.
-reverse_follower = line_tracker.LineTrackingEngine(
-    base_speed=BASE_SPEED, max_speed=MAX_SPEED, min_speed=MIN_SPEED,
-    kp=KP, kd=KD, target_position=TARGET_POSITION,
+line_follower = line_tracker.LineTrackingEngine(
+    base_speed=BASE_SPEED,
+    max_speed=MAX_SPEED,
+    min_speed=MIN_SPEED,
+    kp=KP,
+    kd=KD,
+    target_position=TARGET_POSITION,
 )
-
-
-class Differential2Forward:
-    """Тот же simple_pid + FreshFrames + PWM, что в differential2.py."""
-
-    def __init__(self):
-        self.pid = PID(
-            KP, KI, KD, setpoint=TARGET_POSITION,
-            sample_time=None,
-            output_limits=(-MAX_CORRECTION, MAX_CORRECTION),
-            differential_on_measurement=True,
-        )
-        self.freshness = FreshFrames()
-
-    def reset_steering(self):
-        self.pid.reset()
-        self.freshness = FreshFrames()
-
-    def stop(self):
-        self.reset_steering()
-        motors.motor_stop()
-
-    def drive(self, state, speed=BASE_SPEED, max_speed=MAX_SPEED):
-        if state is None or state.get("position") is None:
-            self.stop()
-            return False
-        if not self.freshness.accept(state, time.monotonic()):
-            return True  # Как в differential2.py: не вычислять PID на повторном кадре.
-        correction = -self.pid(state["position"])
-        left = round(max(MIN_SPEED, min(max_speed, speed + correction)))
-        right = round(max(MIN_SPEED, min(max_speed, speed - correction)))
-        motors.set_speeds(left, right)
-        return True
-
-    def drive_straight(self, speed=BASE_SPEED, max_speed=MAX_SPEED):
-        self.reset_steering()
-        pwm = round(max(MIN_SPEED, min(max_speed, speed)))
-        motors.set_speeds(pwm, pwm)
-        return True
-
-    def reverse(self, state, speed):
-        return reverse_follower.reverse(state, speed)
-
-    def reverse_straight(self, speed):
-        return reverse_follower.reverse_straight(speed)
-
-
-line_follower = Differential2Forward()
 
 
 def stop():
     line_follower.stop()
-    reverse_follower.reset_steering()
 
 
 def differential_drive(state, speed=BASE_SPEED, max_speed=MAX_SPEED):
-    """Точная схема управления колёсами из differential2.py."""
+    """Совместимый интерфейс для отдельного контроллера следования по линии."""
     return line_follower.drive(state, speed=speed, max_speed=max_speed)
 
+
+def post_junction_drive_limits(elapsed):
+    """Плавно увеличивает базовый PWM и максимальный PWM колёс после манёвра."""
+    fraction = max(0.0, min(1.0, elapsed / POST_JUNCTION_ACCEL_SECONDS))
+    start_speed = min(MANEUVER_SPEED, BASE_SPEED)
+    start_max = min(MANEUVER_MAX_SPEED, MAX_SPEED)
+    speed = start_speed + (BASE_SPEED - start_speed) * fraction
+    max_speed = start_max + (MAX_SPEED - start_max) * fraction
+    return speed, max_speed
+
+
+def update_straight_speed(state, left, right, candidate, controller, now):
+    """Ускоряет робот только на устойчивой прямой без ответвлений."""
+    position = state.get("position") if state else None
+    previous_time = controller["previous_time"]
+    dt = 0.0 if previous_time is None else max(0.0, now - previous_time)
+    controller["previous_time"] = now
+    if position is None:
+        controller["current_speed"] = BASE_SPEED
+        controller["previous_error"] = None
+        controller["straight_since"] = None
+        return BASE_SPEED, MAX_SPEED
+    error = position - TARGET_POSITION
+    previous_error = controller["previous_error"]
+    derivative = 0.0
+    if previous_error is not None and dt > 0.0:
+        derivative = (error - previous_error) / dt
+    controller["previous_error"] = error
+    stable = (
+        not left and not right and not candidate
+        and abs(error) <= STRAIGHT_POSITION_TOLERANCE
+        and abs(derivative) <= STRAIGHT_DERROR_LIMIT
+    )
+    if stable:
+        if controller["straight_since"] is None:
+            controller["straight_since"] = now
+        if now - controller["straight_since"] >= STRAIGHT_CONFIRM_SECONDS:
+            controller["current_speed"] = min(
+                STRAIGHT_MAX_SPEED,
+                controller["current_speed"] + STRAIGHT_ACCEL_RATE * dt,
+            )
+    else:
+        controller["straight_since"] = None
+        controller["current_speed"] = max(
+            BASE_SPEED,
+            controller["current_speed"] - STRAIGHT_DECEL_RATE * dt,
+        )
+    return controller["current_speed"], min(
+        STRAIGHT_MAX_SPEED,
+        max(MANEUVER_MAX_SPEED, controller["current_speed"]),
+    )
 
 
 def differential_reverse(state, speed, controller=None):
@@ -340,29 +332,6 @@ class JunctionDetector:
             and side_pattern
         )
         return self.left_black, self.right_black, candidate
-
-
-class JunctionRearmGate:
-    """Разрешает новый перекрёсток после выхода датчиков со старого."""
-
-    def __init__(self):
-        self.armed = True
-        self.clear_count = 0
-
-    def mark_junction(self):
-        self.armed = False
-        self.clear_count = 0
-
-    def update(self, left, right, position):
-        if self.armed:
-            return
-        if left or right:
-            self.clear_count = 0
-            return
-        self.clear_count += 1
-        if self.clear_count >= JUNCTION_REARM_CLEAR_FRAMES:
-            self.armed = True
-            self.clear_count = 0
 
 
 def gyro_raw(bus):
@@ -541,7 +510,7 @@ class ReverseLineController:
 
 
 def pivot(bus, offset, direction, angle_target=TURN_ANGLE):
-    """Исходный поворот L/R, также применяемый в заданиях B/C/F."""
+    """Проверенный поворот L/R для маршрута и всех заданий."""
     if direction not in ("L", "R"):
         raise ValueError("Turn direction must be L or R")
     left = direction == "L"
@@ -579,116 +548,9 @@ def pivot(bus, offset, direction, angle_target=TURN_ANGLE):
         time.sleep(PIVOT_SETTLE_SECONDS)
 
 
-def pivot_90(bus, offset, direction, angle_target=TURN_90_ANGLE, *, slow=False):
-    """Поворот с проверенным алгоритмом коррекции до 90 градусов."""
-    if direction not in ("L", "R"):
-        raise ValueError("Turn direction must be L or R")
-    stop()
-    left = direction == "L"
-    start = previous = time.monotonic()
-    angle = signed = 0.0
-    gyro_sign = None
-    candidate_sign = None
-    direction_samples = 0
-    reverse_since = None
-    last_rate = 0.0
-    lead = 5.6425 if left else 6.125
-    try:
-        while True:
-            now = time.monotonic()
-            rate = gyro_rate(bus, offset)
-            dt = max(0.0, min(now - previous, 0.1))
-            previous = now
-            if not math.isfinite(rate) or abs(rate) > 1000:
-                raise RuntimeError("GYRO_TURN: invalid angular rate")
 
-            # Игнорируем измерения до начала движения и во время инерции.
-
-            # Определяем полярность только после устойчивой реакции моторов.
-            if gyro_sign is None:
-                if (now - start >= GYRO_DIRECTION_SETTLE_SECONDS
-                        and abs(rate) >= GYRO_DIRECTION_MIN_RATE):
-                    observed_sign = 1 if rate > 0 else -1
-                    direction_samples = (
-                        direction_samples + 1
-                        if observed_sign == candidate_sign else 1
-                    )
-                    candidate_sign = observed_sign
-                    if direction_samples >= GYRO_DIRECTION_CONFIRM_SAMPLES:
-                        gyro_sign = candidate_sign
-                else:
-                    direction_samples = 0
-                    candidate_sign = None
-            if gyro_sign is not None:
-                directed = rate * gyro_sign
-                if directed < -GYRO_DIRECTION_MIN_RATE:
-                    if reverse_since is None:
-                        reverse_since = now
-                    elif now - reverse_since >= GYRO_REVERSE_CONFIRM_SECONDS:
-                        raise RuntimeError("GYRO_TURN: gyro direction reversed")
-                else:
-                    reverse_since = None
-                angle = max(0.0, angle + directed * dt)
-                signed += rate * dt
-            last_rate = abs(rate)
-            stop_angle = angle_target - max(
-                lead, min(12.0, last_rate * 0.04)
-            )
-            if angle >= stop_angle:
-                break
-            if now - start >= GYRO_TIMEOUT or (now - start > 0.7 and angle < 2):
-                print(f"\nGYRO_TURN timeout/no motion at {angle:.1f} degrees")
-                return False, None
-            pwm = (SLOW_90_PWM_FAST if slow else
-                   (TURN_PWM_SLOW if angle >= angle_target - 25 else TURN_PWM_FAST))
-            motors.set_speeds(-pwm if left else pwm, pwm if left else -pwm)
-            time.sleep(0.005)
-        stop()
-        settle_until = time.monotonic() + 0.05
-        while time.monotonic() < settle_until:
-            now = time.monotonic()
-            signed += gyro_rate(bus, offset) * max(
-                0.0, min(now - previous, 0.1)
-            )
-            previous = now
-            time.sleep(0.005)
-        final_angle = abs(signed)
-        if (angle_target >= 45
-                and TURN_CORRECTION_START_DEG < angle_target - final_angle <= 20):
-            correction_deadline = time.monotonic() + 0.2
-            while time.monotonic() < correction_deadline:
-                now = time.monotonic()
-                signed += gyro_rate(bus, offset) * max(
-                    0.0, min(now - previous, 0.1)
-                )
-                previous = now
-                if abs(signed) >= angle_target - lead:
-                    break
-                correction_pwm = 70 if not slow else min(70, SLOW_90_PWM_FAST)
-                motors.set_speeds(
-                    -correction_pwm if left else correction_pwm,
-                    correction_pwm if left else -correction_pwm,
-                )
-                time.sleep(0.005)
-            stop()
-            final_angle = abs(signed)
-        tolerance = min(TURN_TOLERANCE_DEG, angle_target * 0.2)
-        print(
-            f"\nGYRO_TURN {direction}: target={angle_target:.1f}, "
-            f"gyro={final_angle:.1f}, error={final_angle-angle_target:+.1f}"
-        )
-        left_sign = None
-        if abs(signed) > 5:
-            observed_sign = 1 if signed > 0 else -1
-            left_sign = observed_sign if left else -observed_sign
-        return abs(final_angle - angle_target) <= tolerance, left_sign
-    finally:
-        stop()
-        time.sleep(0.02)
-
-
-def follow_for(calibration, seconds, *, speed=BASE_SPEED,
-               max_speed=MAX_SPEED, recover_connection=None):
+def follow_for(calibration, seconds, *, speed=MANEUVER_SPEED,
+               max_speed=MANEUVER_MAX_SPEED, recover_connection=None):
     """Движение вперёд заданное время с сохранением регулятора differential2."""
     deadline = time.monotonic() + seconds
     try:
@@ -725,81 +587,6 @@ def activate_arm_home(board):
     arm, _ = get_shared_arm(board)
     arm.write(**START_ANGLES)
     print("ARM: active in base pose (90, 170, 180, 0, 170).")
-
-
-def button_bumper_approach(calibration, sensor):
-    """Нажимает кнопку бампером корпуса без движения руки (устаревший вариант)."""
-    deadline = time.monotonic() + BUTTON_BUMPER_APPROACH_TIMEOUT
-    ram_started = False
-    ram_deadline = None
-    last_status = 0.0
-    try:
-        while time.monotonic() < deadline:
-            distance_cm = sensor.read_distance_mm() / 10.0
-            if not math.isfinite(distance_cm):
-                print("\nBUTTON: invalid distance reading; stopping.")
-                return False
-            state = line_tracker.update(calibration)
-            if not ram_started:
-
-                # Полный таран начинается с расстояния 20 ± 1 см (старый вариант).
-                if distance_cm <= (
-                    BUTTON_BUMPER_START_CM + BUTTON_BUMPER_START_TOLERANCE_CM
-                ):
-                    ram_started = True
-                    ram_deadline = (
-                        time.monotonic() + BUTTON_BUMPER_RAM_SECONDS
-                    )
-                    print(
-                        f"\nBUTTON: {distance_cm:.1f} cm; "
-                        f"starting {BUTTON_BUMPER_RAM_SECONDS:g}-second "
-                        "full-speed bumper press."
-                    )
-                elif state["position"] is None:
-                    stop()
-                    time.sleep(LOOP_DELAY)
-                    continue
-                else:
-                    differential_drive(
-                        state,
-                        speed=BASE_SPEED,
-                        max_speed=MAX_SPEED,
-                    )
-                    time.sleep(LOOP_DELAY)
-                    continue
-            if time.monotonic() >= ram_deadline:
-                stop()
-                print(
-                    f"\nBUTTON: bumper run complete; final distance "
-                    f"{distance_cm:.1f} cm. Returning to junction."
-                )
-                return True
-            now = time.monotonic()
-            if now - last_status >= BUTTON_BUMPER_STATUS_SECONDS:
-                print(
-                    f"\rBUTTON RAM distance={distance_cm:.1f} cm",
-                    end="",
-                    flush=True,
-                )
-                last_status = now
-            if state["position"] is None:
-
-                # Во время ограниченного тарана можно продолжать прямо при потере линии.
-                line_follower.drive_straight(
-                    speed=BASE_SPEED,
-                    max_speed=MAX_SPEED,
-                )
-            else:
-                differential_drive(
-                    state,
-                    speed=BASE_SPEED,
-                    max_speed=MAX_SPEED,
-                )
-            time.sleep(LOOP_DELAY)
-        print("\nBUTTON: bumper approach timeout.")
-        return False
-    finally:
-        stop()
 
 
 def button_return(
@@ -860,7 +647,7 @@ def button_return(
                 outer_confirm_count = (
                     outer_confirm_count + 1
                     if (
-                        cleared_count >= RETURN_JUNCTION_CLEAR
+                        cleared_count >= JUNCTION_CLEAR
                         and (candidate or left or right)
                     )
                     else 0
@@ -871,7 +658,7 @@ def button_return(
             elif accept_s8_only:
                 outer_confirm_count = (
                     outer_confirm_count + 1
-                    if cleared_count >= RETURN_JUNCTION_CLEAR and right
+                    if cleared_count >= JUNCTION_CLEAR and right
                     else 0
                 )
                 if outer_confirm_count >= JUNCTION_CONFIRM:
@@ -883,11 +670,10 @@ def button_return(
 
             # BUTTON: запоминаем срабатывания краёв в коротком окне.
             # Не требуем одновременной чёрной линии на S1 и S8.
-            elif label in ("BUTTON", "BUTTON_BOUNCE", "FIREFIGHTER"):
-                if cleared_count >= RETURN_JUNCTION_CLEAR:
+            elif label == "BUTTON":
+                if cleared_count >= JUNCTION_CLEAR:
                     if button_first_edge_at is not None and (
                         now - button_first_edge_at > BUTTON_RETURN_JUNCTION_WINDOW
-                        or (not left and not right)
                     ):
                         button_first_edge_at = None
                         button_seen_left = button_seen_right = False
@@ -909,7 +695,7 @@ def button_return(
                     button_seen_left = button_seen_right = False
                     button_confirm = 0
             # Остальные задания сохраняют исходное правило обоих краёв.
-            elif cleared_count >= RETURN_JUNCTION_CLEAR and left and right:
+            elif cleared_count >= JUNCTION_CLEAR and left and right:
                 print(f"\n{label}: return junction found (both outer sensors).")
                 return True
 
@@ -917,7 +703,7 @@ def button_return(
 
             # Не используем его для распознавания перекрёстка и выбора скорости.
             candidate_visible = right if accept_s8_only else left != right
-            if label in ("BUTTON", "BUTTON_BOUNCE", "FIREFIGHTER") and button_first_edge_at is not None:
+            if label == "BUTTON" and button_first_edge_at is not None:
                 candidate_visible = True
             if candidate_visible:
                 if candidate_since is None:
@@ -925,7 +711,7 @@ def button_return(
             elif accept_s8_only or (not left and not right):
                 candidate_since = None
             speed = RETURN_SLOW_SPEED if candidate_since is not None else RETURN_SPEED
-            if label in ("BUTTON", "BUTTON_BOUNCE", "FIREFIGHTER") and button_first_edge_at is not None:
+            if label == "BUTTON" and button_first_edge_at is not None:
                 speed = BUTTON_RETURN_JUNCTION_SLOW_SPEED
             if not differential_reverse(state, speed, reverse_controller):
                 print(f"\n{label}: line lost too long while reversing.")
@@ -961,12 +747,8 @@ def button_task(
         recover_connection=recover_connection,
     ):
         return False
-    if not follow_for(
-        calibration, RETURN_FORWARD_TIME, recover_connection=recover_connection
-    ):
-        return False
-    print("\nBUTTON: final R90.")
-    ok, _ = pivot_90(bus, offset, "R", angle_target=TURN_90_ANGLE)
+    print("\nBUTTON: final ordinary R, without forward approach.")
+    ok, _ = pivot(bus, offset, "R")
     return ok
 
 
@@ -1249,8 +1031,8 @@ def cube1_transport(calibration, detector, cube_sensor, indicator,
                     print("\\nCUBE1: line lost before drop; STOP.")
                     return None
                 line_follower.drive_straight(
-                    speed=BASE_SPEED,
-                    max_speed=MAX_SPEED,
+                    speed=MANEUVER_SPEED,
+                    max_speed=MANEUVER_MAX_SPEED,
                 )
             else:
                 line_loss_count = 0
@@ -1295,24 +1077,6 @@ def cube1_emergency_reverse_to_line(
         stop()
 
 
-def cube1_final_turn_approach():
-    """После возвращения к перекрёстку едет 0,5 с на PWM 80 перед R90.
-    Во время этого короткого откалиброванного проезда поиск края линии и PD не используются."""
-    if not line_tracker.all_channels_fresh():
-        print("\nCUBE1: ADC stale before final forward pulse; stopping.")
-        stop()
-        return False
-    try:
-        print(
-            f"\nCUBE1: return junction found; forward "
-            f"{CUBE1_RETURN_FORWARD_SECONDS:.3f}s PWM {CUBE1_RETURN_FORWARD_PWM}."
-        )
-        motors.set_speeds(CUBE1_RETURN_FORWARD_PWM, CUBE1_RETURN_FORWARD_PWM)
-        time.sleep(CUBE1_RETURN_FORWARD_SECONDS)
-        return True
-    finally:
-        stop()
-
 
 def cube1_task(
     calibration, detector, bus, offset, board, board_state=None,
@@ -1346,18 +1110,8 @@ def cube1_task(
             return None
 
     try:
-        print("\nCUBE1: execute R90.")
-        if not follow_for(
-            calibration,
-            TURN_90_FORWARD_TIME,
-            speed=TURN_90_FORWARD_SPEED,
-            max_speed=TURN_90_FORWARD_MAX_SPEED,
-            recover_connection=recover_cube,
-        ):
-            return False
-        ok, left_sign = pivot_90(
-            bus, offset, "R", angle_target=TURN_90_ANGLE
-        )
+        print("\nCUBE1: execute ordinary R without forward approach.")
+        ok, left_sign = pivot(bus, offset, "R")
         if not ok or left_sign is None:
             print("CUBE1: initial turn/gyro check failed.")
             return False
@@ -1421,14 +1175,10 @@ def cube1_task(
         ):
             return False
         if not line_tracker.all_channels_fresh():
-            if recover_cube("before final R90") is None:
+            if recover_cube("before final R") is None:
                 return False
-        if not cube1_final_turn_approach():
-            return False
-        print("\nCUBE1: final R90 using main_test.py's existing pivot.")
-        ok, _ = pivot_90(
-            bus, offset, "R", angle_target=TURN_90_ANGLE
-        )
+        print("\nCUBE1: final ordinary R without forward approach.")
+        ok, _ = pivot(bus, offset, "R")
         return ok
     finally:
         stop()
@@ -1544,21 +1294,12 @@ def firefighter_task(
             indicator = create_robot_rgb_indicator()
         except Exception as exc:
             print(f"F: RGB unavailable ({exc}); continuing without indication.")
-        # Перед входным поворотом сохраняем проверенный проезд 0,5 с.
-        print("\nF: advance 0.5s along line before initial L90.")
-        if not follow_for(
-            calibration, TURN_90_FORWARD_TIME,
-            speed=TURN_90_FORWARD_SPEED,
-            max_speed=TURN_90_FORWARD_MAX_SPEED,
-            recover_connection=lambda stage: reconnect_fire(stage),
-        ):
-            return False
-        print("\nF: initial shared L90.")
-        ok, left_sign = pivot_90(bus, offset, "L", angle_target=TURN_90_ANGLE)
+        print("\nF: initial ordinary L without forward approach.")
+        ok, left_sign = pivot(bus, offset, "L")
         if not ok or left_sign is None:
             return False
         if not line_tracker.all_channels_fresh():
-            if not reconnect_fire("after initial L90"):
+            if not reconnect_fire("after initial L"):
                 return False
 
         # До окончания позиционирования руки не движемся вперёд.
@@ -1635,8 +1376,8 @@ def firefighter_task(
                 break
             line_end_count = 0
             differential_drive(
-                state, speed=BASE_SPEED,
-                max_speed=MAX_SPEED,
+                state, speed=FIRE_APPROACH_SPEED,
+                max_speed=FIRE_APPROACH_MAX_SPEED,
             )
             time.sleep(LOOP_DELAY)
         else:
@@ -1653,21 +1394,13 @@ def firefighter_task(
             offset,
             left_sign,
             label="FIREFIGHTER",
-            accept_any_junction=False,
+            accept_any_junction=True,
             line_loss_timeout=BUTTON_REVERSE_LINE_LOSS_TIMEOUT,
             recover_connection=lambda stage: reconnect_fire(stage),
         ):
             return False
-        print("\nF: advance 0.5s along line before final R90.")
-        if not follow_for(
-            calibration, TURN_90_FORWARD_TIME,
-            speed=TURN_90_FORWARD_SPEED,
-            max_speed=TURN_90_FORWARD_MAX_SPEED,
-            recover_connection=lambda stage: reconnect_fire(stage),
-        ):
-            return False
-        print("\nF: final shared R90.")
-        ok, _ = pivot_90(bus, offset, "R", angle_target=TURN_90_ANGLE)
+        print("\nF: final ordinary R without forward approach.")
+        ok, _ = pivot(bus, offset, "R")
         return ok
     finally:
         try:
@@ -1745,7 +1478,7 @@ def create_color_rgb_indicator():
 
 
 def color_marker_task(calibration, board, bus, offset, camera_stream=None):
-    """Задание COLOR с проверенным поворотом R90 из этого файла.
+    """Задание COLOR с обычным поворотом R из этого файла.
     После поворота рука занимает заданное положение, камера распознаёт цвет,
     а индикатор сохраняет его до следующего перекрёстка."""
     from color_marker_detector import run_color_marker_task
@@ -1754,14 +1487,8 @@ def color_marker_task(calibration, board, bus, offset, camera_stream=None):
     stop()
     marker = None
     try:
-        print("\nCOLOR: execute R90 using this file's existing turn logic.")
-        if not follow_for(
-            calibration, TURN_90_FORWARD_TIME,
-            speed=TURN_90_FORWARD_SPEED,
-            max_speed=TURN_90_FORWARD_MAX_SPEED,
-        ):
-            return False
-        ok, _ = pivot_90(bus, offset, "R", angle_target=TURN_90_ANGLE)
+        print("\nCOLOR: execute ordinary R without forward approach.")
+        ok, _ = pivot(bus, offset, "R")
         if not ok:
             return False
         arm, _ = get_shared_arm(board)
@@ -1848,7 +1575,7 @@ def button_bounce_press_and_home(board):
 
 
 def button_bounce_find_color(calibration, camera_stream, recover=None):
-    """Следовать по линии с PWM 130/255 до цветного объекта в нижней центральной зоне."""
+    """Следовать по линии с отдельным PD до цвета в нижней центральной зоне."""
     import cv2
     from color_marker_detector import ColorMarkerDetector
     if camera_stream is None:
@@ -1864,7 +1591,15 @@ def button_bounce_find_color(calibration, camera_stream, recover=None):
     locked_color = None
     centered_frames = 0
     last_frame_at = time.monotonic()
-    line_follower.reset_steering()
+    bounce_follower = line_tracker.LineTrackingEngine(
+        base_speed=BUTTON_BOUNCE_DRIVE_PWM,
+        max_speed=BUTTON_BOUNCE_MAX_PWM,
+        min_speed=MIN_SPEED,
+        kp=BUTTON_BOUNCE_KP,
+        kd=BUTTON_BOUNCE_KD,
+        target_position=TARGET_POSITION,
+    )
+    bounce_follower.reset_steering()
     camera.start_task("BUTTON_BOUNCE: searching red/green/blue")
     try:
         while True:
@@ -1919,12 +1654,14 @@ def button_bounce_find_color(calibration, camera_stream, recover=None):
                 stop()
                 print("\\nBUTTON_BOUNCE: camera frames stopped.")
                 return False
-            differential_drive(
-                state, speed=BUTTON_BOUNCE_DRIVE_PWM, max_speed=MAX_SPEED
+            bounce_follower.drive(
+                state, speed=BUTTON_BOUNCE_DRIVE_PWM,
+                max_speed=BUTTON_BOUNCE_MAX_PWM,
             )
             time.sleep(LOOP_DELAY)
     finally:
         stop()
+        bounce_follower.reset_steering()
         line_follower.reset_steering()
         camera.end_task()
 
@@ -1933,7 +1670,7 @@ def button_bounce_task(
     calibration, detector, bus, offset, board, camera_stream=None,
     recover_connection=None,
 ):
-    """R, подготовка руки, цвет в нижней части кадра, нажатие, возврат, L90."""
+    """R, подготовка руки, цвет в нижней части кадра, нажатие, возврат, L."""
     stop()
     try:
         print("\\nBUTTON_BOUNCE: ordinary R.")
@@ -1957,13 +1694,8 @@ def button_bounce_task(
             recover_connection=recover_connection,
         ):
             return False
-        if not follow_for(
-            calibration, RETURN_FORWARD_TIME,
-            recover_connection=recover_connection,
-        ):
-            return False
-        print("\\nBUTTON_BOUNCE: final L90.")
-        ok, _ = pivot_90(bus, offset, "L", angle_target=TURN_90_ANGLE)
+        print("\\nBUTTON_BOUNCE: final ordinary L without forward approach.")
+        ok, _ = pivot(bus, offset, "L")
         return ok
     except Exception as exc:
         print(f"\\nBUTTON_BOUNCE: {exc}")
@@ -1999,11 +1731,13 @@ def load_route():
         if cmd not in ALLOWED_ROUTE_COMMANDS:
             raise ValueError(
                 f"Invalid ROUTE entry #{index}: {command!r}. "
-                "Allowed: L, R, L90, R90, L90SLOW, R90SLOW, S, SLOW, "
-                "BUTTON, CHARGING, FIREFIGHTER, CUBE1, COLOR, BUTTON_BOUNCE, Q."
+                "Allowed: L, R, LSLOW, RSLOW, S, SLOW, "
+                "BUTTON, CHARGING, FIREFIGHTER, CUBE1, COLOR, BUTTON_BOUNCE, START, FINISH."
             )
-        if cmd == "Q" and index != len(ROUTE):
-            raise ValueError("Q must be the last ROUTE entry.")
+        if cmd == "FINISH" and index != len(ROUTE):
+            raise ValueError("FINISH must be the last ROUTE entry.")
+        if cmd == "START" and index != 1:
+            raise ValueError("START must be the first ROUTE entry.")
         route.append(cmd)
     return route
 
@@ -2158,9 +1892,23 @@ def main():
         route_index = 0
         junction_count = 0
         candidate_count = 0
-        junction_gate = JunctionRearmGate()
         junction_ignore_until = 0.0
+        junction_diag_source = "startup"
+        junction_diag_started = None
+        junction_diag_last_print = 0.0
+        junction_diag_expired = False
+        if route[0] == "START":
+            route_index = 1
+            junction_ignore_until = time.monotonic() + POST_STRAIGHT_JUNCTION_IGNORE_SECONDS
+            print("START: moving straight; initial junction detection ignored temporarily.")
+        acceleration_started = None
         slow_until_next_junction = False
+        straight_speed = {
+            "current_speed": BASE_SPEED,
+            "previous_error": None,
+            "previous_time": None,
+            "straight_since": None,
+        }
         while True:
 
             # Не используем устаревшие данные ADC для управления моторами.
@@ -2182,7 +1930,6 @@ def main():
                         break
                     offset_90 = None
                     detector = JunctionDetector()
-                    junction_gate = JunctionRearmGate()
                     candidate_count = 0
                     adc_stale_since = None
                 time.sleep(LOOP_DELAY)
@@ -2191,16 +1938,53 @@ def main():
             position = state["position"]
             left, right, candidate = detector.read(state)
             now = time.monotonic()
-            junction_gate.update(left, right, position)
+            # Диагностика: показывает, блокирует ли таймер перекрёсток
+            # и какие именно значения датчиков видит основной цикл.
+            if junction_diag_started is not None:
+                remaining = junction_ignore_until - now
+                if now - junction_diag_last_print >= 0.20:
+                    print(
+                        f"\nJUNCTION_DIAG [{junction_diag_source}] "
+                        f"elapsed={now - junction_diag_started:.2f}s "
+                        f"remaining={max(0.0, remaining):.2f}s "
+                        f"blocked={int(remaining > 0)} "
+                        f"candidate={int(candidate)} "
+                        f"count={candidate_count} "
+                        f"S1={int(left)} S8={int(right)} "
+                        f"pos={position} "
+                        f"N={[round(v, 2) for v in state['normalized']]}",
+                        flush=True,
+                    )
+                    junction_diag_last_print = now
+                if remaining <= 0 and not junction_diag_expired:
+                    junction_diag_expired = True
+                    print(
+                        f"\nJUNCTION_DIAG [{junction_diag_source}] "
+                        f"IGNORE EXPIRED after "
+                        f"{now - junction_diag_started:.2f}s; "
+                        f"candidate={int(candidate)}",
+                        flush=True,
+                    )
             if (now >= junction_ignore_until
-                    and junction_gate.armed and candidate):
+                    and candidate):
                 candidate_count += 1
             else:
                 candidate_count = 0
             if candidate_count >= JUNCTION_CONFIRM:
+                print(
+                    f"\nJUNCTION_DIAG TRIGGER "
+                    f"source={junction_diag_source} "
+                    f"remaining={max(0.0, junction_ignore_until - now):.2f}s "
+                    f"candidate={int(candidate)} "
+                    f"count={candidate_count} "
+                    f"S1={int(left)} S8={int(right)} "
+                    f"pos={position} "
+                    f"N={[round(v, 2) for v in state['normalized']]}",
+                    flush=True,
+                )
+                junction_diag_started = None
                 stop()
                 slow_until_next_junction = False
-                junction_gate.mark_junction()
                 candidate_count = 0
                 junction_count += 1
 
@@ -2222,7 +2006,7 @@ def main():
                     f"\nJUNCTION #{junction_count}: S1={int(left)} "
                     f"S8={int(right)}; ROUTE {route_index}/{len(route)} -> {cmd}"
                 )
-                if cmd == "Q":
+                if cmd == "FINISH":
                     print("ROUTE: stop command.")
                     break
                 if cmd == "COLOR":
@@ -2236,7 +2020,7 @@ def main():
                     # Только медленное движение вперёд; короткая защита от старого перекрёстка.
                     ok = True
                 elif cmd in (
-                    "L", "R", "L90", "R90", "L90SLOW", "R90SLOW", "BUTTON", "BUTTON_BOUNCE", "CHARGING",
+                    "L", "R", "LSLOW", "RSLOW", "BUTTON", "BUTTON_BOUNCE", "CHARGING",
                     "FIREFIGHTER", "CUBE1",
                 ):
 
@@ -2244,12 +2028,7 @@ def main():
                     if bus is None:
                         bus = smbus.SMBus(I2C_BUS)
                         gyro_setup(bus)
-                    if cmd in ("L90", "R90", "L90SLOW", "R90SLOW"):
-                        if offset_90 is None:
-                            offset_90 = gyro_calibrate(bus, settle_seconds=0.05)
-                        offset = offset_90
-                    else:
-                        offset = gyro_calibrate(bus)
+                    offset = gyro_calibrate(bus)
                     if cmd == "BUTTON":
 
                         # BUTTON едет 2 секунды по линии, без датчика расстояния.
@@ -2282,61 +2061,79 @@ def main():
                             # Тот же поворот вправо и последующее центрирование, что в старом алгоритме.
                             ok, _ = pivot(bus, offset, "R")
                             # Обычное differential2 продолжит движение после задания.
-                    elif cmd in ("L90", "R90", "L90SLOW", "R90SLOW"):
-                        ok = follow_for(
-                            calibration, TURN_90_FORWARD_TIME,
-                            speed=BASE_SPEED,
-                            max_speed=MAX_SPEED,
-                            recover_connection=recover_during_task,
-                        )
-                        if ok:
-                            ok, _ = pivot_90(
-                                bus,
-                                offset,
-                                cmd[0],
-                                angle_target=TURN_90_ANGLE,
-                                slow=False,
-                            )
-                        # Центрирование выполняется обычным differential2 в основном цикле.
+                    elif cmd in ("LSLOW", "RSLOW"):
+                        ok, _ = pivot(bus, offset, cmd[0])
+                        # Медленное следование по линии начнётся в основном цикле.
                     else:
                         # Обычные L/R выполняются без проезда вперёд.
                         ok, _ = pivot(bus, offset, cmd)
                         # Центрирование выполняется обычным differential2 в основном цикле.
                 else:
-                    ok = follow_for(calibration, 0.5)
+                    # S: продолжить движение в основном цикле без отдельного проезда.
+                    ok = True
                 if not ok:
                     print("\nManeuver failed. Robot stopped.")
                     break
-                slow_until_next_junction = cmd in ("SLOW", "L90SLOW", "R90SLOW")
-                if cmd in (
-                    "L", "R", "L90", "R90", "L90SLOW", "R90SLOW",
-                    "BUTTON", "CHARGING", "FIREFIGHTER", "CUBE1", "COLOR", "BUTTON_BOUNCE",
-                ):
-                    junction_ignore_until = (
-                        time.monotonic() + POST_TURN_JUNCTION_IGNORE_SECONDS
-                    )
-                    candidate_count = 0
-                if slow_until_next_junction:
-                    junction_ignore_until = (
-                        time.monotonic() + POST_SLOW_JUNCTION_IGNORE_SECONDS
-                    )
-                    candidate_count = 0
+                slow_until_next_junction = cmd in ("SLOW", "LSLOW", "RSLOW")
+                acceleration_started = None if slow_until_next_junction else time.monotonic()
+                straight_speed["current_speed"] = MANEUVER_SPEED
+                straight_speed["previous_error"] = None
+                straight_speed["previous_time"] = None
+                straight_speed["straight_since"] = None
+                ignore_seconds = (
+                    POST_STRAIGHT_JUNCTION_IGNORE_SECONDS if cmd == "S"
+                    else POST_SLOW_JUNCTION_IGNORE_SECONDS if slow_until_next_junction
+                    else POST_TURN_JUNCTION_IGNORE_SECONDS
+                )
+                junction_diag_started = time.monotonic()
+                junction_ignore_until = junction_diag_started + ignore_seconds
+                junction_diag_source = cmd
+                junction_diag_last_print = 0.0
+                junction_diag_expired = False
+                print(
+                    f"\nJUNCTION_DIAG START command={cmd} "
+                    f"ignore={ignore_seconds:.2f}s "
+                    f"deadline={junction_ignore_until:.3f} "
+                    f"detector_left={int(detector.left_black)} "
+                    f"detector_right={int(detector.right_black)}",
+                    flush=True,
+                )
+                candidate_count = 0
                 if route_index >= len(route):
                     stop()
                     print("\nAll ROUTE commands completed. Robot stopped.")
                     break
                 continue
 
-            # Везде один и тот же differential2 PID; PWM 190, кроме BUTTON_BOUNCE (80).
+            # Только проверенный differential2.py управляет движением по линии.
             if position is None:
                 stop()
+                if acceleration_started is not None:
+                    acceleration_started = time.monotonic()
                 print(
-                    '\\rNO LINE: paused; route resumes when line returns. '
+                    '\rNO LINE: paused; route resumes when line returns. '
                     f'raw={state["raw"]}',
                     end="", flush=True,
                 )
             else:
-                differential_drive(state, speed=BASE_SPEED, max_speed=MAX_SPEED)
+                if slow_until_next_junction:
+                    differential_drive(state, speed=150, max_speed=MAX_SPEED)
+                elif acceleration_started is None:
+                    speed, max_speed = update_straight_speed(
+                        state, left, right, candidate,
+                        straight_speed, time.monotonic(),
+                    )
+                    differential_drive(state, speed=speed, max_speed=max_speed)
+                else:
+                    elapsed = time.monotonic() - acceleration_started
+                    speed, max_speed = post_junction_drive_limits(elapsed)
+                    differential_drive(state, speed=speed, max_speed=max_speed)
+                    if elapsed >= POST_JUNCTION_ACCEL_SECONDS:
+                        acceleration_started = None
+                        straight_speed["current_speed"] = speed
+                        straight_speed["previous_error"] = None
+                        straight_speed["previous_time"] = None
+                        straight_speed["straight_since"] = None
                 print(
                     f"\rLINE pos={position:+.3f} "
                     f"S1={int(left)} S8={int(right)} "
