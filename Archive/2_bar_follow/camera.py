@@ -150,6 +150,9 @@ class Camera:
                 # array, so no additional copy is necessary.
 
                 frame = self.picam2.capture_array()
+                # Wrist-mounted camera is physically upside down.
+                # Rotate once before both raw streaming and vision processing.
+                frame = cv2.rotate(frame, cv2.ROTATE_180)
 
                 with self.frame_lock:
                     self.latest_frame = frame
