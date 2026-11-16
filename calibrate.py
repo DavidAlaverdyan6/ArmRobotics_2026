@@ -4,7 +4,6 @@ import time
 from telemetrix import telemetrix
 import line_tracker
 from stm32_reset import STM32_RESET_GPIO, reset_stm32
-from junction_drive_config import save as save_junction_drive, validate as validate_junction_drive
 
 
 SERIAL_PORT = "/dev/serial0"
@@ -72,24 +71,6 @@ def main():
                 line_tracker.CALIBRATION_FILE
             )
 
-            print("Sensors calibrated. Next: junction drive configuration.")
-        print("\nJUNCTION ALIGNMENT: after the trailing edge of the crossing,")
-        print("the robot moves forward for this fixed time at this PWM.")
-        print("Enter values you have already measured on the real robot.")
-        while True:
-            try:
-                seconds_text = input("Forward time, seconds (0.01..2): ").strip()
-                pwm_text = input("Forward motor PWM (70..255): ").strip()
-                seconds, pwm = validate_junction_drive(
-                    seconds_text.replace(",", "."), pwm_text
-                )
-            except ValueError as error:
-                print(f"Invalid junction drive settings: {error}")
-                continue
-            save_junction_drive(seconds, pwm)
-            print(f"Saved junction drive: {seconds:g} s, PWM {pwm}.")
-            print("main.py reads these settings automatically on every L90/R90.")
-            break
 
 
     except KeyboardInterrupt:
