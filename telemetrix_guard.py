@@ -1,3 +1,4 @@
+
 """Keep Telemetrix reporter thread alive on spurious OneWire report packets.
 
 Some UART sessions produce a packet tagged ONE_WIRE_REPORT although the robot
@@ -38,7 +39,6 @@ def install_unexpected_onewire_guard(telemetrix_class):
         last = getattr(self, "_postintegral_last_onewire_warning", -1e12)
         if total == 1 or now - last >= _REPORT_INTERVAL_SECONDS:
             self._postintegral_last_onewire_warning = now
-            # A warning is deliberately retained in terminal scrollback.
             print(
                 "TELEMETRIX WARNING: discarded unexpected OneWire report "
                 f"without callback (count={total}, payload={report!r}). "
