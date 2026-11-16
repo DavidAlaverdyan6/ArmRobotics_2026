@@ -1144,11 +1144,9 @@ def cube1_task(
         # Рука начинает работать сразу после поворота, без отдельного центрирования.
         if not cube1_arm_action(board):
             return False
-        if not line_tracker.all_channels_fresh():
-            if recover_cube("after arm positioning") is None:
-                return False
-            if not cube1_arm_action(board):
-                return False
+        if not reverse_adc_alive():
+            print("CUBE1: no ADC callbacks after arm positioning.")
+            return False
         cube_sensor = Firefighter(board)
         cube_sensor.initialize()
         sensor_ready = True
@@ -1200,9 +1198,9 @@ def cube1_task(
             recover_connection=recover_cube,
         ):
             return False
-        if not line_tracker.all_channels_fresh():
-            if recover_cube("before final R") is None:
-                return False
+        if not reverse_adc_alive():
+            print("CUBE1: ADC stream lost before final R.")
+            return False
         print("\nCUBE1: final ordinary R without forward approach.")
         ok, _ = pivot(bus, offset, "R")
         return ok
@@ -1319,9 +1317,9 @@ def firefighter_task(
         ok, left_sign = pivot(bus, offset, "L")
         if not ok or left_sign is None:
             return False
-        if not line_tracker.all_channels_fresh():
-            if not reconnect_fire("after initial L"):
-                return False
+        if not reverse_adc_alive():
+            print("F: no ADC callbacks after initial L.")
+            return False
 
         # До окончания позиционирования руки не движемся вперёд.
         stop()
@@ -1336,9 +1334,9 @@ def firefighter_task(
         arm.open_gripper()
         _return_home(arm, pose, AUTO_MAX_STEP_DEG, STEP_DELAY)
         time.sleep(0.3)
-        if not line_tracker.all_channels_fresh():
-            if not reconnect_fire("after arm positioning", restage=True):
-                return False
+        if not reverse_adc_alive():
+            print("F: no ADC callbacks after arm positioning.")
+            return False
 
         # При подтверждении пламени тушим сразу; резерв — конец линии.
         deadline = time.monotonic() + FIRE_APPROACH_TIMEOUT
