@@ -417,18 +417,14 @@ class ReverseLineController:
     def _wheel_command(self, base_pwm, steering):
         """При движении назад подтормаживает только одно колесо и ограничивает изменение PWM."""
         base = max(REVERSE_MIN_PWM, min(REVERSE_MAX_PWM, round(base_pwm)))
-        brake = min(REVERSE_MAX_BRAKE_PWM, abs(steering))
-        left = right = -base
-
-        # Положительная коррекция тормозит правое колесо. При движении назад
-
-        # реакция корпуса обратная движению вперёд; знак коррекции
-
-        # задаётся калибровкой оборудования, а не перестановкой значений PWM.
-        if steering * REVERSE_STEER_SIGN >= 0:
-            right = -max(REVERSE_MIN_PWM, base - round(brake))
-        else:
-            left = -max(REVERSE_MIN_PWM, base - round(brake))
+        # Distribute correction across both wheels. At base PWM 115 the old
+        # one-wheel brake could provide only 35 PWM difference (115 - 80).
+        # Differential steering provides up to 70 without crossing PWM limits.
+        correction = max(-REVERSE_MAX_BRAKE_PWM, min(REVERSE_MAX_BRAKE_PWM,
+                                                     steering * REVERSE_STEER_SIGN))
+        half = correction / 2.0
+        left = -round(max(REVERSE_MIN_PWM, min(REVERSE_MAX_PWM, base + half)))
+        right = -round(max(REVERSE_MIN_PWM, min(REVERSE_MAX_PWM, base - half)))
         old_left, old_right = self.previous_pwm or (None, None)
         left = self._slew(old_left, left)
         right = self._slew(old_right, right)
@@ -602,6 +598,18 @@ def wait_for_reverse_adc(timeout=0.75):
     return line_tracker.all_channels_fresh()
 
 
+def reverse_adc_alive(max_silence=2.5):
+    """Detect a complete ADC stream outage, not per-channel synchronization.
+
+    A constant-valued channel may legitimately report less often. The guard
+    requires only that at least one of eight callbacks has arrived recently.
+    """
+    now = time.monotonic()
+    with line_tracker._sample_lock:
+        times = line_tracker.sample_times.copy()
+    return any(t is not None and 0 <= now - t <= max_silence for t in times)
+
+
 def button_return(
     calibration,
     detector,
@@ -633,27 +641,11 @@ def button_return(
             max_return_time is None
             or time.monotonic() - start < max_return_time
         ):
-            if not line_tracker.all_channels_fresh():
-                print(f"\n{label}: ADC stale during reverse; waiting up to 0.75 s.")
-                if wait_for_reverse_adc():
-                    print(f"{label}: ADC resumed; continuing reverse without restart.")
-                    continue
-                print(f"{label}: ADC still stale; recovering Telemetrix.")
-                if recover_connection is None or not recover_connection(f"{label} reverse"):
-                    return False
-                # STM32 reset: новая серия данных, курс и поиск перекрёстка.
-                heading = Heading(bus, offset, left_sign)
-                reverse_controller = ReverseLineController(
-                    heading, line_loss_timeout=line_loss_timeout
-                )
-                start = time.monotonic()
-                cleared_count = 0
-                outer_confirm_count = 0
-                candidate_since = None
-                button_first_edge_at = None
-                button_seen_left = button_seen_right = False
-                button_confirm = 0
-                continue
+            # Do not require eight ADC channels to report in a 150 ms window.
+            # A genuine complete stream outage is handled by the common guard.
+            if not reverse_adc_alive():
+                print(f"\n{label}: all ADC reports stopped; ending reverse safely.")
+                return False
             state = line_tracker.update(calibration)
             left, right, candidate = detector.read(state)
             now = time.monotonic()
@@ -1094,17 +1086,9 @@ def cube1_emergency_reverse_to_line(
     seen = 0
     try:
         while True:
-            if not line_tracker.all_channels_fresh():
-                print("CUBE1: ADC stale during emergency reverse; waiting up to 0.75 s.")
-                if wait_for_reverse_adc():
-                    print("CUBE1: ADC resumed without reconnect.")
-                    continue
-                if recover_connection is None or not recover_connection(
-                    "emergency reverse", require_line=False
-                ):
-                    return False
-                seen = 0
-                continue
+            if not reverse_adc_alive():
+                print("CUBE1: all ADC reports stopped; ending emergency reverse safely.")
+                return False
             state = line_tracker.update(calibration)
             if state.get("position") is not None:
                 seen += 1
@@ -1240,17 +1224,9 @@ def firefighter_reverse_until_line(calibration, recover_connection=None):
     deadline = time.monotonic() + FIRE_LINE_RECOVERY_TIMEOUT
     try:
         while time.monotonic() < deadline:
-            if not line_tracker.all_channels_fresh():
-                print("F: ADC stale during emergency reverse; waiting up to 0.75 s.")
-                if wait_for_reverse_adc():
-                    print("F: ADC resumed without reconnect.")
-                    continue
-                print("F: ADC still stale; reconnecting.")
-                if recover_connection is None or not recover_connection("reverse line"):
-                    return False
-                deadline = time.monotonic() + FIRE_LINE_RECOVERY_TIMEOUT
-                confirmed = 0
-                continue
+            if not reverse_adc_alive():
+                print("F: all ADC reports stopped; ending emergency reverse safely.")
+                return False
             state = line_tracker.update(calibration)
             values = state.get("normalized", [])
             raw = state.get("raw", [])
