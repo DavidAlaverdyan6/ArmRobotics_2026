@@ -36,7 +36,7 @@ JUNCTION_CONFIRM = 1
 JUNCTION_CLEAR = 1
 POST_TURN_JUNCTION_IGNORE_SECONDS = 0.8
 BUTTON_POST_TURN_IGNORE_SECONDS = 1.0
-BUTTON_BOUNCE_POST_TURN_IGNORE_SECONDS = 0.8
+BUTTON2_POST_TURN_IGNORE_SECONDS = 0.8
 FIREFIGHTER_POST_TURN_IGNORE_SECONDS = 0.8
 CUBE1_POST_TURN_IGNORE_SECONDS = 1
 POST_SLOW_JUNCTION_IGNORE_SECONDS = 0.4
@@ -99,14 +99,21 @@ REVERSE_SENSOR_SPAN_MM = 60.0
 REVERSE_POSITION_MM_PER_UNIT = REVERSE_SENSOR_SPAN_MM / 7.0
 
 # Отдельный PD-регулятор и наблюдатель гироскопа для заднего хода; настройка на роботе.
-REVERSE_LATERAL_KP = 2.6          # PWM на мм ошибки, оценённой у оси.
+REVERSE_LATERAL_KP = 3.2          # PWM на мм ошибки, оценённой у оси.
 REVERSE_LATERAL_KD = 0.055        # PWM на (мм/с); подавляет колебания.
 REVERSE_HEADING_KP = 0.70         # PWM на градус ошибки курса MPU.
 REVERSE_YAW_RATE_KD = 0.12        # PWM на (градус/с); подавляет рыскание.
 REVERSE_REFERENCE_FOLLOW = 2.5    # 1/с: скорость подстройки опорного курса на поворотах.
 REVERSE_REFERENCE_WINDOW_MM = 7.0
 REVERSE_MAX_BRAKE_PWM = 70
-REVERSE_PWM_SLEW_PER_LOOP = 7
+REVERSE_PWM_SLEW_PER_LOOP = 11
+REVERSE_RECOVERY_ENTER_MM = 15.0
+REVERSE_RECOVERY_EXIT_MM = 7.0
+REVERSE_RECOVERY_HEADING_ENTER_DEG = 12.0
+REVERSE_RECOVERY_HEADING_EXIT_DEG = 5.0
+REVERSE_RECOVERY_SPEED = 95
+REVERSE_RECOVERY_LATERAL_KP = 4.2
+REVERSE_RECOVERY_HEADING_KP = 1.3
 REVERSE_LINE_LOSS_TIMEOUT = 0.5 #?
 BUTTON_REVERSE_LINE_LOSS_TIMEOUT = 0.5 #?
 REVERSE_GYRO_SPEED = 90
@@ -163,17 +170,22 @@ COLOR_ARM_ANGLES = {
     "gripper": 180.0,
 }
 COLOR_LED_HOLD = None
-# BUTTON_BOUNCE: отдельные настройки PD только во время поиска цвета.
-BUTTON_BOUNCE_DRIVE_PWM = 80
-BUTTON_BOUNCE_MAX_PWM = 150
-BUTTON_BOUNCE_KP = 45.0
-BUTTON_BOUNCE_KD = 3.0
-BUTTON_BOUNCE_MIN_OBJECT_AREA = 300
-BUTTON_BOUNCE_CONFIRM_FRAMES = 1
-BUTTON_BOUNCE_TARGET_X = (0.35, 0.65)
-BUTTON_BOUNCE_TARGET_Y = (0.65, 0.90)
-BUTTON_BOUNCE_PRESS = (0.0, 250.0, -20.0)
-BUTTON_BOUNCE_REVERSE_LINE_TIMEOUT = 0.5 #?
+# BUTTON2: отдельные настройки PD только во время поиска цвета.
+BUTTON2_DRIVE_PWM = 80
+BUTTON2_MAX_PWM = 150
+BUTTON2_KP = 45.0
+BUTTON2_KD = 3.0
+BUTTON2_MIN_OBJECT_AREA = 1000
+BUTTON2_CONFIRM_FRAMES = 3
+BUTTON2_TARGET_X = (0.35, 0.65)
+BUTTON2_TARGET_Y = (0.65, 0.90)
+BUTTON2_PRESS = (0.0, 250.0, -20.0)
+BUTTON2_PREP_GRIPPER_DEG = 180
+BUTTON2_PREP_BASE_DEG = 180
+BUTTON2_PREP_SHOULDER_DEG = 140
+BUTTON2_PREP_SETTLE_SECONDS = 0.3
+BUTTON2_PRESS_SHOULDER_DEG = 180
+BUTTON2_REVERSE_LINE_TIMEOUT = 0.5 #?
 
 # Автоматический маршрут: по одной команде на каждый найденный перекрёсток.
 
@@ -198,7 +210,7 @@ ROUTE = [
     "FIREFIGHTER",
     "L",
     "R",
-    "BUTTON_BOUNCE",
+    "BUTTON2",
     "RSLOW",
     "L",
     "RSLOW",
@@ -213,7 +225,7 @@ ROUTE = [
 ]
 ALLOWED_ROUTE_COMMANDS = {
     "L", "R", "LSLOW", "RSLOW", "S", "SLOW",
-    "BUTTON", "BUTTON_BOUNCE", "CHARGING", "FIREFIGHTER", "CUBE1", "COLOR", "START", "FINISH",
+    "BUTTON", "BUTTON2", "CHARGING", "FIREFIGHTER", "CUBE1", "COLOR", "START", "FINISH",
 }
 line_follower = line_tracker.LineTrackingEngine(
     base_speed=BASE_SPEED,
@@ -405,6 +417,7 @@ class ReverseLineController:
         self.last_angle = 0.0
         self.last_axle_error = None
         self.mode = "LINE"
+        self.recovery_active = False
 
     @staticmethod
 
@@ -489,10 +502,18 @@ class ReverseLineController:
             follow = min(1.0, REVERSE_REFERENCE_FOLLOW * dt)
             self.reference_heading += heading_error * follow
             heading_error = _wrap_degrees(angle - self.reference_heading)
+        # Strong correction uses both line position and gyro heading.
+        if self.recovery_active:
+            if (abs(axle_error) <= REVERSE_RECOVERY_EXIT_MM
+                    and abs(heading_error) <= REVERSE_RECOVERY_HEADING_EXIT_DEG):
+                self.recovery_active = False
+        elif (abs(axle_error) >= REVERSE_RECOVERY_ENTER_MM
+              or abs(heading_error) >= REVERSE_RECOVERY_HEADING_ENTER_DEG):
+            self.recovery_active = True
         steering = (
-            REVERSE_LATERAL_KP * axle_error
+            (REVERSE_RECOVERY_LATERAL_KP if self.recovery_active else REVERSE_LATERAL_KP) * axle_error
             + REVERSE_LATERAL_KD * derivative
-            + REVERSE_HEADING_KP * heading_error
+            + (REVERSE_RECOVERY_HEADING_KP if self.recovery_active else REVERSE_HEADING_KP) * heading_error
             + REVERSE_YAW_RATE_KD * rate
         )
 
@@ -503,7 +524,9 @@ class ReverseLineController:
             RETURN_SLOW_SPEED,
             speed - min(25.0, abs(axle_error) * 0.8),
         )
-        self.mode = "LINE"
+        if self.recovery_active:
+            base = min(base, REVERSE_RECOVERY_SPEED)
+        self.mode = "GYRO_CORRECT" if self.recovery_active else "LINE"
         return self._wheel_command(base, steering)
 
 
@@ -663,7 +686,7 @@ def button_return(
 
             # BUTTON: запоминаем срабатывания краёв в коротком окне.
             # Не требуем одновременной чёрной линии на S1 и S8.
-            elif label == "BUTTON":
+            elif label in ("BUTTON", "BUTTON2"):
                 if cleared_count >= JUNCTION_CLEAR:
                     if button_first_edge_at is not None and (
                         now - button_first_edge_at > BUTTON_RETURN_JUNCTION_WINDOW
@@ -696,7 +719,7 @@ def button_return(
 
             # Не используем его для распознавания перекрёстка и выбора скорости.
             candidate_visible = right if accept_s8_only else left != right
-            if label == "BUTTON" and button_first_edge_at is not None:
+            if label in ("BUTTON", "BUTTON2") and button_first_edge_at is not None:
                 candidate_visible = True
             if candidate_visible:
                 if candidate_since is None:
@@ -704,7 +727,7 @@ def button_return(
             elif accept_s8_only or (not left and not right):
                 candidate_since = None
             speed = RETURN_SLOW_SPEED if candidate_since is not None else RETURN_SPEED
-            if label == "BUTTON" and button_first_edge_at is not None:
+            if label in ("BUTTON", "BUTTON2") and button_first_edge_at is not None:
                 speed = BUTTON_RETURN_JUNCTION_SLOW_SPEED
             if not differential_reverse(state, speed, reverse_controller):
                 print(f"\n{label}: line lost too long while reversing.")
@@ -1527,35 +1550,35 @@ def color_marker_task(calibration, board, bus, offset, camera_stream=None):
         stop()
 
 
-def button_bounce_prepare_arm(board):
-    """Сначала BASE 180, затем SHOULDER 130; захват закрыт."""
+def button2_prepare_arm(board):
+    """Сначала BASE 180, затем SHOULDER 140; захват закрыт."""
     from roboarm import get_shared_arm
     stop()
     arm, _ = get_shared_arm(board)
-    arm.write(gripper=180)
-    arm.write(base=180)
-    time.sleep(0.3)
-    arm.write(shoulder=140)
-    time.sleep(0.3)
+    arm.write(gripper=BUTTON2_PREP_GRIPPER_DEG)
+    arm.write(base=BUTTON2_PREP_BASE_DEG)
+    time.sleep(BUTTON2_PREP_SETTLE_SECONDS)
+    arm.write(shoulder=BUTTON2_PREP_SHOULDER_DEG)
+    time.sleep(BUTTON2_PREP_SETTLE_SECONDS)
     return arm
 
 
-def button_bounce_press_and_home(board):
+def button2_press_and_home(board):
     """Поднять плечо, нажать по IK с автоматической кистью, сложить руку."""
     import arm_web
     from button_arm import _execute_plan, _return_home
     from roboarm import get_shared_arm
     stop()
     arm, _ = get_shared_arm(board)
-    arm.write(gripper=180)
-    arm.write(shoulder=180)
-    time.sleep(0.3)
+    arm.write(gripper=BUTTON2_PREP_GRIPPER_DEG)
+    arm.write(shoulder=BUTTON2_PRESS_SHOULDER_DEG)
+    time.sleep(BUTTON2_PREP_SETTLE_SECONDS)
     arm_web.arm = arm
-    x, y, z = BUTTON_BOUNCE_PRESS
+    x, y, z = BUTTON2_PRESS
     path, pitch = arm_web.plan_auto_path({
         "x": x, "y": y, "z": z, "orientation_mode": "auto",
     })
-    print(f"BUTTON_BOUNCE: press ({x:g}, {y:g}, {z:g}), auto wrist {pitch:.1f}.")
+    print(f"BUTTON2: press ({x:g}, {y:g}, {z:g}), auto wrist {pitch:.1f}.")
     _execute_plan(arm, path, arm_web.STEP_DELAY)
     arm.write(gripper=180)
     _return_home(
@@ -1565,17 +1588,17 @@ def button_bounce_press_and_home(board):
     return True
 
 
-def button_bounce_find_color(calibration, camera_stream, recover=None):
+def button2_find_color(calibration, camera_stream, recover=None):
     """Следовать по линии с отдельным PD до цвета в нижней центральной зоне."""
     import cv2
     from color_marker_detector import ColorMarkerDetector
     if camera_stream is None:
-        print("BUTTON_BOUNCE: camera unavailable.")
+        print("BUTTON2: camera unavailable.")
         return False
     camera = camera_stream
     detector = ColorMarkerDetector(
-        min_object_area=BUTTON_BOUNCE_MIN_OBJECT_AREA,
-        stable_frames=BUTTON_BOUNCE_CONFIRM_FRAMES,
+        min_object_area=BUTTON2_MIN_OBJECT_AREA,
+        stable_frames=BUTTON2_CONFIRM_FRAMES,
         allowed_colors={"red", "green", "blue"},
     )
     sequence = camera.sequence
@@ -1583,15 +1606,15 @@ def button_bounce_find_color(calibration, camera_stream, recover=None):
     centered_frames = 0
     last_frame_at = time.monotonic()
     bounce_follower = line_tracker.LineTrackingEngine(
-        base_speed=BUTTON_BOUNCE_DRIVE_PWM,
-        max_speed=BUTTON_BOUNCE_MAX_PWM,
+        base_speed=BUTTON2_DRIVE_PWM,
+        max_speed=BUTTON2_MAX_PWM,
         min_speed=MIN_SPEED,
-        kp=BUTTON_BOUNCE_KP,
-        kd=BUTTON_BOUNCE_KD,
+        kp=BUTTON2_KP,
+        kd=BUTTON2_KD,
         target_position=TARGET_POSITION,
     )
     bounce_follower.reset_steering()
-    camera.start_task("BUTTON_BOUNCE: searching red/green/blue")
+    camera.start_task("BUTTON2: searching red/green/blue")
     try:
         while True:
             if not line_tracker.all_channels_fresh():
@@ -1607,7 +1630,7 @@ def button_bounce_find_color(calibration, camera_stream, recover=None):
             state = line_tracker.update(calibration)
             if state["position"] is None:
                 stop()
-                print("\\nBUTTON_BOUNCE: line lost.")
+                print("\\nBUTTON2: line lost.")
                 return False
             captured = camera.get_frame(after_sequence=sequence, timeout=0.01)
             if captured is not None:
@@ -1616,12 +1639,12 @@ def button_bounce_find_color(calibration, camera_stream, recover=None):
                 objects, annotated, confirmed_color = detector.process_frame(frame)
                 if locked_color is None and confirmed_color in ("red", "green", "blue"):
                     locked_color = confirmed_color
-                    print(f"\\nBUTTON_BOUNCE: locked {locked_color}.")
+                    print(f"\\nBUTTON2: locked {locked_color}.")
                 height, width = frame.shape[:2]
-                x1 = int(width * BUTTON_BOUNCE_TARGET_X[0])
-                x2 = int(width * BUTTON_BOUNCE_TARGET_X[1])
-                y1 = int(height * BUTTON_BOUNCE_TARGET_Y[0])
-                y2 = int(height * BUTTON_BOUNCE_TARGET_Y[1])
+                x1 = int(width * BUTTON2_TARGET_X[0])
+                x2 = int(width * BUTTON2_TARGET_X[1])
+                y1 = int(height * BUTTON2_TARGET_Y[0])
+                y2 = int(height * BUTTON2_TARGET_Y[1])
                 cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 255, 255), 2)
                 target = next((
                     obj for obj in objects
@@ -1631,23 +1654,23 @@ def button_bounce_find_color(calibration, camera_stream, recover=None):
                     and obj["y"] < y2
                     and obj["y"] + obj["h"] > y1
                 ), None)
-                centered_frames = 1 if target else 0
+                centered_frames = centered_frames + 1 if target else 0
                 camera.publish_task_frame(
                     annotated,
-                    f"BUTTON_BOUNCE: {locked_color or 'searching'} "
-                    f"target {centered_frames}/{BUTTON_BOUNCE_CONFIRM_FRAMES}",
+                    f"BUTTON2: {locked_color or 'searching'} "
+                    f"target {centered_frames}/{BUTTON2_CONFIRM_FRAMES}",
                 )
-                if target is not None:
+                if centered_frames >= BUTTON2_CONFIRM_FRAMES:
                     stop()
-                    print(f"\\nBUTTON_BOUNCE: {locked_color} in lower center.")
+                    print(f"\\nBUTTON2: {locked_color} in lower center.")
                     return True
             elif time.monotonic() - last_frame_at > 0.5:
                 stop()
-                print("\\nBUTTON_BOUNCE: camera frames stopped.")
+                print("\\nBUTTON2: camera frames stopped.")
                 return False
             bounce_follower.drive(
-                state, speed=BUTTON_BOUNCE_DRIVE_PWM,
-                max_speed=BUTTON_BOUNCE_MAX_PWM,
+                state, speed=BUTTON2_DRIVE_PWM,
+                max_speed=BUTTON2_MAX_PWM,
             )
             time.sleep(LOOP_DELAY)
     finally:
@@ -1657,39 +1680,39 @@ def button_bounce_find_color(calibration, camera_stream, recover=None):
         camera.end_task()
 
 
-def button_bounce_task(
+def button2_task(
     calibration, detector, bus, offset, board, camera_stream=None,
     recover_connection=None,
 ):
     """R, подготовка руки, цвет в нижней части кадра, нажатие, возврат, L."""
     stop()
     try:
-        print("\\nBUTTON_BOUNCE: ordinary R.")
+        print("\\nBUTTON2: ordinary R.")
         ok, turn_sign = pivot(bus, offset, "R")
         if not ok or turn_sign is None:
             return False
         stop()
-        button_bounce_prepare_arm(board)
-        if not button_bounce_find_color(
+        button2_prepare_arm(board)
+        if not button2_find_color(
             calibration, camera_stream,
-            recover=(lambda: recover_connection("BUTTON_BOUNCE color search")
+            recover=(lambda: recover_connection("BUTTON2 color search")
                      is not None) if recover_connection else None,
         ):
             return False
-        if not button_bounce_press_and_home(board):
+        if not button2_press_and_home(board):
             return False
         if not button_return(
             calibration, detector, bus, offset, turn_sign,
-            label="BUTTON_BOUNCE",
-            line_loss_timeout=BUTTON_BOUNCE_REVERSE_LINE_TIMEOUT,
+            label="BUTTON2",
+            line_loss_timeout=BUTTON2_REVERSE_LINE_TIMEOUT,
             recover_connection=recover_connection,
         ):
             return False
-        print("\\nBUTTON_BOUNCE: final ordinary L without forward approach.")
+        print("\\nBUTTON2: final ordinary L without forward approach.")
         ok, _ = pivot(bus, offset, "L")
         return ok
     except Exception as exc:
-        print(f"\\nBUTTON_BOUNCE: {exc}")
+        print(f"\\nBUTTON2: {exc}")
         return False
     finally:
         stop()
@@ -1723,7 +1746,7 @@ def load_route():
             raise ValueError(
                 f"Invalid ROUTE entry #{index}: {command!r}. "
                 "Allowed: L, R, LSLOW, RSLOW, S, SLOW, "
-                "BUTTON, CHARGING, FIREFIGHTER, CUBE1, COLOR, BUTTON_BOUNCE, START, FINISH."
+                "BUTTON, CHARGING, FIREFIGHTER, CUBE1, COLOR, BUTTON2, START, FINISH."
             )
         if cmd == "FINISH" and index != len(ROUTE):
             raise ValueError("FINISH must be the last ROUTE entry.")
@@ -2011,7 +2034,7 @@ def main():
                     # Только медленное движение вперёд; короткая защита от старого перекрёстка.
                     ok = True
                 elif cmd in (
-                    "L", "R", "LSLOW", "RSLOW", "BUTTON", "BUTTON_BOUNCE", "CHARGING",
+                    "L", "R", "LSLOW", "RSLOW", "BUTTON", "BUTTON2", "CHARGING",
                     "FIREFIGHTER", "CUBE1",
                 ):
 
@@ -2027,8 +2050,8 @@ def main():
                             calibration, detector, sensor, bus, offset, board,
                             recover_connection=recover_during_task,
                         )
-                    elif cmd == "BUTTON_BOUNCE":
-                        ok = button_bounce_task(
+                    elif cmd == "BUTTON2":
+                        ok = button2_task(
                             calibration, detector, bus, offset, board, camera_stream,
                             recover_connection=recover_during_task,
                         )
@@ -2073,7 +2096,7 @@ def main():
                 straight_speed["straight_since"] = None
                 task_post_turn_ignore = {
                     "BUTTON": BUTTON_POST_TURN_IGNORE_SECONDS,
-                    "BUTTON_BOUNCE": BUTTON_BOUNCE_POST_TURN_IGNORE_SECONDS,
+                    "BUTTON2": BUTTON2_POST_TURN_IGNORE_SECONDS,
                     "FIREFIGHTER": FIREFIGHTER_POST_TURN_IGNORE_SECONDS,
                     "CUBE1": CUBE1_POST_TURN_IGNORE_SECONDS,
                 }
