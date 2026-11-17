@@ -122,7 +122,7 @@ BUTTON_RETURN_JUNCTION_CONFIRM = 1
 BUTTON_RETURN_JUNCTION_SLOW_SPEED = 80
 FIRE_APPROACH_TIMEOUT = 12.0
 FIRE_LINE_RECOVERY_SPEED = 80
-FIRE_LINE_RECOVERY_TIMEOUT = 5.0
+FIRE_LINE_RECOVERY_TIMEOUT = 15.0
 FIRE_LINE_RECOVERY_CONFIRM = 1
 FIRE_LINE_BLACKNESS_MIN = 0.80
 FIRE_LINE_END_CONFIRM = 1
@@ -598,18 +598,6 @@ def wait_for_reverse_adc(timeout=0.75):
     return line_tracker.all_channels_fresh()
 
 
-def reverse_adc_alive(max_silence=2.5):
-    """Detect a complete ADC stream outage, not per-channel synchronization.
-
-    A constant-valued channel may legitimately report less often. The guard
-    requires only that at least one of eight callbacks has arrived recently.
-    """
-    now = time.monotonic()
-    with line_tracker._sample_lock:
-        times = line_tracker.sample_times.copy()
-    return any(t is not None and 0 <= now - t <= max_silence for t in times)
-
-
 def button_return(
     calibration,
     detector,
@@ -641,11 +629,8 @@ def button_return(
             max_return_time is None
             or time.monotonic() - start < max_return_time
         ):
-            # Do not require eight ADC channels to report in a 150 ms window.
-            # A genuine complete stream outage is handled by the common guard.
-            if not reverse_adc_alive():
-                print(f"\n{label}: all ADC reports stopped; ending reverse safely.")
-                return False
+            # Reverse motion is bounded by the 15-second deadline below.
+            # Do not stop for ADC callback freshness while reversing.
             state = line_tracker.update(calibration)
             left, right, candidate = detector.read(state)
             now = time.monotonic()
@@ -1084,11 +1069,9 @@ def cube1_emergency_reverse_to_line(
 ):
     """Движется назад до обнаружения линии после аварии или сброса кубика."""
     seen = 0
+    deadline = time.monotonic() + RETURN_MAX_TIME
     try:
-        while True:
-            if not reverse_adc_alive():
-                print("CUBE1: all ADC reports stopped; ending emergency reverse safely.")
-                return False
+        while time.monotonic() < deadline:
             state = line_tracker.update(calibration)
             if state.get("position") is not None:
                 seen += 1
@@ -1099,6 +1082,8 @@ def cube1_emergency_reverse_to_line(
                 seen = 0
             line_follower.reverse_straight(CUBE1_EMERGENCY_REVERSE_SPEED)
             time.sleep(LOOP_DELAY)
+        print("CUBE1: emergency reverse timed out after 15 seconds.")
+        return False
     finally:
         stop()
 
@@ -1143,9 +1128,6 @@ def cube1_task(
             return False
         # Рука начинает работать сразу после поворота, без отдельного центрирования.
         if not cube1_arm_action(board):
-            return False
-        if not reverse_adc_alive():
-            print("CUBE1: no ADC callbacks after arm positioning.")
             return False
         cube_sensor = Firefighter(board)
         cube_sensor.initialize()
@@ -1194,12 +1176,9 @@ def cube1_task(
         if not button_return(
             calibration, detector, bus, offset, left_sign,
             label="CUBE1", accept_s8_only=True,
-            max_return_time=None, line_loss_timeout=None,
+            max_return_time=RETURN_MAX_TIME, line_loss_timeout=None,
             recover_connection=recover_cube,
         ):
-            return False
-        if not reverse_adc_alive():
-            print("CUBE1: ADC stream lost before final R.")
             return False
         print("\nCUBE1: final ordinary R without forward approach.")
         ok, _ = pivot(bus, offset, "R")
@@ -1222,9 +1201,6 @@ def firefighter_reverse_until_line(calibration, recover_connection=None):
     deadline = time.monotonic() + FIRE_LINE_RECOVERY_TIMEOUT
     try:
         while time.monotonic() < deadline:
-            if not reverse_adc_alive():
-                print("F: all ADC reports stopped; ending emergency reverse safely.")
-                return False
             state = line_tracker.update(calibration)
             values = state.get("normalized", [])
             raw = state.get("raw", [])
@@ -1317,9 +1293,6 @@ def firefighter_task(
         ok, left_sign = pivot(bus, offset, "L")
         if not ok or left_sign is None:
             return False
-        if not reverse_adc_alive():
-            print("F: no ADC callbacks after initial L.")
-            return False
 
         # До окончания позиционирования руки не движемся вперёд.
         stop()
@@ -1334,9 +1307,6 @@ def firefighter_task(
         arm.open_gripper()
         _return_home(arm, pose, AUTO_MAX_STEP_DEG, STEP_DELAY)
         time.sleep(0.3)
-        if not reverse_adc_alive():
-            print("F: no ADC callbacks after arm positioning.")
-            return False
 
         # При подтверждении пламени тушим сразу; резерв — конец линии.
         deadline = time.monotonic() + FIRE_APPROACH_TIMEOUT
