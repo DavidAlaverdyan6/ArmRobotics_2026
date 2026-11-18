@@ -9,7 +9,7 @@ import line_tracker
 import motors
 from stm32_reset import STM32_RESET_GPIO, reset_stm32
 
-# BUTTON использует двухсекундное следование по линии; VL53L0X не нужен.
+# BUTTON использует следование по линии по времени; VL53L0X не нужен.
 PROGRAM_BUILD = "cube-fire-2026-11-10.1"
 
 # Ранее проверенные скорости контроллера differential2.
@@ -19,6 +19,7 @@ MAX_SPEED = 255
 MIN_SPEED = 0
 MANEUVER_SPEED = 230
 MANEUVER_MAX_SPEED = 255
+BUTTON_FORWARD_PWM = 150
 BUTTON_FORWARD_TIME = 1.0  # Время движения вперёд только для BUTTON, сек.
 KP = 65.0
 KD = 15.0
@@ -42,6 +43,23 @@ BUTTON2_POST_TURN_IGNORE_SECONDS = 0.8
 BUTTON2_PRESS_IGNORE_TIME = 0.8  # Ignore junctions after BUTTON2 press and return
 FIREFIGHTER_POST_TURN_IGNORE_SECONDS = 0.9
 CUBE1_POST_TURN_IGNORE_SECONDS = 1
+CUBE2_POST_TURN_IGNORE_SECONDS = 0.4
+CUBE_DROP_POST_TURN_IGNORE_SECONDS = 0.8
+CUBE2_TURN_DIRECTION = "L"  # "L" — налево, "R" — направо.
+CUBE2_DRIVE_PWM = 80
+CUBE2_DETECTION_X = (0.39, 0.61)  # Доли ширины кадра.
+CUBE_DROP_FORWARD_PWM = 150
+CUBE_DROP_FORWARD_TIME = 0.7
+CUBE2_PICK_ATTEMPTS = 3
+CUBE2_SENSOR_SECONDS = 1.0
+CUBE_GRIP_CLOSED = 130
+CUBE_GRIP_SETTLE_SECONDS = 0.3
+CUBE2_SEARCH_POSE = dict(base=180, shoulder=145, elbow=180, wrist=0, gripper=0)
+CUBE2_NEAR_POSE = dict(base=180, shoulder=50, elbow=100, wrist=0, gripper=0)
+CUBE2_FAR_POSE = dict(base=180, shoulder=0, elbow=100, wrist=180, gripper=0)
+CUBE_DECK_POSE = dict(base=90, shoulder=180, elbow=180, wrist=0, gripper=0)
+CUBE2_DECK_APPROACH_XYZ = (130, 0, 100)
+CUBE_CARRY_AND_DROP_XYZ = (220, 0, 120)
 POST_SLOW_JUNCTION_IGNORE_SECONDS = 0.4
 POST_STRAIGHT_JUNCTION_IGNORE_SECONDS = 0.5
 POST_JUNCTION_ACCEL_SECONDS = 0.5
@@ -218,20 +236,19 @@ ROUTE = [
     "R",
     "BUTTON2",
     "RSLOW",
-    "L",
+    "CUBE2",
     "RSLOW",
     "R",
     "S",
     "LSLOW",
-    "L",
+    "CUBE_DROP",
     "S",
     "FINISH",
-
-
 ]
 ALLOWED_ROUTE_COMMANDS = {
     "L", "R", "LSLOW", "RSLOW", "S", "SLOW",
-    "BUTTON", "BUTTON2", "CHARGING", "FIREFIGHTER", "CUBE1", "COLOR", "START", "FINISH",
+    "BUTTON", "BUTTON1", "BUTTON2", "CHARGING", "FIREFIGHTER",
+    "CUBE1", "CUBE2", "CUBE_DROP", "COLOR", "START", "FINISH",
 }
 line_follower = line_tracker.LineTrackingEngine(
     base_speed=BASE_SPEED,
@@ -639,6 +656,7 @@ def task_return(
     max_return_time=RETURN_MAX_TIME,
     line_loss_timeout=REVERSE_LINE_LOSS_TIMEOUT,
     recover_connection=None,
+    accept_s1_only=False,
 ):
     """Возврат назад с геометрически корректным регулятором."""
     heading = Heading(bus, offset, left_sign)
@@ -663,7 +681,7 @@ def task_return(
             state = line_tracker.update(calibration)
             left, right, candidate = detector.read(state)
             now = time.monotonic()
-            if not left and not right:
+            if not left and (accept_s1_only or not right):
                 cleared_count += 1
             if accept_any_junction:
                 outer_confirm_count = (
@@ -677,16 +695,17 @@ def task_return(
                 if outer_confirm_count >= JUNCTION_CONFIRM:
                     print(f"\n{label}: return junction found.")
                     return True
-            elif accept_s8_only:
+            elif accept_s1_only or accept_s8_only:
+                target_visible = left if accept_s1_only else right
                 outer_confirm_count = (
                     outer_confirm_count + 1
-                    if cleared_count >= JUNCTION_CLEAR and right
+                    if cleared_count >= JUNCTION_CLEAR and target_visible
                     else 0
                 )
                 if outer_confirm_count >= JUNCTION_CONFIRM:
                     print(
-                        f"\n{label}: return junction found by S8 "
-                        "(S1 is ignored for this task)."
+                        f"\n{label}: return junction found by "
+                        f"{'S1' if accept_s1_only else 'S8'}."
                     )
                     return True
 
@@ -724,13 +743,16 @@ def task_return(
             # При возврате CUBE1 датчик S1 не видит ответвление.
 
             # Не используем его для распознавания перекрёстка и выбора скорости.
-            candidate_visible = right if accept_s8_only else left != right
+            if accept_s1_only:
+                candidate_visible = left
+            else:
+                candidate_visible = right if accept_s8_only else left != right
             if label in ("BUTTON", "BUTTON2", "FIREFIGHTER") and button_first_edge_at is not None:
                 candidate_visible = True
             if candidate_visible:
                 if candidate_since is None:
                     candidate_since = now
-            elif accept_s8_only or (not left and not right):
+            elif accept_s1_only or accept_s8_only or (not left and not right):
                 candidate_since = None
             speed = RETURN_SLOW_SPEED if candidate_since is not None else RETURN_SPEED
             if label in ("BUTTON", "BUTTON2", "FIREFIGHTER") and button_first_edge_at is not None:
@@ -761,7 +783,10 @@ def button_task(
     if not ok or left_sign is None:
         return False
     print(f"\nBUTTON: follow line for {BUTTON_FORWARD_TIME:g} seconds.")
-    if not follow_for(calibration, BUTTON_FORWARD_TIME, recover_connection=recover_connection):
+    if not follow_for(
+        calibration, BUTTON_FORWARD_TIME, speed=BUTTON_FORWARD_PWM,
+        recover_connection=recover_connection,
+    ):
         return False
     if not task_return(
         calibration, detector, bus, offset, left_sign,
@@ -771,6 +796,199 @@ def button_task(
         return False
     print("\nBUTTON: final ordinary R, without forward approach.")
     ok, _ = pivot(bus, offset, "R")
+    return ok
+
+
+def cube_move_in_joints(arm, pose):
+    from arm_web import AUTO_MAX_STEP_DEG, STEP_DELAY
+    from button_arm import _return_home
+    _return_home(arm, pose, AUTO_MAX_STEP_DEG, STEP_DELAY)
+
+
+def cube_move_xyz(arm, target):
+    import arm_web
+    from button_arm import _execute_plan
+    arm_web.arm = arm
+    x, y, z = target
+    path, _ = arm_web.plan_auto_path({
+        "x": x, "y": y, "z": z, "orientation_mode": "auto",
+    })
+    _execute_plan(arm, path, arm_web.STEP_DELAY)
+
+
+def cube2_pick(arm, sensor, detection_started):
+    from arm_web import AUTO_MAX_STEP_DEG, STEP_DELAY
+
+    def grab_if_detected(wait_seconds):
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            sample = sensor.sample
+            if sample is not None and sample[1] >= detection_started and sensor.detected():
+                arm.write(gripper=CUBE_GRIP_CLOSED)
+                time.sleep(CUBE_GRIP_SETTLE_SECONDS)
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.02, remaining))
+
+    joints = ("base", "shoulder", "elbow", "wrist")
+    for _ in range(CUBE2_PICK_ATTEMPTS):
+        for pose in (CUBE2_NEAR_POSE, CUBE2_FAR_POSE):
+            current = {name: float(getattr(arm, name).angle) for name in joints}
+            max_delta = max(abs(pose[name] - current[name]) for name in joints)
+            steps = max(1, math.ceil(max_delta / AUTO_MAX_STEP_DEG))
+
+            if grab_if_detected(0):
+                return True
+            for index in range(1, steps + 1):
+                progress = index / steps
+                smooth = progress * progress * (3 - 2 * progress)
+                arm.write(**{
+                    name: round(current[name] + (pose[name] - current[name]) * smooth, 2)
+                    for name in joints
+                })
+                if grab_if_detected(STEP_DELAY):
+                    return True
+
+            if grab_if_detected(CUBE2_SENSOR_SECONDS):
+                return True
+    return False
+
+
+def cube2_task(calibration, bus, offset, board, camera, cargo):
+    """Leave the next junction for the main route loop if the search reaches it."""
+    from arm_web import START_ANGLES
+    from color_marker_detector import ColorMarkerDetector
+    from firefighter import Firefighter
+    from roboarm import get_shared_arm
+
+    if camera is None:
+        return False, False
+    ok, left_sign = pivot(bus, offset, CUBE2_TURN_DIRECTION)
+    if not ok or left_sign is None:
+        return False, False
+    cargo["left_sign"] = left_sign
+    arm, _ = get_shared_arm(board)
+    sensor = Firefighter(board)
+    sensor.initialize()
+    vision = ColorMarkerDetector(
+        min_object_area=BUTTON2_MIN_OBJECT_AREA,
+        stable_frames=BUTTON2_CONFIRM_FRAMES,
+        allowed_colors={"green"},
+    )
+    junction = JunctionDetector()
+    cube_move_in_joints(arm, CUBE2_SEARCH_POSE)
+    sequence = camera.sequence
+    start = last_frame = time.monotonic()
+    armed = True
+    clear_frames = junction_frames = 0
+    cleared_entry = False
+    line_follower.reset_steering()
+    camera.start_task("CUBE2: green in detection strip")
+    try:
+        while True:
+            if not line_tracker.all_channels_fresh():
+                print("CUBE2: stale line ADC.")
+                return False, False
+            state = line_tracker.update(calibration)
+            left, right, candidate = junction.read(state)
+            cleared_entry = cleared_entry or not (left or right or candidate)
+            now = time.monotonic()
+            junction_frames = (
+                junction_frames + 1 if cleared_entry and candidate
+                and now - start >= CUBE2_POST_TURN_IGNORE_SECONDS else 0
+            )
+            if junction_frames >= JUNCTION_CONFIRM:
+                stop()
+                cube_move_in_joints(arm, START_ANGLES)
+                return True, True
+            frame_data = camera.get_frame(after_sequence=sequence, timeout=0.01)
+            if frame_data is not None:
+                sequence, frame = frame_data
+                last_frame = time.monotonic()
+                width = frame.shape[1]
+                x0, x1 = (int(width * fraction) for fraction in CUBE2_DETECTION_X)
+                objects, annotated, confirmed = vision.process_frame(frame[:, x0:x1].copy())
+                preview = frame // 3
+                preview[:, x0:x1] = annotated
+                preview[:, x0:x0 + 2] = (0, 0, 255)
+                preview[:, x1 - 2:x1] = (0, 0, 255)
+                camera.publish_task_frame(preview, "CUBE2: green in detection strip")
+                clear_frames = 0 if objects else clear_frames + 1
+                if clear_frames >= BUTTON2_CONFIRM_FRAMES:
+                    armed = True
+                if armed and confirmed == "green" and state["position"] is not None:
+                    detection_started = time.monotonic()
+                    stop()
+                    if cube2_pick(arm, sensor, detection_started):
+                        if cargo["deck"]:
+                            cargo["held"] = True
+                            cube_move_xyz(arm, CUBE_CARRY_AND_DROP_XYZ)
+                            return True, False
+                        cube_move_xyz(arm, CUBE2_DECK_APPROACH_XYZ)
+                        cube_move_in_joints(arm, dict(
+                            CUBE_DECK_POSE, gripper=CUBE_GRIP_CLOSED
+                        ))
+                        arm.write(gripper=0)
+                        time.sleep(CUBE_GRIP_SETTLE_SECONDS)
+                        cargo["deck"] = True
+                    cube_move_in_joints(arm, CUBE2_SEARCH_POSE)
+                    vision.reset()
+                    sequence = camera.sequence
+                    last_frame = time.monotonic()
+                    armed = False
+                    clear_frames = 0
+                    line_follower.reset_steering()
+                    continue
+            elif now - last_frame > 0.5:
+                print("CUBE2: camera frames stopped.")
+                return False, False
+            if state["position"] is None:
+                stop()
+            else:
+                differential_drive(state, speed=CUBE2_DRIVE_PWM)
+            time.sleep(LOOP_DELAY)
+    finally:
+        stop()
+        camera.end_task()
+
+
+def cube_drop_task(calibration, detector, bus, offset, board, cargo):
+    """Unload the gripper and the deck in that order, then return like BUTTON."""
+    from arm_web import START_ANGLES
+    from roboarm import get_shared_arm
+
+    if not (cargo["held"] or cargo["deck"]):
+        ok, _ = pivot(bus, offset, "R")
+        return ok
+    if not follow_for(calibration, CUBE_DROP_FORWARD_TIME, speed=CUBE_DROP_FORWARD_PWM):
+        return False
+    arm, _ = get_shared_arm(board)
+    if cargo["held"]:
+        arm.write(gripper=0)
+        time.sleep(CUBE_GRIP_SETTLE_SECONDS)
+        cargo["held"] = False
+    if cargo["deck"]:
+        arm.write(gripper=0)
+        cube_move_in_joints(arm, CUBE_DECK_POSE)
+        cube_move_in_joints(arm, dict(CUBE_DECK_POSE, shoulder=160))
+        arm.write(gripper=CUBE_GRIP_CLOSED)
+        time.sleep(CUBE_GRIP_SETTLE_SECONDS)
+        cube_move_in_joints(arm, dict(CUBE_DECK_POSE, gripper=CUBE_GRIP_CLOSED))
+        cargo["held"], cargo["deck"] = True, False
+        cube_move_xyz(arm, CUBE_CARRY_AND_DROP_XYZ)
+        arm.write(gripper=0)
+        time.sleep(CUBE_GRIP_SETTLE_SECONDS)
+        cargo["held"] = False
+    cube_move_in_joints(arm, START_ANGLES)
+    if not task_return(
+        calibration, detector, bus, offset, cargo["left_sign"], label="CUBE_DROP",
+        accept_s1_only=True,
+        line_loss_timeout=BUTTON_REVERSE_LINE_LOSS_TIMEOUT,
+    ):
+        return False
+    ok, _ = pivot(bus, offset, "L")
     return ok
 
 
@@ -1540,6 +1758,8 @@ def color_marker_task(calibration, board, bus, offset, camera_stream=None):
         )
         if marker is None:
             print("COLOR: marker not found within 10 seconds; continue route.")
+        from arm_web import START_ANGLES
+        cube_move_in_joints(arm, START_ANGLES)
         return True
     except Exception as exc:
         print(f"\nCOLOR: camera/LED error: {exc}")
@@ -1871,13 +2091,14 @@ def load_route():
             raise ValueError(
                 f"Invalid ROUTE entry #{index}: {command!r}. "
                 "Allowed: L, R, LSLOW, RSLOW, S, SLOW, "
-                "BUTTON, CHARGING, FIREFIGHTER, CUBE1, COLOR, BUTTON2, START, FINISH."
+                "BUTTON, BUTTON1, BUTTON2, CHARGING, FIREFIGHTER, "
+                "CUBE1, CUBE2, CUBE_DROP, COLOR, START, FINISH."
             )
         if cmd == "FINISH" and index != len(ROUTE):
             raise ValueError("FINISH must be the last ROUTE entry.")
         if cmd == "START" and index != 1:
             raise ValueError("START must be the first ROUTE entry.")
-        route.append(cmd)
+        route.append("BUTTON" if cmd == "BUTTON1" else cmd)
     return route
 
 
@@ -2029,6 +2250,8 @@ def main():
             "Automatic route active."
         )
         route_index = 0
+        cargo = {"deck": False, "held": False, "left_sign": None}
+        next_junction_ready = False
         junction_count = 0
         candidate_count = 0
         junction_ignore_until = 0.0
@@ -2109,7 +2332,8 @@ def main():
                 candidate_count += 1
             else:
                 candidate_count = 0
-            if candidate_count >= JUNCTION_CONFIRM:
+            if next_junction_ready or candidate_count >= JUNCTION_CONFIRM:
+                next_junction_ready = False
                 print(
                     f"\nJUNCTION_DIAG TRIGGER "
                     f"source={junction_diag_source} "
@@ -2160,7 +2384,7 @@ def main():
                     ok = True
                 elif cmd in (
                     "L", "R", "LSLOW", "RSLOW", "BUTTON", "BUTTON2", "CHARGING",
-                    "FIREFIGHTER", "CUBE1",
+                    "FIREFIGHTER", "CUBE1", "CUBE2", "CUBE_DROP",
                 ):
 
                     # Гироскоп включаем только при необходимости поворота.
@@ -2170,7 +2394,7 @@ def main():
                     offset = gyro_calibrate(bus)
                     if cmd == "BUTTON":
 
-                        # BUTTON едет 2 секунды по линии, без датчика расстояния.
+                        # BUTTON едет по линии с отдельными временем и PWM.
                         ok = button_task(
                             calibration, detector, sensor, bus, offset, board,
                             recover_connection=recover_during_task,
@@ -2193,6 +2417,14 @@ def main():
                             recover_connection=recover_during_task,
                         )
                         board = board_state["board"]
+                    elif cmd == "CUBE2":
+                        ok, next_junction_ready = cube2_task(
+                            calibration, bus, offset, board, camera_stream, cargo,
+                        )
+                    elif cmd == "CUBE_DROP":
+                        ok = cube_drop_task(
+                            calibration, detector, bus, offset, board, cargo,
+                        )
                     elif cmd == "CHARGING":
                         ok = charging_task()
                         if ok:
@@ -2224,6 +2456,8 @@ def main():
                     "BUTTON2": BUTTON2_POST_TURN_IGNORE_SECONDS,
                     "FIREFIGHTER": FIREFIGHTER_POST_TURN_IGNORE_SECONDS,
                     "CUBE1": CUBE1_POST_TURN_IGNORE_SECONDS,
+                    "CUBE2": CUBE2_POST_TURN_IGNORE_SECONDS,
+                    "CUBE_DROP": CUBE_DROP_POST_TURN_IGNORE_SECONDS,
                 }
                 ignore_seconds = (
                     POST_STRAIGHT_JUNCTION_IGNORE_SECONDS if cmd == "S"
