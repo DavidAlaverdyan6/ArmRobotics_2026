@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Основной маршрут ArmRobotics: навигация и задания робота."""
 import math
+import threading
 import time
 import smbus
 from telemetrix import telemetrix
@@ -18,8 +19,9 @@ MAX_SPEED = 255
 MIN_SPEED = 0
 MANEUVER_SPEED = 230
 MANEUVER_MAX_SPEED = 255
+BUTTON_FORWARD_TIME = 1.0  # Время движения вперёд только для BUTTON, сек.
 KP = 65.0
-KD = 10.0
+KD = 15.0
 TARGET_POSITION = line_tracker.CENTER_POSITION
 LOOP_DELAY = 0.04
 # Восстановление пропущенного перекрёстка.
@@ -37,7 +39,8 @@ JUNCTION_CLEAR = 1
 POST_TURN_JUNCTION_IGNORE_SECONDS = 0.8
 BUTTON_POST_TURN_IGNORE_SECONDS = 1.0
 BUTTON2_POST_TURN_IGNORE_SECONDS = 0.8
-FIREFIGHTER_POST_TURN_IGNORE_SECONDS = 0.8
+BUTTON2_PRESS_IGNORE_TIME = 0.8  # Ignore junctions after BUTTON2 press and return
+FIREFIGHTER_POST_TURN_IGNORE_SECONDS = 0.9
 CUBE1_POST_TURN_IGNORE_SECONDS = 1
 POST_SLOW_JUNCTION_IGNORE_SECONDS = 0.4
 POST_STRAIGHT_JUNCTION_IGNORE_SECONDS = 0.5
@@ -80,14 +83,11 @@ TURN_CORRECTION_START_DEG = 4.0
 # Зарядка: красный мигает 9 с, затем зелёный горит 2 с; всего 11 с перед R.
 CHARGE_SECONDS = 10.0
 CHARGE_RED_SECONDS = 9.0
-CHARGE_BLINK_HALF_PERIOD = 0.25
+CHARGE_BLINK_HALF_PERIOD = 0.4
 
 # Геометрия следования по линии задним ходом (размеры в миллиметрах).
 
 # Линейный датчик находится на 70 мм впереди колёсной оси, поэтому при
-
-
-
 
 # движении назад он становится задним и требует другого регулятора.
 RETURN_SPEED = 130
@@ -160,11 +160,11 @@ CUBE1_RETURN_FORWARD_PWM = 80
 # COLOR: остановиться, найти цветной маркер и включить соответствующий RGB.
 COLOR_MARKER_TIMEOUT = 5.0
 COLOR_MARKER_HOLD_SECONDS = 0
-COLOR_MARKER_MIN_AREA = 700
-COLOR_MARKER_STABLE_FRAMES = 2
+COLOR_MARKER_MIN_AREA = 1000
+COLOR_MARKER_STABLE_FRAMES = 3
 COLOR_ARM_ANGLES = {
     "base": 90.0,
-    "shoulder": 160.0,
+    "shoulder": 140.0,
     "elbow": 180.0,
     "wrist": 0.0,
     "gripper": 180.0,
@@ -173,19 +173,25 @@ COLOR_LED_HOLD = None
 # BUTTON2: отдельные настройки PD только во время поиска цвета.
 BUTTON2_DRIVE_PWM = 80
 BUTTON2_MAX_PWM = 150
-BUTTON2_KP = 45.0
-BUTTON2_KD = 3.0
+BUTTON2_KP = 50.0
+BUTTON2_KD = 10.0
 BUTTON2_MIN_OBJECT_AREA = 1000
 BUTTON2_CONFIRM_FRAMES = 3
-BUTTON2_TARGET_X = (0.35, 0.65)
-BUTTON2_TARGET_Y = (0.50, 1.00)
+BUTTON2_TARGET_X = (0.27, 0.65)
+BUTTON2_TARGET_Y = (0.13, 0.58)
 BUTTON2_PRESS = (0.0, 250.0, -20.0)
 BUTTON2_PREP_GRIPPER_DEG = 180
 BUTTON2_PREP_BASE_DEG = 180
 BUTTON2_PREP_SHOULDER_DEG = 140
 BUTTON2_PREP_SETTLE_SECONDS = 0.3
 BUTTON2_PRESS_SHOULDER_DEG = 180
-BUTTON2_REVERSE_LINE_TIMEOUT = 0.5 #?
+BUTTON2_END_LINE_CONFIRM_CYCLES = 3
+BUTTON2_TURN_180_ANGLE = 175.0
+BUTTON2_TURN_180_PWM = 120  # Equal and opposite wheel PWM: pivot in place.
+BUTTON2_HOME_SHOULDER_DEG = 170
+BUTTON2_HOME_BASE_DEG = 90
+BUTTON2_MIRROR_BASE_DEG = 0
+BUTTON2_RED_LED_SECONDS = 1.0
 
 # Автоматический маршрут: по одной команде на каждый найденный перекрёсток.
 
@@ -621,7 +627,7 @@ def wait_for_reverse_adc(timeout=0.75):
     return line_tracker.all_channels_fresh()
 
 
-def button_return(
+def task_return(
     calibration,
     detector,
     bus,
@@ -686,7 +692,7 @@ def button_return(
 
             # BUTTON: запоминаем срабатывания краёв в коротком окне.
             # Не требуем одновременной чёрной линии на S1 и S8.
-            elif label in ("BUTTON", "BUTTON2"):
+            elif label in ("BUTTON", "BUTTON2", "FIREFIGHTER"):
                 if cleared_count >= JUNCTION_CLEAR:
                     if button_first_edge_at is not None and (
                         now - button_first_edge_at > BUTTON_RETURN_JUNCTION_WINDOW
@@ -719,7 +725,7 @@ def button_return(
 
             # Не используем его для распознавания перекрёстка и выбора скорости.
             candidate_visible = right if accept_s8_only else left != right
-            if label in ("BUTTON", "BUTTON2") and button_first_edge_at is not None:
+            if label in ("BUTTON", "BUTTON2", "FIREFIGHTER") and button_first_edge_at is not None:
                 candidate_visible = True
             if candidate_visible:
                 if candidate_since is None:
@@ -727,7 +733,7 @@ def button_return(
             elif accept_s8_only or (not left and not right):
                 candidate_since = None
             speed = RETURN_SLOW_SPEED if candidate_since is not None else RETURN_SPEED
-            if label in ("BUTTON", "BUTTON2") and button_first_edge_at is not None:
+            if label in ("BUTTON", "BUTTON2", "FIREFIGHTER") and button_first_edge_at is not None:
                 speed = BUTTON_RETURN_JUNCTION_SLOW_SPEED
             if not differential_reverse(state, speed, reverse_controller):
                 print(f"\n{label}: line lost too long while reversing.")
@@ -749,15 +755,15 @@ def button_return(
 def button_task(
     calibration, detector, sensor, bus, offset, board, recover_connection=None,
 ):
-    """Проверенные повороты и двухсекундное движение по линии."""
+    """Поворот и движение по линии в течение BUTTON_FORWARD_TIME секунд."""
     print("\nBUTTON: turn LEFT.")
     ok, left_sign = pivot(bus, offset, "L")
     if not ok or left_sign is None:
         return False
-    print("\nBUTTON: follow line for 2 seconds.")
-    if not follow_for(calibration, 2.0, recover_connection=recover_connection):
+    print(f"\nBUTTON: follow line for {BUTTON_FORWARD_TIME:g} seconds.")
+    if not follow_for(calibration, BUTTON_FORWARD_TIME, recover_connection=recover_connection):
         return False
-    if not button_return(
+    if not task_return(
         calibration, detector, bus, offset, left_sign,
         line_loss_timeout=BUTTON_REVERSE_LINE_LOSS_TIMEOUT,
         recover_connection=recover_connection,
@@ -1196,7 +1202,7 @@ def cube1_task(
                 return False
         # Возвращаемся по линии к тому же перекрёстку.
         # Используем геометрический контроллер заднего хода и гироскоп.
-        if not button_return(
+        if not task_return(
             calibration, detector, bus, offset, left_sign,
             label="CUBE1", accept_s8_only=True,
             max_return_time=RETURN_MAX_TIME, line_loss_timeout=None,
@@ -1401,14 +1407,13 @@ def firefighter_task(
             print("\nF: no-flame fallback complete; returning along the line.")
         stop()
         _return_home(arm, START_ANGLES, AUTO_MAX_STEP_DEG, STEP_DELAY)
-        if not button_return(
+        if not task_return(
             calibration,
             detector,
             bus,
             offset,
             left_sign,
             label="FIREFIGHTER",
-            accept_any_junction=True,
             line_loss_timeout=BUTTON_REVERSE_LINE_LOSS_TIMEOUT,
             recover_connection=lambda stage: reconnect_fire(stage),
         ):
@@ -1550,21 +1555,33 @@ def color_marker_task(calibration, board, bus, offset, camera_stream=None):
         stop()
 
 
-def button2_prepare_arm(board):
-    """Сначала BASE 180, затем SHOULDER 140; захват закрыт."""
+def button2_prepare_arm(board, *, mirrored=False):
+    """Search pose: base 180 initially, base 0 after the end-of-line U-turn."""
     from roboarm import get_shared_arm
     stop()
     arm, _ = get_shared_arm(board)
     arm.write(gripper=BUTTON2_PREP_GRIPPER_DEG)
-    arm.write(base=BUTTON2_PREP_BASE_DEG)
+    arm.write(base=BUTTON2_MIRROR_BASE_DEG if mirrored else BUTTON2_PREP_BASE_DEG)
     time.sleep(BUTTON2_PREP_SETTLE_SECONDS)
     arm.write(shoulder=BUTTON2_PREP_SHOULDER_DEG)
     time.sleep(BUTTON2_PREP_SETTLE_SECONDS)
     return arm
 
 
-def button2_press_and_home(board):
-    """Поднять плечо, нажать по IK с автоматической кистью, сложить руку."""
+def button2_fold_arm(board):
+    """Before every U-turn: shoulder 170 first, then base 90."""
+    from roboarm import get_shared_arm
+    stop()
+    arm, _ = get_shared_arm(board)
+    arm.write(shoulder=BUTTON2_HOME_SHOULDER_DEG)
+    time.sleep(BUTTON2_PREP_SETTLE_SECONDS)
+    arm.write(base=BUTTON2_HOME_BASE_DEG)
+    time.sleep(BUTTON2_PREP_SETTLE_SECONDS)
+    return arm
+
+
+def button2_press_and_home(board, *, mirrored=False):
+    """Press red with original or mirrored Y; then fold before moving."""
     import arm_web
     from button_arm import _execute_plan, _return_home
     from roboarm import get_shared_arm
@@ -1575,6 +1592,8 @@ def button2_press_and_home(board):
     time.sleep(BUTTON2_PREP_SETTLE_SECONDS)
     arm_web.arm = arm
     x, y, z = BUTTON2_PRESS
+    if mirrored:
+        y = -y
     path, pitch = arm_web.plan_auto_path({
         "x": x, "y": y, "z": z, "orientation_mode": "auto",
     })
@@ -1585,16 +1604,76 @@ def button2_press_and_home(board):
         arm, arm_web.START_ANGLES, arm_web.AUTO_MAX_STEP_DEG,
         arm_web.STEP_DELAY,
     )
+    # Explicitly ensure the safe turn pose even if START_ANGLES differs.
+    button2_fold_arm(board)
     return True
 
 
+def button2_red_indicator():
+    """Light red asynchronously for one second while arm moves over UART."""
+    def worker():
+        rgb = None
+        try:
+            rgb = create_color_rgb_indicator()
+            rgb.red()
+            print(f"BUTTON2: RED indicator for {BUTTON2_RED_LED_SECONDS:g}s (parallel to arm).")
+            time.sleep(BUTTON2_RED_LED_SECONDS)
+        except Exception as exc:
+            print(f"BUTTON2: RGB unavailable ({exc}); arm continues.")
+        finally:
+            if rgb is not None:
+                try:
+                    rgb.off()
+                    rgb.close()
+                except Exception as exc:
+                    print(f"BUTTON2: RGB cleanup failed ({exc}).")
+
+    thread = threading.Thread(target=worker, name="button2-red-led", daemon=True)
+    thread.start()
+    return thread
+
+
+def button2_return_to_junction(calibration, detector, bus, offset):
+    """After pressing, ignore crossings briefly, then turn right at the next one."""
+    detector.left_black = False
+    detector.right_black = False
+    ignore_until = time.monotonic() + BUTTON2_PRESS_IGNORE_TIME
+    confirmed = 0
+    print(f"BUTTON2: follow forward; ignore junctions for {BUTTON2_PRESS_IGNORE_TIME:g}s.")
+    try:
+        while True:
+            if not line_tracker.all_channels_fresh():
+                stop()
+                print("BUTTON2: ADC stale on return to junction.")
+                return False
+            state = line_tracker.update(calibration)
+            left, right, candidate = detector.read(state)
+            if time.monotonic() >= ignore_until and candidate:
+                confirmed += 1
+            else:
+                confirmed = 0
+            if confirmed >= JUNCTION_CONFIRM:
+                stop()
+                print("\nBUTTON2: return junction reached; final ordinary RIGHT turn.")
+                ok, _ = pivot(bus, offset, "R")
+                return ok
+            if state["position"] is None:
+                stop()
+                print("\nBUTTON2: line lost on return to junction; waiting for line.")
+            else:
+                differential_drive(state, speed=BASE_SPEED, max_speed=MAX_SPEED)
+            time.sleep(LOOP_DELAY)
+    finally:
+        stop()
+
+
 def button2_find_color(calibration, camera_stream, recover=None):
-    """Следовать по линии с отдельным PD до цвета в нижней центральной зоне."""
+    """Return 'red' or 'line_end'; never reverse or press for green/blue."""
     import cv2
     from color_marker_detector import ColorMarkerDetector
     if camera_stream is None:
         print("BUTTON2: camera unavailable.")
-        return False
+        return None
     camera = camera_stream
     detector = ColorMarkerDetector(
         min_object_area=BUTTON2_MIN_OBJECT_AREA,
@@ -1604,6 +1683,7 @@ def button2_find_color(calibration, camera_stream, recover=None):
     sequence = camera.sequence
     locked_color = None
     centered_frames = 0
+    missing_line_cycles = 0
     last_frame_at = time.monotonic()
     bounce_follower = line_tracker.LineTrackingEngine(
         base_speed=BUTTON2_DRIVE_PWM,
@@ -1620,26 +1700,39 @@ def button2_find_color(calibration, camera_stream, recover=None):
             if not line_tracker.all_channels_fresh():
                 stop()
                 if recover is None or not recover():
-                    return False
+                    return None
                 sequence = camera.sequence
                 last_frame_at = time.monotonic()
                 detector.reset()
                 locked_color = None
                 centered_frames = 0
+                missing_line_cycles = 0
                 continue
             state = line_tracker.update(calibration)
             if state["position"] is None:
+                missing_line_cycles += 1
+                if missing_line_cycles >= BUTTON2_END_LINE_CONFIRM_CYCLES:
+                    stop()
+                    print("\nBUTTON2: end of line; fold arm and U-turn, no reverse.")
+                    return "line_end"
+                # Do not advance farther off the line while confirming its end.
                 stop()
-                print("\\nBUTTON2: line lost.")
-                return False
+                time.sleep(LOOP_DELAY)
+                continue
+            missing_line_cycles = 0
             captured = camera.get_frame(after_sequence=sequence, timeout=0.01)
             if captured is not None:
                 sequence, frame = captured
                 last_frame_at = time.monotonic()
                 objects, annotated, confirmed_color = detector.process_frame(frame)
-                if locked_color is None and confirmed_color in ("red", "green", "blue"):
-                    locked_color = confirmed_color
-                    print(f"\\nBUTTON2: locked {locked_color}.")
+                if confirmed_color in ("red", "green", "blue"):
+                    if confirmed_color == "red":
+                        locked_color = "red"
+                    else:
+                        print(f"\nBUTTON2: detected {confirmed_color}; ignoring for press.")
+                        locked_color = None
+                else:
+                    locked_color = None
                 height, width = frame.shape[:2]
                 x1 = int(width * BUTTON2_TARGET_X[0])
                 x2 = int(width * BUTTON2_TARGET_X[1])
@@ -1648,7 +1741,7 @@ def button2_find_color(calibration, camera_stream, recover=None):
                 cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 255, 255), 2)
                 target = next((
                     obj for obj in objects
-                    if obj["color"] == locked_color
+                    if obj["color"] == "red"
                     and obj["x"] < x2
                     and obj["x"] + obj["w"] > x1
                     and obj["y"] < y2
@@ -1662,12 +1755,12 @@ def button2_find_color(calibration, camera_stream, recover=None):
                 )
                 if centered_frames >= BUTTON2_CONFIRM_FRAMES:
                     stop()
-                    print(f"\\nBUTTON2: {locked_color} in lower center.")
-                    return True
+                    print("\nBUTTON2: RED in target zone; pressing button.")
+                    return "red"
             elif time.monotonic() - last_frame_at > 0.5:
                 stop()
-                print("\\nBUTTON2: camera frames stopped.")
-                return False
+                print("\nBUTTON2: camera frames stopped.")
+                return None
             bounce_follower.drive(
                 state, speed=BUTTON2_DRIVE_PWM,
                 max_speed=BUTTON2_MAX_PWM,
@@ -1680,42 +1773,74 @@ def button2_find_color(calibration, camera_stream, recover=None):
         camera.end_task()
 
 
+def button2_u_turn(bus, offset):
+    """CCW viewed from above: robot rear swings to the right."""
+    print("\nBUTTON2: gyro U-turn 180 degrees CCW (rear to the right).")
+    # Unlike the route pivot(), rotate around the midpoint of the wheel axle.
+    # Left wheel backwards, right wheel forwards: counterclockwise from above.
+    pwm = BUTTON2_TURN_180_PWM
+    motors.set_speeds(-pwm, pwm)
+    start = previous = time.monotonic()
+    angle = 0.0
+    try:
+        while angle < BUTTON2_TURN_180_ANGLE:
+            now = time.monotonic()
+            rate = gyro_rate(bus, offset)
+            dt = max(0.0, now - previous)
+            previous = now
+            angle += abs(rate) * dt
+            if now - start >= GYRO_TIMEOUT:
+                print("\nBUTTON2: in-place U-turn timeout.")
+                return False
+            time.sleep(0.005)
+        return True
+    finally:
+        stop()
+
+
 def button2_task(
     calibration, detector, bus, offset, board, camera_stream=None,
     recover_connection=None,
 ):
-    """R, подготовка руки, цвет в нижней части кадра, нажатие, возврат, L."""
+    """Search red, press, and leave FORWARD only; optionally U-turn at line end."""
     stop()
+    led_thread = None
     try:
-        print("\\nBUTTON2: ordinary R.")
-        ok, turn_sign = pivot(bus, offset, "R")
-        if not ok or turn_sign is None:
+        print("\nBUTTON2: ordinary R.")
+        ok, _ = pivot(bus, offset, "R")
+        if not ok:
             return False
-        stop()
         button2_prepare_arm(board)
-        if not button2_find_color(
-            calibration, camera_stream,
-            recover=(lambda: recover_connection("BUTTON2 color search")
-                     is not None) if recover_connection else None,
-        ):
+        recover = (lambda: recover_connection("BUTTON2 color search") is not None) if recover_connection else None
+        outcome = button2_find_color(calibration, camera_stream, recover=recover)
+        mirrored = False
+        if outcome == "line_end":
+            button2_fold_arm(board)
+            if not button2_u_turn(bus, offset):
+                return False
+            mirrored = True
+            button2_prepare_arm(board, mirrored=True)
+            outcome = button2_find_color(calibration, camera_stream, recover=recover)
+        if outcome != "red":
+            print(f"\nBUTTON2: red not found; search result={outcome}.")
             return False
-        if not button2_press_and_home(board):
+        led_thread = button2_red_indicator()
+        if not button2_press_and_home(board, mirrored=mirrored):
             return False
-        if not button_return(
-            calibration, detector, bus, offset, turn_sign,
-            label="BUTTON2",
-            line_loss_timeout=BUTTON2_REVERSE_LINE_TIMEOUT,
-            recover_connection=recover_connection,
-        ):
-            return False
-        print("\\nBUTTON2: final ordinary L without forward approach.")
-        ok, _ = pivot(bus, offset, "L")
-        return ok
+        if not mirrored:
+            # Original direction faces away from the junction; turn to face it.
+            if not button2_u_turn(bus, offset):
+                return False
+        # In the mirrored scenario the robot already faces the junction.
+        # The return and final right turn belong to BUTTON2, not ROUTE.
+        return button2_return_to_junction(calibration, detector, bus, offset)
     except Exception as exc:
-        print(f"\\nBUTTON2: {exc}")
+        print(f"\nBUTTON2: {exc}")
         return False
     finally:
         stop()
+        if led_thread is not None:
+            led_thread.join()
 
 
 def reverse_for_short_turn(seconds, speed):
