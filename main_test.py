@@ -3,6 +3,7 @@
 import math
 import threading
 import time
+from contextlib import contextmanager
 import smbus
 from telemetrix import telemetrix
 import line_tracker
@@ -38,9 +39,9 @@ JUNCTION_CENTER_MIN = 0.50
 JUNCTION_CONFIRM = 1
 JUNCTION_CLEAR = 1
 POST_TURN_JUNCTION_IGNORE_SECONDS = 0.7
-BUTTON_POST_TURN_IGNORE_SECONDS = 1.0
+BUTTON_POST_TURN_IGNORE_SECONDS = 0.8
 BUTTON2_POST_TURN_IGNORE_SECONDS = 0.8
-BUTTON2_PRESS_IGNORE_TIME = 0.7  # Ignore junctions after BUTTON2 press and return
+BUTTON2_PRESS_IGNORE_TIME = 0.8  # Ignore junctions after BUTTON2 press and return
 FIREFIGHTER_POST_TURN_IGNORE_SECONDS = 0.8
 CUBE1_POST_TURN_IGNORE_SECONDS = 0.7
 CUBE2_POST_TURN_IGNORE_SECONDS = 0.7
@@ -176,13 +177,44 @@ CUBE1_RETURN_FORWARD_SECONDS = 0.5
 CUBE1_RETURN_FORWARD_PWM = 80
 
 # COLOR: остановиться, найти цветной маркер и включить соответствующий RGB.
+# Формат диапазона [[H_min, S_min, V_min], [H_max, S_max, V_max]].
+# H: 0–179, S и V: 0–255. None берёт данные из color_calibration.json.
+COLOR_HSV_OVERRIDES = {
+    "red": [
+        ([0, 67, 60], [22, 255, 255]),
+        ([158, 67, 60], [179, 255, 255]),
+    ],
+    "green": [
+        ([34, 43, 60], [85, 255, 255]),
+    ],
+    "blue": [
+        ([95, 120, 100], [135, 255, 255]),
+    ],
+}
+
+# Пример значения: [([0, 30, 120], [10, 255, 255]), ([170, 30, 120], [179, 255, 255])]
+# Узкий диапазон красного для BUTTON2, отдельно от задания COLOR.
+BUTTON2_RED_HSV_OVERRIDE = [
+    ([0, 67, 60], [12, 255, 255]),
+    ([168, 67, 60], [179, 255, 255]),
+]
+BUTTON2_RED_HUE_MARGIN = 0
+BUTTON2_RED_SATURATION_MARGIN = 18
+BUTTON2_RED_VALUE_MARGIN = 25
+BUTTON2_RED_MIN_SATURATION = 8
+BUTTON2_RED_MIN_VALUE = 80
+
+COLOR_EXPOSURE_US = 2_000
+COLOR_ANALOGUE_GAIN = 1.0
+COLOR_EXPOSURE_SETTLE_SECONDS = 0.5
+
 COLOR_MARKER_TIMEOUT = 5.0
 COLOR_MARKER_HOLD_SECONDS = 0
 COLOR_MARKER_MIN_AREA = 1000
 COLOR_MARKER_STABLE_FRAMES = 3
 COLOR_ARM_ANGLES = {
     "base": 90.0,
-    "shoulder": 140.0,
+    "shoulder": 138.0,
     "elbow": 180.0,
     "wrist": 0.0,
     "gripper": 180.0,
@@ -193,10 +225,9 @@ BUTTON2_DRIVE_PWM = 80
 BUTTON2_MAX_PWM = 150
 BUTTON2_KP = 50.0
 BUTTON2_KD = 10.0
-BUTTON2_MIN_OBJECT_AREA = 1000
+BUTTON2_MIN_OBJECT_AREA = 1000  # Используется поиском кубиков CUBE2.
+BUTTON2_RED_MIN_OBJECT_AREA = 1000
 BUTTON2_CONFIRM_FRAMES = 3
-BUTTON2_TARGET_X = (0.27, 0.65)
-BUTTON2_TARGET_Y = (0.13, 0.58)
 BUTTON2_PRESS = (0.0, 250.0, -20.0)
 BUTTON2_PREP_GRIPPER_DEG = 180
 BUTTON2_PREP_BASE_DEG = 180
@@ -236,13 +267,14 @@ ROUTE = [
     # "R",
     # "FIREFIGHTER",
     "BUTTON2",
-    "R",
     "L",
+    "CUBE2",
     "R",
     "S",
     "R",
+    "S",
     "L", 
-    "L",
+    "CUBE_DROP",
     "S",
     "FINISH",
 ]
@@ -1715,7 +1747,7 @@ def create_color_rgb_indicator():
     return rgb
 
 
-def calibrated_color_detector(**options):
+def calibrated_color_detector(*, button_red_only=False, **options):
     """Use the camera HSV profile for COLOR and BUTTON2 only."""
     import json
     from pathlib import Path
@@ -1723,15 +1755,26 @@ def calibrated_color_detector(**options):
     import numpy as np
     from color_marker_detector import COLOR_NAMES, ColorMarkerDetector
 
+    allowed_colors = {"red"} if button_red_only else {"red", "green", "blue"}
     path = Path(__file__).with_name("color_calibration.json")
     try:
-        with path.open(encoding="utf-8") as source:
-            profile = json.load(source)
+        overrides = COLOR_HSV_OVERRIDES.copy()
+        if button_red_only and BUTTON2_RED_HSV_OVERRIDE is not None:
+            overrides["red"] = BUTTON2_RED_HSV_OVERRIDE
+        needs_json = any(overrides.get(name) is None for name in allowed_colors)
+        profile = {}
+        if needs_json:
+            with path.open(encoding="utf-8") as source:
+                profile = json.load(source)
         bounds = {}
         for color_id, name in COLOR_NAMES.items():
-            if name not in {"red", "green", "blue"}:
+            if name not in allowed_colors:
                 continue
-            ranges = profile[name]
+            override = overrides.get(name)
+            if override is None:
+                ranges = profile[name]
+            else:
+                ranges = [{"lower": lower, "upper": upper} for lower, upper in override]
             if not isinstance(ranges, list) or not ranges:
                 raise ValueError(f"{name}: missing HSV ranges")
             bounds[color_id] = []
@@ -1753,21 +1796,60 @@ def calibrated_color_detector(**options):
             colors = np.zeros(frame.shape[:2], dtype=np.uint8)
             for color_id, ranges in bounds.items():
                 for lower, upper in ranges:
-                    match = cv2.inRange(hsv, lower, upper) != 0
+                    if button_red_only:
+                        hue = hsv[:, :, 0].astype(np.int16)
+                        start = (lower[0] - BUTTON2_RED_HUE_MARGIN) % 180
+                        span = min(179, upper[0] - lower[0] + 2 * BUTTON2_RED_HUE_MARGIN)
+                        match = (
+                            ((hue - start) % 180 <= span)
+                            & (hsv[:, :, 1] >= max(
+                                BUTTON2_RED_MIN_SATURATION, lower[1] - BUTTON2_RED_SATURATION_MARGIN
+                            ))
+                            & (hsv[:, :, 2] >= max(
+                                BUTTON2_RED_MIN_VALUE, lower[2] - BUTTON2_RED_VALUE_MARGIN
+                            ))
+                        )
+                    else:
+                        match = cv2.inRange(hsv, lower, upper) != 0
                     colors[match & (colors == 0)] = color_id
             return colors
 
-    print(f"COLOR: loaded {path.name}.")
-    return CalibratedDetector(allowed_colors={"red", "green", "blue"}, **options)
+    source = path.name if needs_json else "manual HSV settings"
+    if needs_json and any(overrides.get(name) is not None for name in allowed_colors):
+        source += " + manual HSV settings"
+    print(f"COLOR: loaded {source}.")
+    return CalibratedDetector(allowed_colors=allowed_colors, **options)
+
+
+@contextmanager
+def color_exposure(camera_stream, *, start_if_missing=False):
+    """Use the lamp-test exposure only while looking for a color."""
+    if camera_stream is None and not start_if_missing:
+        yield None
+        return
+
+    owns_camera = camera_stream is None
+    if owns_camera:
+        from color_marker_detector import ContinuousCamera
+        camera_stream = ContinuousCamera(port=8000)
+        camera_stream.start()
+
+    try:
+        camera_stream.camera.set_controls({
+            "AeEnable": False,
+            "ExposureTime": COLOR_EXPOSURE_US,
+            "AnalogueGain": COLOR_ANALOGUE_GAIN,
+        })
+        time.sleep(COLOR_EXPOSURE_SETTLE_SECONDS)
+        yield camera_stream
+    finally:
+        if owns_camera:
+            camera_stream.stop()
+        else:
+            camera_stream.camera.set_controls({"AeEnable": True})
 
 
 def run_calibrated_color(detector, camera, on_confirm):
-    from color_marker_detector import ContinuousCamera
-
-    owns_camera = camera is None
-    if owns_camera:
-        camera = ContinuousCamera(port=8000)
-        camera.start()
     try:
         camera.start_task("COLOR: searching with calibrated HSV")
         sequence = camera.sequence
@@ -1790,8 +1872,6 @@ def run_calibrated_color(detector, camera, on_confirm):
         return None
     finally:
         camera.end_task()
-        if owns_camera:
-            camera.stop()
 
 
 def color_marker_task(calibration, board, bus, offset, camera_stream=None):
@@ -1830,19 +1910,20 @@ def color_marker_task(calibration, board, bus, offset, camera_stream=None):
             min_object_area=COLOR_MARKER_MIN_AREA,
             stable_frames=COLOR_MARKER_STABLE_FRAMES,
         )
-        if detector is not None:
-            marker = run_calibrated_color(detector, camera_stream, light_confirmed_color)
-        else:
-            marker = run_color_marker_task(
-                timeout_s=COLOR_MARKER_TIMEOUT,
-                hold_seconds=COLOR_MARKER_HOLD_SECONDS,
-                min_object_area=COLOR_MARKER_MIN_AREA,
-                stable_frames=COLOR_MARKER_STABLE_FRAMES,
-                control_led=False,
-                confirmation_callback=light_confirmed_color,
-                preview_port=None if camera_stream is not None else 8000,
-                camera_stream=camera_stream,
-            )
+        with color_exposure(camera_stream, start_if_missing=True) as camera:
+            if detector is not None:
+                marker = run_calibrated_color(detector, camera, light_confirmed_color)
+            else:
+                marker = run_color_marker_task(
+                    timeout_s=COLOR_MARKER_TIMEOUT,
+                    hold_seconds=COLOR_MARKER_HOLD_SECONDS,
+                    min_object_area=COLOR_MARKER_MIN_AREA,
+                    stable_frames=COLOR_MARKER_STABLE_FRAMES,
+                    control_led=False,
+                    confirmation_callback=light_confirmed_color,
+                    preview_port=None,
+                    camera_stream=camera,
+                )
         if marker is None:
             print("COLOR: marker not found within 10 seconds; continue route.")
         from arm_web import START_ANGLES
@@ -1974,27 +2055,25 @@ def button2_return_to_junction(calibration, detector, bus, offset):
         stop()
 
 
-def button2_find_color(calibration, camera_stream, recover=None):
+def button2_find_color(calibration, camera_stream, recover=None, *, ignore_until=0.0):
     """Return 'red' or 'line_end'; never reverse or press for green/blue."""
-    import cv2
     from color_marker_detector import ColorMarkerDetector
     if camera_stream is None:
         print("BUTTON2: camera unavailable.")
         return None
     camera = camera_stream
     detector = calibrated_color_detector(
-        min_object_area=BUTTON2_MIN_OBJECT_AREA,
-        stable_frames=BUTTON2_CONFIRM_FRAMES,
+        button_red_only=True,
+        min_object_area=BUTTON2_RED_MIN_OBJECT_AREA,
+        stable_frames=1,
     )
     if detector is None:
         detector = ColorMarkerDetector(
-            min_object_area=BUTTON2_MIN_OBJECT_AREA,
-            stable_frames=BUTTON2_CONFIRM_FRAMES,
-            allowed_colors={"red", "green", "blue"},
+            min_object_area=BUTTON2_RED_MIN_OBJECT_AREA,
+            stable_frames=1,
+            allowed_colors={"red"},
         )
     sequence = camera.sequence
-    locked_color = None
-    centered_frames = 0
     missing_line_cycles = 0
     last_frame_at = time.monotonic()
     bounce_follower = line_tracker.LineTrackingEngine(
@@ -2006,7 +2085,7 @@ def button2_find_color(calibration, camera_stream, recover=None):
         target_position=TARGET_POSITION,
     )
     bounce_follower.reset_steering()
-    camera.start_task("BUTTON2: searching red/green/blue")
+    camera.start_task("BUTTON2: searching for red")
     try:
         while True:
             if not line_tracker.all_channels_fresh():
@@ -2016,13 +2095,12 @@ def button2_find_color(calibration, camera_stream, recover=None):
                 sequence = camera.sequence
                 last_frame_at = time.monotonic()
                 detector.reset()
-                locked_color = None
-                centered_frames = 0
                 missing_line_cycles = 0
                 continue
             state = line_tracker.update(calibration)
             if state["position"] is None:
-                missing_line_cycles += 1
+                if time.monotonic() >= ignore_until:
+                    missing_line_cycles += 1
                 if missing_line_cycles >= BUTTON2_END_LINE_CONFIRM_CYCLES:
                     stop()
                     print("\nBUTTON2: end of line; fold arm and U-turn, no reverse.")
@@ -2036,38 +2114,14 @@ def button2_find_color(calibration, camera_stream, recover=None):
             if captured is not None:
                 sequence, frame = captured
                 last_frame_at = time.monotonic()
-                objects, annotated, confirmed_color = detector.process_frame(frame)
-                if confirmed_color in ("red", "green", "blue"):
-                    if confirmed_color == "red":
-                        locked_color = "red"
-                    else:
-                        print(f"\nBUTTON2: detected {confirmed_color}; ignoring for press.")
-                        locked_color = None
+                if last_frame_at < ignore_until:
+                    annotated, confirmed_color = frame, None
                 else:
-                    locked_color = None
-                height, width = frame.shape[:2]
-                x1 = int(width * BUTTON2_TARGET_X[0])
-                x2 = int(width * BUTTON2_TARGET_X[1])
-                y1 = int(height * BUTTON2_TARGET_Y[0])
-                y2 = int(height * BUTTON2_TARGET_Y[1])
-                cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 255, 255), 2)
-                target = next((
-                    obj for obj in objects
-                    if obj["color"] == "red"
-                    and obj["x"] < x2
-                    and obj["x"] + obj["w"] > x1
-                    and obj["y"] < y2
-                    and obj["y"] + obj["h"] > y1
-                ), None)
-                centered_frames = centered_frames + 1 if target else 0
-                camera.publish_task_frame(
-                    annotated,
-                    f"BUTTON2: {locked_color or 'searching'} "
-                    f"target {centered_frames}/{BUTTON2_CONFIRM_FRAMES}",
-                )
-                if centered_frames >= BUTTON2_CONFIRM_FRAMES:
+                    _, annotated, confirmed_color = detector.process_frame(frame)
+                camera.publish_task_frame(annotated, "BUTTON2: red button search")
+                if confirmed_color == "red":
                     stop()
-                    print("\nBUTTON2: RED in target zone; pressing button.")
+                    print("\nBUTTON2: RED detected; pressing button.")
                     return "red"
             elif time.monotonic() - last_frame_at > 0.5:
                 stop()
@@ -2122,17 +2176,25 @@ def button2_task(
         ok, _ = pivot(bus, offset, "R")
         if not ok:
             return False
+        ignore_until = time.monotonic() + BUTTON2_POST_TURN_IGNORE_SECONDS
         button2_prepare_arm(board)
         recover = (lambda: recover_connection("BUTTON2 color search") is not None) if recover_connection else None
-        outcome = button2_find_color(calibration, camera_stream, recover=recover)
+        with color_exposure(camera_stream) as camera:
+            outcome = button2_find_color(
+                calibration, camera, recover=recover, ignore_until=ignore_until,
+            )
         mirrored = False
         if outcome == "line_end":
             button2_fold_arm(board)
             if not button2_u_turn(bus, offset):
                 return False
+            ignore_until = time.monotonic() + BUTTON2_POST_TURN_IGNORE_SECONDS
             mirrored = True
             button2_prepare_arm(board, mirrored=True)
-            outcome = button2_find_color(calibration, camera_stream, recover=recover)
+            with color_exposure(camera_stream) as camera:
+                outcome = button2_find_color(
+                    calibration, camera, recover=recover, ignore_until=ignore_until,
+                )
         if outcome != "red":
             print(f"\nBUTTON2: red not found; search result={outcome}.")
             return False
