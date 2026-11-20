@@ -14,14 +14,14 @@ PROGRAM_BUILD = "cube-fire-2026-11-10.1"
 
 # Ранее проверенные скорости контроллера differential2.
 SERIAL_PORT = "/dev/serial0"
-BASE_SPEED = 200
+BASE_SPEED = 190
 MAX_SPEED = 255
 MIN_SPEED = 0
 MANEUVER_SPEED = 230
 MANEUVER_MAX_SPEED = 255
 BUTTON_FORWARD_PWM = 150
-BUTTON_FORWARD_TIME = 1.0  # Время движения вперёд только для BUTTON, сек.
-KP = 65.0
+BUTTON_FORWARD_TIME = 1.5  # Время движения вперёд только для BUTTON, сек.
+KP = 70.0
 KD = 15.0
 TARGET_POSITION = line_tracker.CENTER_POSITION
 LOOP_DELAY = 0.04
@@ -37,15 +37,15 @@ JUNCTION_SIDE_SUPPORT_OFF = 0.35
 JUNCTION_CENTER_MIN = 0.50
 JUNCTION_CONFIRM = 1
 JUNCTION_CLEAR = 1
-POST_TURN_JUNCTION_IGNORE_SECONDS = 0.8
+POST_TURN_JUNCTION_IGNORE_SECONDS = 0.7
 BUTTON_POST_TURN_IGNORE_SECONDS = 1.0
 BUTTON2_POST_TURN_IGNORE_SECONDS = 0.8
-BUTTON2_PRESS_IGNORE_TIME = 0.8  # Ignore junctions after BUTTON2 press and return
-FIREFIGHTER_POST_TURN_IGNORE_SECONDS = 0.9
-CUBE1_POST_TURN_IGNORE_SECONDS = 1
-CUBE2_POST_TURN_IGNORE_SECONDS = 0.4
+BUTTON2_PRESS_IGNORE_TIME = 0.7  # Ignore junctions after BUTTON2 press and return
+FIREFIGHTER_POST_TURN_IGNORE_SECONDS = 0.8
+CUBE1_POST_TURN_IGNORE_SECONDS = 0.7
+CUBE2_POST_TURN_IGNORE_SECONDS = 0.7
 CUBE_DROP_POST_TURN_IGNORE_SECONDS = 0.8
-CUBE2_TURN_DIRECTION = "L"  # "L" — налево, "R" — направо.
+CUBE2_TURN_DIRECTION = "R"  # "L" — налево, "R" — направо.
 CUBE2_DRIVE_PWM = 80
 CUBE2_DETECTION_X = (0.39, 0.61)  # Доли ширины кадра.
 CUBE_DROP_FORWARD_PWM = 150
@@ -60,8 +60,8 @@ CUBE2_FAR_POSE = dict(base=180, shoulder=0, elbow=100, wrist=180, gripper=0)
 CUBE_DECK_POSE = dict(base=90, shoulder=180, elbow=180, wrist=0, gripper=0)
 CUBE2_DECK_APPROACH_XYZ = (130, 0, 100)
 CUBE_CARRY_AND_DROP_XYZ = (220, 0, 120)
-POST_SLOW_JUNCTION_IGNORE_SECONDS = 0.4
-POST_STRAIGHT_JUNCTION_IGNORE_SECONDS = 0.5
+POST_SLOW_JUNCTION_IGNORE_SECONDS = 0.1
+POST_STRAIGHT_JUNCTION_IGNORE_SECONDS = 0.4
 POST_JUNCTION_ACCEL_SECONDS = 0.5
 STRAIGHT_MAX_SPEED = 255
 STRAIGHT_ACCEL_RATE = 180.0
@@ -218,30 +218,31 @@ BUTTON2_RED_LED_SECONDS = 1.0
 # CHARGING, FIREFIGHTER, CUBE1 и COLOR — задания; FINISH завершает маршрут.
 
 ROUTE = [
-    "START",
-    "BUTTON",
-    "L",
-    "CUBE1",
-    "L",
-    "L",
-    "R",
-    "CHARGING",
-    "COLOR",
-    "L",
-    "R",
-    "R",
-    "L",
-    "FIREFIGHTER",
-    "L",
-    "R",
+    # "START",
+    # "BUTTON",
+    # "L",
+    # "R",
+    # "L",
+    # "CUBE1",
+    # "SLOW",
+    # "L",
+    # "R",
+    # "L",
+    # "CHARGING",
+    # "LSLOW",
+    # "R",
+    # "COLOR",
+    # "L",
+    # "R",
+    # "FIREFIGHTER",
     "BUTTON2",
-    "RSLOW",
-    "CUBE2",
-    "RSLOW",
+    "R",
+    "L",
     "R",
     "S",
-    "LSLOW",
-    "CUBE_DROP",
+    "R",
+    "L", 
+    "L",
     "S",
     "FINISH",
 ]
@@ -1714,6 +1715,85 @@ def create_color_rgb_indicator():
     return rgb
 
 
+def calibrated_color_detector(**options):
+    """Use the camera HSV profile for COLOR and BUTTON2 only."""
+    import json
+    from pathlib import Path
+    import cv2
+    import numpy as np
+    from color_marker_detector import COLOR_NAMES, ColorMarkerDetector
+
+    path = Path(__file__).with_name("color_calibration.json")
+    try:
+        with path.open(encoding="utf-8") as source:
+            profile = json.load(source)
+        bounds = {}
+        for color_id, name in COLOR_NAMES.items():
+            if name not in {"red", "green", "blue"}:
+                continue
+            ranges = profile[name]
+            if not isinstance(ranges, list) or not ranges:
+                raise ValueError(f"{name}: missing HSV ranges")
+            bounds[color_id] = []
+            for entry in ranges:
+                lower, upper = entry["lower"], entry["upper"]
+                if (len(lower) != 3 or len(upper) != 3 or not all(
+                    type(lo) is int and type(hi) is int and 0 <= lo <= hi <= limit
+                    for lo, hi, limit in zip(lower, upper, (179, 255, 255))
+                )):
+                    raise ValueError(f"{name}: invalid HSV bounds")
+                bounds[color_id].append((tuple(lower), tuple(upper)))
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        print(f"COLOR: built-in thresholds ({path.name}: {exc}).")
+        return None
+
+    class CalibratedDetector(ColorMarkerDetector):
+        def classify_colors(self, frame):
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            colors = np.zeros(frame.shape[:2], dtype=np.uint8)
+            for color_id, ranges in bounds.items():
+                for lower, upper in ranges:
+                    match = cv2.inRange(hsv, lower, upper) != 0
+                    colors[match & (colors == 0)] = color_id
+            return colors
+
+    print(f"COLOR: loaded {path.name}.")
+    return CalibratedDetector(allowed_colors={"red", "green", "blue"}, **options)
+
+
+def run_calibrated_color(detector, camera, on_confirm):
+    from color_marker_detector import ContinuousCamera
+
+    owns_camera = camera is None
+    if owns_camera:
+        camera = ContinuousCamera(port=8000)
+        camera.start()
+    try:
+        camera.start_task("COLOR: searching with calibrated HSV")
+        sequence = camera.sequence
+        deadline = time.monotonic() + COLOR_MARKER_TIMEOUT
+        while time.monotonic() < deadline:
+            frame_data = camera.get_frame(
+                after_sequence=sequence,
+                timeout=min(0.25, max(0, deadline - time.monotonic())),
+            )
+            if frame_data is None:
+                continue
+            sequence, frame = frame_data
+            objects, annotated, confirmed = detector.process_frame(frame)
+            camera.publish_task_frame(annotated, f"COLOR: {confirmed or 'searching'}")
+            if confirmed is not None:
+                match = next(obj for obj in objects if obj["color"] == confirmed)
+                on_confirm(match)
+                time.sleep(max(0, COLOR_MARKER_HOLD_SECONDS))
+                return match
+        return None
+    finally:
+        camera.end_task()
+        if owns_camera:
+            camera.stop()
+
+
 def color_marker_task(calibration, board, bus, offset, camera_stream=None):
     """Задание COLOR с обычным поворотом R из этого файла.
     После поворота рука занимает заданное положение, камера распознаёт цвет,
@@ -1746,16 +1826,23 @@ def color_marker_task(calibration, board, bus, offset, camera_stream=None):
                 f"COLOR: {match['color'].upper()} indicator ON; "
                 f"holding for {COLOR_MARKER_HOLD_SECONDS:g}s."
             )
-        marker = run_color_marker_task(
-            timeout_s=COLOR_MARKER_TIMEOUT,
-            hold_seconds=COLOR_MARKER_HOLD_SECONDS,
+        detector = calibrated_color_detector(
             min_object_area=COLOR_MARKER_MIN_AREA,
             stable_frames=COLOR_MARKER_STABLE_FRAMES,
-            control_led=False,
-            confirmation_callback=light_confirmed_color,
-            preview_port=None if camera_stream is not None else 8000,
-            camera_stream=camera_stream,
         )
+        if detector is not None:
+            marker = run_calibrated_color(detector, camera_stream, light_confirmed_color)
+        else:
+            marker = run_color_marker_task(
+                timeout_s=COLOR_MARKER_TIMEOUT,
+                hold_seconds=COLOR_MARKER_HOLD_SECONDS,
+                min_object_area=COLOR_MARKER_MIN_AREA,
+                stable_frames=COLOR_MARKER_STABLE_FRAMES,
+                control_led=False,
+                confirmation_callback=light_confirmed_color,
+                preview_port=None if camera_stream is not None else 8000,
+                camera_stream=camera_stream,
+            )
         if marker is None:
             print("COLOR: marker not found within 10 seconds; continue route.")
         from arm_web import START_ANGLES
@@ -1895,11 +1982,16 @@ def button2_find_color(calibration, camera_stream, recover=None):
         print("BUTTON2: camera unavailable.")
         return None
     camera = camera_stream
-    detector = ColorMarkerDetector(
+    detector = calibrated_color_detector(
         min_object_area=BUTTON2_MIN_OBJECT_AREA,
         stable_frames=BUTTON2_CONFIRM_FRAMES,
-        allowed_colors={"red", "green", "blue"},
     )
+    if detector is None:
+        detector = ColorMarkerDetector(
+            min_object_area=BUTTON2_MIN_OBJECT_AREA,
+            stable_frames=BUTTON2_CONFIRM_FRAMES,
+            allowed_colors={"red", "green", "blue"},
+        )
     sequence = camera.sequence
     locked_color = None
     centered_frames = 0
